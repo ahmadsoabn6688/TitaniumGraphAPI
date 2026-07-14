@@ -1,0 +1,106 @@
+# Same as gqlgate.yaml, but for running gqlgate itself inside a Docker
+# container while TiDB's port 4000 is published on the Windows/macOS host:
+#
+#   docker run --rm -p 8080:8080 -v %cd%:/app -v gqlgate-gocache:/go -w /app \
+#     -e GQLGATE_JWT_SECRET=dev-secret-change-me-0123456789abcdef \
+#     golang:1.26 go run ./cmd/gqlgate -config example/gqlgate.docker.yaml
+version: 1
+
+database:
+  host: host.docker.internal   # the host's published TiDB port, seen from a container
+  port: 4000
+  user: root
+  password: ""
+  schema: appdb
+
+server:
+  host: 0.0.0.0                # listen on all interfaces so -p 8080:8080 works
+  port: 8080
+  path: /graphql
+  graphiql: true
+  debug: true
+  max_query_depth: 15
+  hot_reload: true             # watch this file (+ scripts) and reload on change (dev)
+  reload_interval_seconds: 2
+  cors:
+    enabled: true
+    allowed_origins: ["*"]
+
+jwt:
+  algorithm: HS256
+  secret: ${GQLGATE_JWT_SECRET}
+  role_lookup:               # role comes from the users table, not the token
+    table: users
+    id_claim: sub
+    id_column: id
+    role_column: role
+    username_column: username
+    password_column: password
+    cache_seconds: 0
+  anonymous_role: anonymous
+  leeway_seconds: 30
+
+schema_gen:
+  default_page_size: 25
+  max_page_size: 200
+
+roles:
+  admin:
+    tables:
+      "*":
+        select: true
+        insert: true
+        update: true
+        delete: true
+      users:
+        select:
+          allow: true
+          columns: [id, username, role, name, email, is_active, balance, metadata, created_at]
+        insert: true
+        update: true
+        delete: true
+
+  author:
+    tables:
+      users:
+        select:
+          allow: true
+          columns: [id, name, is_active, created_at]
+      posts:
+        select: true
+        insert:
+          allow: true
+          columns: [title, body, published, published_on]
+          presets:
+            author_id: ":jwt.sub"
+        update:
+          allow: true
+          columns: [title, body, published, published_on]
+          filter: "author_id = :jwt.sub"
+        delete:
+          allow: true
+          filter: "author_id = :jwt.sub"
+      comments:
+        select: true
+        insert:
+          allow: true
+          columns: [post_id, body]
+          presets:
+            user_id: ":jwt.sub"
+        delete:
+          allow: true
+          filter: "user_id = :jwt.sub"
+
+  anonymous:
+    tables:
+      posts:
+        select:
+          allow: true
+          columns: [id, author_id, title, body, published_on, created_at]
+          filter: "published = 1"
+      users:
+        select:
+          allow: true
+          columns: [id, name]
+      comments:
+        select: true

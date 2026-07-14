@@ -1,0 +1,116 @@
+# gqlgate configuration — THE file you edit. `docker compose up --build`
+# compiles the gateway (including your hooks/ directory), introspects the
+# schema below, and serves GraphQL + GraphiQL on http://localhost:8080/graphql.
+#
+# Out of the box this points at the compose-internal demo TiDB (service name
+# `tidb`) seeded with a small blog schema. To use YOUR database: change
+# database.* below and start only the gateway: `docker compose up --build gqlgate`
+version: 1
+
+database:
+  host: tidb              # compose service name; change to your TiDB host
+  port: 4000
+  user: root
+  password: ""
+  schema: appdb           # the schema whose tables become the GraphQL API
+  startup_wait_seconds: 60  # retry startup while the DB/seeder come up
+
+server:
+  host: 0.0.0.0
+  port: 8080
+  path: /graphql
+  graphiql: true          # dev IDE on GET /graphql — turn off in production
+  debug: true             # logs SQL, exposes DB errors — turn off in production
+  hot_reload: true        # edit this file and save; no restart needed
+  cors:
+    enabled: true
+    allowed_origins: ["*"]
+
+jwt:
+  algorithm: HS256
+  secret: ${GQLGATE_JWT_SECRET}
+  role_lookup:            # role comes from the users table, not the token
+    table: users
+    id_claim: sub
+    id_column: id
+    role_column: role
+    username_column: username
+    password_column: password
+  anonymous_role: anonymous
+  leeway_seconds: 30
+
+schema_gen:
+  default_page_size: 25
+  max_page_size: 200
+
+# Custom logic lives in the hooks/ directory (compiled in on build; any Go
+# library allowed). Activate the sample: rename hooks/signup.go.sample to
+# hooks/signup.go, rebuild, and uncomment the wiring below (the sample
+# registers `validate_post`; its `signup` mutation mounts automatically):
+# hooks:
+#   tables:
+#     posts:
+#       before_insert: [validate_post]
+
+roles:
+  admin:
+    tables:
+      "*":
+        select: true
+        insert: true
+        update: true
+        delete: true
+      users:
+        select:
+          allow: true
+          columns: [id, username, role, name, email, is_active, balance, metadata, created_at]
+        insert: true
+        update: true
+        delete: true
+
+  author:
+    tables:
+      users:
+        select:
+          allow: true
+          columns: [id, name, is_active, created_at]
+      posts:
+        select: true
+        insert:
+          allow: true
+          columns: [title, body, published, published_on]
+          presets:
+            author_id: ":jwt.sub"
+        update:
+          allow: true
+          columns: [title, body, published, published_on]
+          filter: "author_id = :jwt.sub"
+        delete:
+          allow: true
+          filter: "author_id = :jwt.sub"
+      comments:
+        select: true
+        insert:
+          allow: true
+          columns: [post_id, body]
+          presets:
+            user_id: ":jwt.sub"
+        delete:
+          allow: true
+          filter: "user_id = :jwt.sub OR post_id IN (SELECT id FROM posts WHERE author_id = :jwt.sub)"
+
+  anonymous:
+    tables:
+      posts:
+        select:
+          allow: true
+          columns: [id, author_id, title, body, published_on, created_at]
+          filter: "published = 1"
+      users:
+        select:
+          allow: true
+          columns: [id, name]
+      comments:
+        select: true
+      documents:
+        select: true

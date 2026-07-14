@@ -1,0 +1,89 @@
+# One command runs everything:
+#
+#   docker compose up --build
+#
+# That compiles the gateway (with your hooks/ directory baked in), starts a
+# demo TiDB, seeds it with a small blog schema, introspects it, and serves
+# GraphQL + GraphiQL at http://localhost:8080/graphql
+#
+# Get a dev token (user 1 = author, 4 = admin):
+#
+#   docker compose exec gqlgate gqlgate -config /etc/gqlgate/gqlgate.yaml -print-token 1
+#
+# Using YOUR OWN TiDB instead of the demo one: point database.* in
+# gqlgate.yaml at it, then start only the gateway:
+#
+#   docker compose up --build gqlgate
+#
+# (The demo `tidb` + `seed` services only run when named or when you `up`
+# everything; the seeder is hard-pinned to the internal `tidb` host and
+# refuses to touch anything else.)
+
+services:
+  tidb:
+    image: pingcap/tidb:v8.5.6
+    restart: unless-stopped
+    ports:
+      - "4000:4000"    # SQL
+      - "10080:10080"  # status/metrics
+    volumes:
+      - tidb-data:/tmp/tidb
+    networks:
+      - tidb-net
+
+  # Demo-only: loads example/seed.sql (blog schema + users with roles) into
+  # the internal TiDB. Deliberately uses its own pinned connection config so
+  # repointing gqlgate.yaml at a real database can never make this drop it.
+  seed:
+    build: .
+    entrypoint: ["gqlgate-seed"]
+    command: ["-config", "/etc/gqlgate/demo-seed.yaml", "-file", "/etc/gqlgate/seed.sql"]
+    environment:
+      GQLGATE_JWT_SECRET: ${GQLGATE_JWT_SECRET:-dev-secret-change-me-0123456789abcdef}
+    volumes:
+      - ./example/gqlgate.demo-seed.yaml:/etc/gqlgate/demo-seed.yaml:ro
+      - ./example/seed.sql:/etc/gqlgate/seed.sql:ro
+    depends_on:
+      - tidb
+    networks:
+      - tidb-net
+    restart: "no"
+
+  gqlgate:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      GQLGATE_JWT_SECRET: ${GQLGATE_JWT_SECRET:-dev-secret-change-me-0123456789abcdef}
+      GQLGATE_WAIT_DB: "90"   # retry while the database starts up
+      # Database credentials injected here take PRIORITY over gqlgate.yaml —
+      # point at your own TiDB by exporting these (or putting them in a .env
+      # file next to this compose file), no YAML edit needed:
+      #
+      #   GQLGATE_DB_HOST=my-tidb.internal GQLGATE_DB_USER=svc_gql \
+      #   GQLGATE_DB_PASSWORD=... GQLGATE_DB_SCHEMA=mydb \
+      #   docker compose up --build gqlgate
+      GQLGATE_DB_HOST: ${GQLGATE_DB_HOST:-tidb}
+      GQLGATE_DB_PORT: ${GQLGATE_DB_PORT:-4000}
+      GQLGATE_DB_USER: ${GQLGATE_DB_USER:-root}
+      GQLGATE_DB_PASSWORD: ${GQLGATE_DB_PASSWORD:-}
+      GQLGATE_DB_SCHEMA: ${GQLGATE_DB_SCHEMA:-appdb}
+    volumes:
+      # The config is mounted (not baked in), so hot_reload picks up edits
+      # to gqlgate.yaml without a rebuild. Rebuild only when hooks/ changes.
+      - ./gqlgate.yaml:/etc/gqlgate/gqlgate.yaml
+    depends_on:
+      seed:
+        condition: service_completed_successfully
+        required: false
+    networks:
+      - tidb-net
+    restart: unless-stopped
+
+networks:
+  tidb-net:
+    name: tidb-net
+    driver: bridge
+
+volumes:
+  tidb-data:

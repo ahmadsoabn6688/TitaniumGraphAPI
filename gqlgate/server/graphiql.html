@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>gqlgate — GraphiQL</title>
+  <style>
+    body { margin: 0; }
+    #graphiql { height: 100vh; }
+  </style>
+  <link rel="stylesheet" href="https://unpkg.com/graphiql@3/graphiql.min.css" />
+</head>
+<body>
+  <div id="graphiql">Loading GraphiQL…</div>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/graphiql@3/graphiql.min.js"></script>
+  <script>
+    const fetcher = GraphiQL.createFetcher({ url: window.location.pathname });
+    ReactDOM.createRoot(document.getElementById('graphiql')).render(
+      React.createElement(GraphiQL, {
+        fetcher: fetcher,
+        defaultEditorToolsVisibility: 'headers',
+        // Empty (valid JSON) so Docs/introspection and anonymous-role queries
+        // work immediately. Add {"Authorization":"Bearer <jwt>"} once you have
+        // a token (see the query comment).
+        defaultHeaders: '{}',
+        defaultQuery:
+          '# gqlgate — auto-generated GraphQL over your database schema.\n' +
+          '#\n' +
+          '# You are the anonymous role until you add an Authorization header.\n' +
+          '# Get a token without leaving here (if a signup/signin hook exists):\n' +
+          '#   mutation { signup(username: "alice", password: "password123") }\n' +
+          '# then put   { "Authorization": "Bearer <token>" }   in the Headers tab.\n' +
+          '# Press Docs to explore exactly what your current role can access.\n' +
+          '\n' +
+          'query {\n  _role\n}\n',
+      })
+    );
+  </script>
+</body>
+</html>

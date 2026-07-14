@@ -1,0 +1,21 @@
+# Connection config used ONLY by the demo `seed` compose service. The host is
+# pinned to the compose-internal `tidb` service so the (destructive) seed can
+# never touch a real database, even if you repoint the main gqlgate.yaml.
+version: 1
+
+database:
+  host: tidb
+  port: 4000
+  user: root
+  password: ""
+  schema: appdb
+
+jwt:
+  algorithm: HS256
+  secret: ${GQLGATE_JWT_SECRET}
+
+roles:
+  admin:
+    tables:
+      "*":
+        select: true

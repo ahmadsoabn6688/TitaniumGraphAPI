@@ -1,0 +1,75 @@
+// Sample compiled hook file. To activate: rename to signup.go and rebuild
+// (docker compose up --build). It adds a `signup` mutation with REAL bcrypt
+// password hashing (a third-party lib — impossible in interpreted scripts)
+// and a before-insert validation hook you can wire in YAML as:
+//
+//   hooks:
+//     tables:
+//       posts:
+//         before_insert: [validate_post]
+package hooks
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+
+	"github.com/graphql-go/graphql"
+	"golang.org/x/crypto/bcrypt"
+
+	"gqlgate"
+	"gqlgate/register"
+)
+
+func init() {
+	// A lifecycle hook: reject blank post titles (runs in the mutation's tx).
+	register.MutationHook("validate_post", func(ctx context.Context, ev *register.MutationEvent) error {
+		for _, row := range ev.Values {
+			if title, _ := row["title"].(string); strings.TrimSpace(title) == "" {
+				return errors.New("post title must not be empty")
+			}
+		}
+		return nil
+	})
+
+	// A custom mutation: create a user with a bcrypt-hashed password and
+	// return a signed JWT. Only the anonymous role sees this field.
+	register.CustomField(register.CustomFieldDef{
+		Name:         "signup",
+		Operation:    "mutation",
+		AllowedRoles: []string{"anonymous"},
+		Field: &graphql.Field{
+			Type: graphql.NewNonNull(graphql.String),
+			Args: graphql.FieldConfigArgument{
+				"username": &graphql.ArgumentConfig{Type: graphql.NewNonNull(graphql.String)},
+				"password": &graphql.ArgumentConfig{Type: graphql.NewNonNull(graphql.String)},
+			},
+			Resolve: func(p graphql.ResolveParams) (any, error) {
+				username, _ := p.Args["username"].(string)
+				password, _ := p.Args["password"].(string)
+				if len(username) < 3 || len(password) < 6 {
+					return nil, errors.New("username must be >= 3 chars and password >= 6")
+				}
+				hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+				if err != nil {
+					return nil, err
+				}
+				gate := gqlgate.FromContext(p.Context)
+				if gate == nil {
+					return nil, errors.New("gate unavailable")
+				}
+				res, err := gate.DB().ExecContext(p.Context,
+					"INSERT INTO users (username, password, role, name, email) VALUES (?, ?, 'author', ?, ?)",
+					username, string(hash), username, username+"@example.com")
+				if err != nil {
+					return nil, fmt.Errorf("signup failed (username may be taken): %w", err)
+				}
+				id, _ := res.LastInsertId()
+				// SignToken issues the same tokens the gateway verifies
+				// (iat/exp/iss/aud are filled in automatically).
+				return gate.SignToken(map[string]any{"sub": id})
+			},
+		},
+	})
+}

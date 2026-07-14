@@ -1,0 +1,117 @@
+# gqlgate example configuration — a blog-ish schema on a local TiDB.
+#
+# Start the gateway:   gqlgate -config example/gqlgate.yaml
+# Mint a test token:   gqlgate -config example/gqlgate.yaml -print-token author -claims '{"sub": 1}'
+version: 1
+
+database:
+  host: 127.0.0.1
+  port: 4000            # TiDB default
+  user: root
+  password: ""
+  schema: appdb         # the schema whose tables become the GraphQL API
+
+server:
+  host: 127.0.0.1
+  port: 8080
+  path: /graphql
+  graphiql: true        # GET /graphql serves the GraphiQL IDE (dev only!)
+  debug: true           # logs generated SQL; also exposes DB errors to clients
+  max_query_depth: 15
+  cors:
+    enabled: true
+    allowed_origins: ["*"]
+
+jwt:
+  algorithm: HS256
+  # ${ENV_VAR} references are expanded at load time; unset variables fail fast.
+  secret: ${GQLGATE_JWT_SECRET}
+  # The token only carries the user id; the role is read from the identity
+  # table below on every request (so role changes apply instantly). Your
+  # signup service owns this table — gqlgate never reads the password, but it
+  # verifies at startup that the declared columns exist.
+  role_lookup:
+    table: users
+    id_claim: sub          # JWT claim holding the user id
+    id_column: id
+    role_column: role
+    username_column: username   # set to "" to skip the startup check
+    password_column: password   # set to "" to skip the startup check
+    cache_seconds: 0            # >0 caches id->role lookups for that long
+  # Without role_lookup, the role is read from a token claim instead:
+  # role_claim: role      # dot paths work too, e.g. app_metadata.role
+  anonymous_role: anonymous   # role assumed when no Authorization header is sent
+  leeway_seconds: 30
+
+schema_gen:
+  default_page_size: 25
+  max_page_size: 200
+  tables:
+    include: []         # empty = all base tables of the schema
+    exclude: []
+
+roles:
+  # Full access to every exposed table — except that even admins never see
+  # password hashes: an exact table entry overrides the "*" wildcard.
+  admin:
+    tables:
+      "*":
+        select: true
+        insert: true
+        update: true
+        delete: true
+      users:
+        select:
+          allow: true
+          columns: [id, username, role, name, email, is_active, balance, metadata, created_at]
+        insert: true
+        update: true
+        delete: true
+
+  # Authors manage their own posts; author_id is forced from the JWT "sub"
+  # claim, so an author can never write rows for someone else.
+  author:
+    tables:
+      users:
+        select:
+          allow: true
+          columns: [id, name, is_active, created_at]   # no email
+      posts:
+        select: true
+        insert:
+          allow: true
+          columns: [title, body, published, published_on]
+          presets:
+            author_id: ":jwt.sub"
+        update:
+          allow: true
+          columns: [title, body, published, published_on]
+          filter: "author_id = :jwt.sub"
+        delete:
+          allow: true
+          filter: "author_id = :jwt.sub"
+      comments:
+        select: true
+        insert:
+          allow: true
+          columns: [post_id, body]
+          presets:
+            user_id: ":jwt.sub"
+        delete:
+          allow: true
+          filter: "user_id = :jwt.sub"
+
+  # Unauthenticated visitors see published posts and public user info only.
+  anonymous:
+    tables:
+      posts:
+        select:
+          allow: true
+          columns: [id, author_id, title, body, published_on, created_at]
+          filter: "published = 1"
+      users:
+        select:
+          allow: true
+          columns: [id, name]
+      comments:
+        select: true
