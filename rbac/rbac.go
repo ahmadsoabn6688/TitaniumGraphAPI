@@ -63,7 +63,15 @@ type OpAccess struct {
 	Columns   []*introspect.Column
 	ColumnSet map[string]bool
 	// Filter is the compiled row-level condition, nil when unrestricted.
+	// It is never set for insert (an insert filter becomes the Check).
 	Filter *Filter
+	// Check is the compiled write check (insert/update): every row the
+	// write produces must satisfy it, or the mutation is rolled back. nil =
+	// no check.
+	Check *Filter
+	// CheckFromFilter is true when an insert Check came from the rule's
+	// `filter` key (accepted for backward compatibility) rather than `check`.
+	CheckFromFilter bool
 	// Presets are server-forced column values for insert/update.
 	Presets []Preset
 
@@ -213,7 +221,27 @@ func resolveOp(roleName string, table *introspect.Table, op string, perm *config
 		if err != nil {
 			return nil, fmt.Errorf("role %q, table %q, %s filter: %w", roleName, table.Name, op, err)
 		}
-		oa.Filter = f
+		if op == "insert" {
+			// An insert has no existing rows to filter. Earlier versions
+			// accepted insert.filter and ignored it; it is enforced as the
+			// insert check instead, which is what it was meant to say.
+			oa.Check, oa.CheckFromFilter = f, true
+		} else {
+			oa.Filter = f
+		}
+	}
+	if perm.Check != "" {
+		if op != "insert" && op != "update" {
+			return nil, fmt.Errorf("role %q, table %q: check applies to insert and update only, not %s", roleName, table.Name, op)
+		}
+		if oa.Check != nil {
+			return nil, fmt.Errorf("role %q, table %q: insert has both filter and check; keep only check", roleName, table.Name)
+		}
+		f, err := CompileFilter(perm.Check)
+		if err != nil {
+			return nil, fmt.Errorf("role %q, table %q, %s check: %w", roleName, table.Name, op, err)
+		}
+		oa.Check = f
 	}
 
 	for col, val := range perm.Presets {

@@ -31,11 +31,16 @@ func objectFields(t *testing.T, s graphql.Schema, typeName string) []string {
 
 func objectFieldType(t *testing.T, s graphql.Schema, typeName, field string) string {
 	t.Helper()
-	obj, ok := s.Type(typeName).(*graphql.Object)
-	if !ok {
+	var fields graphql.FieldDefinitionMap
+	switch ty := s.Type(typeName).(type) {
+	case *graphql.Object:
+		fields = ty.Fields()
+	case *graphql.Interface: // mutation_response
+		fields = ty.Fields()
+	default:
 		t.Fatalf("object type %q missing", typeName)
 	}
-	f, ok := obj.Fields()[field]
+	f, ok := fields[field]
 	if !ok {
 		t.Fatalf("%s.%s missing", typeName, field)
 	}

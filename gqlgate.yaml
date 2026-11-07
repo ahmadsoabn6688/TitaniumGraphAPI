@@ -22,6 +22,7 @@ server:
   graphiql: true          # dev IDE on GET /graphql — turn off in production
   debug: true             # logs SQL, exposes DB errors — turn off in production
   hot_reload: true        # edit this file and save; no restart needed
+  max_response_rows: 10000  # fail requests that would return more rows (0 = no limit)
   cors:
     enabled: true
     allowed_origins: ["*"]
@@ -105,6 +106,8 @@ roles:
           columns: [post_id, body]
           presets:
             user_id: ":jwt.sub"
+          # every inserted comment must be on a post the author can see
+          check: "post_id IN (SELECT id FROM posts WHERE published = 1 OR author_id = :jwt.sub)"
         delete:
           allow: true
           filter: "user_id = :jwt.sub OR post_id IN (SELECT id FROM posts WHERE author_id = :jwt.sub)"

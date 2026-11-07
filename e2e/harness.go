@@ -111,6 +111,8 @@ const DefaultRolesYAML = `roles:
           columns: [post_id, body]
           presets:
             user_id: ":jwt.sub"
+          # every inserted comment must be on a post the author can see
+          check: "post_id IN (SELECT id FROM posts WHERE published = 1 OR author_id = :jwt.sub)"
         delete:
           allow: true
           filter: "user_id = :jwt.sub OR post_id IN (SELECT id FROM posts WHERE author_id = :jwt.sub)"

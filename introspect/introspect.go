@@ -5,9 +5,12 @@ package introspect
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
+
+	"github.com/go-sql-driver/mysql"
 )
 
 // Catalog is the introspected shape of one database schema.
@@ -25,6 +28,16 @@ type Table struct {
 	PrimaryKey  []string      // column names, in key order; empty if no PK
 	ForeignKeys []*ForeignKey // FKs declared on this table (outgoing)
 	IncomingFKs []*ForeignKey // FKs on other tables referencing this one
+	// UniqueKeys are the table's UNIQUE indexes usable as row lookups: every
+	// column NOT NULL and indexed in full (no prefix or expression parts),
+	// and not the primary key's column set again. Ordered by index name.
+	UniqueKeys []*UniqueKey
+}
+
+// UniqueKey is one UNIQUE index whose columns identify at most one row.
+type UniqueKey struct {
+	Name    string
+	Columns []string // in index order
 }
 
 // Column describes one column.
@@ -36,7 +49,11 @@ type Column struct {
 	Nullable      bool
 	IsPrimary     bool
 	AutoIncrement bool
-	HasDefault    bool
+	// AutoRandom marks a TiDB AUTO_RANDOM primary key column: the database
+	// generates its value (reported through LAST_INSERT_ID like
+	// AUTO_INCREMENT), so it is optional on insert.
+	AutoRandom bool
+	HasDefault bool
 	// Generated is true for STORED/VIRTUAL generated columns. The database
 	// computes their value and rejects any client-supplied one, so they are
 	// never writable and never required on insert.
@@ -136,7 +153,153 @@ func Load(ctx context.Context, db *sql.DB, schema string, include, exclude []str
 	if err := loadForeignKeys(ctx, db, schema, cat); err != nil {
 		return nil, err
 	}
+	if err := loadAutoRandom(ctx, db, schema, cat); err != nil {
+		return nil, err
+	}
+	if err := loadUniqueKeys(ctx, db, schema, cat); err != nil {
+		return nil, err
+	}
 	return cat, nil
+}
+
+// loadAutoRandom marks AUTO_RANDOM primary key columns. TiDB reports them
+// only in information_schema.tables.tidb_row_id_sharding_info
+// ("PK_AUTO_RANDOM_BITS=<n>"), not in columns.extra. On plain MySQL the
+// column does not exist, which simply means no AUTO_RANDOM keys.
+func loadAutoRandom(ctx context.Context, db *sql.DB, schema string, cat *Catalog) error {
+	rows, err := db.QueryContext(ctx,
+		`SELECT table_name, IFNULL(tidb_row_id_sharding_info, '')
+		 FROM information_schema.tables WHERE table_schema = ?`, schema)
+	if err != nil {
+		var me *mysql.MySQLError
+		if errors.As(err, &me) && me.Number == 1054 { // unknown column: not TiDB
+			return nil
+		}
+		return fmt.Errorf("introspect auto_random keys: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var name, info string
+		if err := rows.Scan(&name, &info); err != nil {
+			return err
+		}
+		markAutoRandom(cat.Tables[name], info)
+	}
+	return rows.Err()
+}
+
+// markAutoRandom applies one table's sharding info: an AUTO_RANDOM table has
+// a single-column primary key whose value the database generates.
+func markAutoRandom(t *Table, shardingInfo string) {
+	if t == nil || len(t.PrimaryKey) != 1 || !strings.HasPrefix(shardingInfo, "PK_AUTO_RANDOM_BITS=") {
+		return
+	}
+	c := t.ColumnMap[t.PrimaryKey[0]]
+	c.AutoRandom = true
+	c.HasDefault = true
+}
+
+// StatRow is one row of information_schema.statistics for a unique index.
+type StatRow struct {
+	Table, Index string
+	Column       sql.NullString // NULL for an expression part
+	SubPart      sql.NullInt64  // non-NULL for a prefix part
+}
+
+func loadUniqueKeys(ctx context.Context, db *sql.DB, schema string, cat *Catalog) error {
+	rows, err := db.QueryContext(ctx,
+		`SELECT table_name, index_name, column_name, sub_part
+		 FROM information_schema.statistics
+		 WHERE table_schema = ? AND non_unique = 0 AND index_name <> 'PRIMARY'
+		 ORDER BY table_name, index_name, seq_in_index`, schema)
+	if err != nil {
+		return fmt.Errorf("introspect unique keys: %w", err)
+	}
+	defer rows.Close()
+	var stats []StatRow
+	for rows.Next() {
+		var r StatRow
+		if err := rows.Scan(&r.Table, &r.Index, &r.Column, &r.SubPart); err != nil {
+			return err
+		}
+		stats = append(stats, r)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	ApplyUniqueKeys(cat, stats)
+	return nil
+}
+
+// ApplyUniqueKeys sets Table.UniqueKeys from unique-index statistics rows
+// (ordered by table, index, position). An index is kept only when it
+// identifies one row by plain equality on its columns: no expression or
+// prefix parts (those don't compare whole column values), no nullable
+// column (a UNIQUE index admits any number of NULLs), not the primary key's
+// column set again, and not a column set an earlier index already covers.
+func ApplyUniqueKeys(cat *Catalog, stats []StatRow) {
+	type idx struct {
+		table, name string
+		cols        []string
+		ok          bool
+	}
+	var order []*idx
+	byKey := map[string]*idx{}
+	for _, r := range stats {
+		t := cat.Tables[r.Table]
+		if t == nil {
+			continue
+		}
+		key := r.Table + "\x00" + r.Index
+		ix := byKey[key]
+		if ix == nil {
+			ix = &idx{table: r.Table, name: r.Index, ok: true}
+			byKey[key] = ix
+			order = append(order, ix)
+		}
+		if !r.Column.Valid || r.SubPart.Valid {
+			ix.ok = false
+			continue
+		}
+		c := t.ColumnMap[r.Column.String]
+		if c == nil || c.Nullable {
+			ix.ok = false
+			continue
+		}
+		ix.cols = append(ix.cols, c.Name)
+	}
+	seen := map[string]bool{}
+	for _, t := range cat.Tables {
+		t.UniqueKeys = nil
+		if len(t.PrimaryKey) > 0 {
+			seen[t.Name+"\x00"+colSetKey(t.PrimaryKey)] = true
+		}
+	}
+	sort.SliceStable(order, func(i, j int) bool {
+		if order[i].table != order[j].table {
+			return order[i].table < order[j].table
+		}
+		return order[i].name < order[j].name
+	})
+	for _, ix := range order {
+		if !ix.ok || len(ix.cols) == 0 {
+			continue
+		}
+		k := ix.table + "\x00" + colSetKey(ix.cols)
+		if seen[k] {
+			continue
+		}
+		seen[k] = true
+		t := cat.Tables[ix.table]
+		t.UniqueKeys = append(t.UniqueKeys, &UniqueKey{Name: ix.name, Columns: ix.cols})
+	}
+}
+
+// colSetKey identifies a set of columns regardless of their order.
+func colSetKey(cols []string) string {
+	s := append([]string{}, cols...)
+	sort.Strings(s)
+	return strings.Join(s, "\x00")
 }
 
 func loadColumns(ctx context.Context, db *sql.DB, schema string, t *Table) error {

@@ -52,13 +52,19 @@ func BuildAll(opt Options) (map[string]graphql.Schema, error) {
 // operator compilation + database dry run) and returns the state every role's
 // build shares.
 func newBuildShared(opt Options) (*buildShared, error) {
-	reserved, err := reservedNames(opt.Catalog)
+	names, err := reserveNames(opt.Catalog)
 	if err != nil {
 		return nil, err
 	}
+	if opt.Logger != nil {
+		for _, s := range names.skipped {
+			opt.Logger.Warn("unique-key field not generated: name collision", "field", s)
+		}
+	}
 	shared := &buildShared{
 		db:            opt.DB,
-		reservedTypes: reserved,
+		names:         names,
+		reservedTypes: names.types,
 		filterChecks:  map[string]error{},
 		timeout:       time.Duration(opt.Config.Database.QueryTimeoutSeconds) * time.Second,
 		ciCollations:  true, // without a database, assume the default (new) framework
@@ -125,6 +131,44 @@ func checkNameCollisions(cat *introspect.Catalog) error {
 // namespace it built (type name -> owner), which later per-role type names
 // (e.g. restricted comparison types) are checked against.
 func reservedNames(cat *introspect.Catalog) (map[string]string, error) {
+	r, err := reserveNames(cat)
+	if err != nil {
+		return nil, err
+	}
+	return r.types, nil
+}
+
+// nameReservation is the role-independent GraphQL namespace of a catalog.
+type nameReservation struct {
+	types map[string]string // global type names -> owner
+	// mutResp is each table's <t>_mutation_response type name.
+	mutResp map[string]string
+	// unique holds, per table and unique index, the root-field names of the
+	// unique-key lookups; a name some other field already has is "".
+	unique map[string]map[string]uniqueNames
+	// skipped describes the unique-key fields left out because of a name
+	// collision (logged at startup).
+	skipped []string
+}
+
+// uniqueNames are the root fields of one unique key: <t>_by_<cols>,
+// update_<t>_by_<cols> and delete_<t>_by_<cols>.
+type uniqueNames struct{ query, update, delete string }
+
+// uniqueSuffix is "_by_<col1>_and_<col2>…" for a unique key.
+func uniqueSuffix(uk *introspect.UniqueKey) string {
+	cols := make([]string, len(uk.Columns))
+	for i, c := range uk.Columns {
+		cols[i] = graphqlName(c)
+	}
+	return "_by_" + strings.Join(cols, "_and_")
+}
+
+// reserveNames builds the namespace and rejects collisions among the fixed
+// names. Names added later (the per-table mutation response types and the
+// unique-key fields) are claimed only after every fixed name, and never fail
+// the build: a schema that worked before keeps working.
+func reserveNames(cat *introspect.Catalog) (*nameReservation, error) {
 	seenTables := map[string]string{}
 	for _, tn := range cat.TableOrder {
 		n := graphqlName(tn)
@@ -204,7 +248,44 @@ func reservedNames(cat *introspect.Catalog) (map[string]string, error) {
 			}
 		}
 	}
-	return types, nil
+
+	r := &nameReservation{
+		types:   types,
+		mutResp: map[string]string{},
+		unique:  map[string]map[string]uniqueNames{},
+	}
+	// <t>_mutation_response, numbered if a table-derived name already has it.
+	for _, tn := range cat.TableOrder {
+		base := graphqlName(tn) + "_mutation_response"
+		name := base
+		for i := 1; types[name] != ""; i++ {
+			name = fmt.Sprintf("%s_%d", base, i)
+		}
+		types[name] = "table " + tn
+		r.mutResp[tn] = name
+	}
+	// Unique-key lookups; a name another field already has is left out.
+	for _, tn := range cat.TableOrder {
+		n := graphqlName(tn)
+		r.unique[tn] = map[string]uniqueNames{}
+		for _, uk := range cat.Tables[tn].UniqueKeys {
+			soft := func(ns map[string]string, name, kind string) string {
+				if other, taken := ns[name]; taken {
+					r.skipped = append(r.skipped, fmt.Sprintf("%s %q for unique key %s.%s (already used by %s)", kind, name, tn, uk.Name, other))
+					return ""
+				}
+				ns[name] = "table " + tn
+				return name
+			}
+			suffix := uniqueSuffix(uk)
+			r.unique[tn][uk.Name] = uniqueNames{
+				query:  soft(queryFields, n+suffix, "query field"),
+				update: soft(mutationFields, "update_"+n+suffix, "mutation field"),
+				delete: soft(mutationFields, "delete_"+n+suffix, "mutation field"),
+			}
+		}
+	}
+	return r, nil
 }
 
 // tableInfo is the per-role view of one table.
@@ -231,6 +312,7 @@ type tableInfo struct {
 type buildShared struct {
 	db            *sql.DB
 	timeout       time.Duration
+	names         *nameReservation
 	reservedTypes map[string]string    // global type names -> owner
 	customOps     map[string]*customOp // schema_gen.custom_operators
 	customOrder   []string
@@ -254,9 +336,17 @@ type builder struct {
 	cmpExps    map[string]*graphql.InputObject
 	cmpOwners  map[string]string // restricted comparison type -> "table.column"
 	orderEnum  *graphql.Enum
-	mutResp    *graphql.Object
 	pageInfo   *graphql.Object
 	metricEnum *graphql.Enum
+	// mutRespIface is the mutation_response interface every
+	// <t>_mutation_response implements (so `... on mutation_response`
+	// keeps working); mutRespTypes caches those types per table.
+	mutRespIface *graphql.Interface
+	mutRespTypes map[string]*graphql.Object
+	// optionalFields are generated root fields a custom field of the same
+	// name may replace ("query:<name>" / "mutation:<name>"): the unique-key
+	// fields, which are newer than any custom field that might use the name.
+	optionalFields map[string]bool
 }
 
 func buildRole(opt Options, shared *buildShared, roleName string, access *rbac.Access) (graphql.Schema, error) {
@@ -280,6 +370,9 @@ func buildRoleBuilder(opt Options, shared *buildShared, roleName string, access 
 		orderBys:  map[string]*graphql.InputObject{},
 		cmpExps:   map[string]*graphql.InputObject{},
 		cmpOwners: map[string]string{},
+
+		mutRespTypes:   map[string]*graphql.Object{},
+		optionalFields: map[string]bool{},
 	}
 
 	// page_info is the cursor-pagination metadata, shared by every connection.
@@ -308,17 +401,14 @@ func buildRoleBuilder(opt Options, shared *buildShared, roleName string, access 
 			"desc": &graphql.EnumValueConfig{Value: "DESC"},
 		},
 	})
-	b.mutResp = graphql.NewObject(graphql.ObjectConfig{
-		Name: "mutation_response",
+	b.mutRespIface = graphql.NewInterface(graphql.InterfaceConfig{
+		Name:        "mutation_response",
+		Description: "The result of a bulk insert/update/delete; implemented by each <table>_mutation_response.",
 		Fields: graphql.Fields{
-			"affected_rows": &graphql.Field{
-				Type: graphql.NewNonNull(b.countScalar()),
-				Resolve: func(p graphql.ResolveParams) (any, error) {
-					m, _ := p.Source.(map[string]any)
-					return m["affected_rows"], nil
-				},
-			},
+			"affected_rows": &graphql.Field{Type: graphql.NewNonNull(b.countScalar())},
 		},
+		// No field returns the interface itself; resolution is never needed.
+		ResolveType: func(graphql.ResolveTypeParams) *graphql.Object { return nil },
 	})
 
 	// Pass 1: per-role table views for every table the role can touch at all.
@@ -339,6 +429,9 @@ func buildRoleBuilder(opt Options, shared *buildShared, roleName string, access 
 			f := graphqlName(c.Name)
 			ti.fieldToCol[f] = c
 			ti.colToField[c.Name] = f
+		}
+		if err := b.validateWriteChecks(ti); err != nil {
+			return nil, graphql.Schema{}, err
 		}
 		b.tinfos[tn] = ti
 	}
@@ -451,7 +544,15 @@ func (b *builder) addCustomFields(fields graphql.Fields, operation string) error
 			return fmt.Errorf("custom %s field must have a non-empty Name and Field", operation)
 		}
 		if _, taken := fields[cf.Name]; taken {
-			return fmt.Errorf("custom %s field %q collides with a generated field for role %q", operation, cf.Name, b.role)
+			if !b.optionalFields[operation+":"+cf.Name] {
+				return fmt.Errorf("custom %s field %q collides with a generated field for role %q", operation, cf.Name, b.role)
+			}
+			// A unique-key field is newer than any custom field that may
+			// already use its name; the custom field keeps it.
+			if b.opt.Logger != nil {
+				b.opt.Logger.Warn("custom field replaces the generated unique-key field of the same name",
+					"role", b.role, "operation", operation, "field", cf.Name)
+			}
 		}
 		fields[cf.Name] = cf.Field
 	}
@@ -592,6 +693,9 @@ func (b *builder) addObjectRelField(fields graphql.Fields, rel *relInfo) {
 				if len(rows) == 0 {
 					return nil, nil
 				}
+				if err := countRows(p.Context, 1); err != nil {
+					return nil, err
+				}
 				return rows[0], nil // FK references a unique key
 			}, nil
 		},
@@ -667,6 +771,9 @@ func (b *builder) addArrayRelField(fields graphql.Fields, rel *relInfo) {
 				}
 				page, err := b.applyPage(rows, la)
 				if err != nil {
+					return nil, err
+				}
+				if err := countRows(p.Context, len(page)); err != nil {
 					return nil, err
 				}
 				return page, nil
@@ -759,12 +866,126 @@ func (b *builder) pkExposable(ti *tableInfo) bool {
 
 // pkArgs builds by-primary-key arguments (one per PK column).
 func (b *builder) pkArgs(ti *tableInfo) graphql.FieldConfigArgument {
+	return b.keyArgs(ti, ti.table.PrimaryKey)
+}
+
+// keyArgs builds one non-null argument per key column, named like the
+// column's field.
+func (b *builder) keyArgs(ti *tableInfo, cols []string) graphql.FieldConfigArgument {
 	args := graphql.FieldConfigArgument{}
-	for _, pkName := range ti.table.PrimaryKey {
-		col := ti.table.ColumnMap[pkName]
-		args[ti.colToField[pkName]] = &graphql.ArgumentConfig{Type: graphql.NewNonNull(scalarFor(col))}
+	for _, name := range cols {
+		col := ti.table.ColumnMap[name]
+		args[ti.colToField[name]] = &graphql.ArgumentConfig{Type: graphql.NewNonNull(scalarFor(col))}
 	}
 	return args
+}
+
+// uniqueLookup is one unique key a role may address rows by.
+type uniqueLookup struct {
+	key   *introspect.UniqueKey
+	names uniqueNames
+}
+
+// uniqueLookups returns the table's unique keys usable by this role: it must
+// read every key column and be allowed to compare it with _eq in `where` (a
+// lookup is exactly that equality filter), so a lookup never probes a column
+// the role's permissions hide.
+func (b *builder) uniqueLookups(ti *tableInfo) []uniqueLookup {
+	sel := ti.access.Select
+	if sel == nil {
+		return nil
+	}
+	var out []uniqueLookup
+	for _, uk := range ti.table.UniqueKeys {
+		ok := true
+		for _, c := range uk.Columns {
+			if !sel.ColumnSet[c] || !ti.filterOpSet[c]["_eq"] {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			out = append(out, uniqueLookup{key: uk, names: b.shared.names.unique[ti.table.Name][uk.Name]})
+		}
+	}
+	return out
+}
+
+// addUniqueQueryFields adds <t>_by_<cols>(cols…) for every usable unique key.
+func (b *builder) addUniqueQueryFields(fields graphql.Fields, ti *tableInfo) {
+	tn := ti.table.Name
+	for _, ul := range b.uniqueLookups(ti) {
+		if ul.names.query == "" {
+			continue
+		}
+		cols := ul.key.Columns
+		fields[ul.names.query] = &graphql.Field{
+			Type:        b.objTypes[tn],
+			Description: fmt.Sprintf("One row of %s by its unique key %s (%s).", tn, ul.key.Name, strings.Join(cols, ", ")),
+			Args:        b.keyArgs(ti, cols),
+			Resolve: func(p graphql.ResolveParams) (any, error) {
+				id, err := identityFrom(p)
+				if err != nil {
+					return nil, err
+				}
+				cond, err := b.keyCond(ti, cols, p.Args)
+				if err != nil {
+					return nil, err
+				}
+				rows, err := b.runSelect(p.Context, ti, id, listArgs{}, cond, true)
+				if err != nil || len(rows) == 0 {
+					return nil, err
+				}
+				return rows[0], nil
+			},
+		}
+		b.optionalFields["query:"+ul.names.query] = true
+	}
+}
+
+// validateWriteChecks verifies a table's insert/update checks for the role at
+// build time: the table needs a primary key (the written rows are found
+// again by it), and with a database the check is dry-run against the table,
+// so a typo fails startup (or a hot reload) instead of every write.
+func (b *builder) validateWriteChecks(ti *tableInfo) error {
+	for _, w := range []struct {
+		op string
+		oa *rbac.OpAccess
+	}{{"insert", ti.access.Insert}, {"update", ti.access.Update}} {
+		if w.oa == nil || w.oa.Check == nil {
+			continue
+		}
+		if len(ti.table.PrimaryKey) == 0 {
+			return fmt.Errorf("table %q: the %s check needs a primary key to find the written rows", ti.table.Name, w.op)
+		}
+		if w.oa.CheckFromFilter && b.opt.Logger != nil {
+			b.opt.Logger.Warn("insert.filter is enforced as the insert check; rename it to check",
+				"role", b.role, "table", ti.table.Name)
+		}
+		if b.shared.db == nil {
+			continue
+		}
+		vsql := w.oa.Check.ValidationSQL()
+		key := "check\x00" + ti.table.Name + "\x00" + vsql
+		err, done := b.shared.filterChecks[key]
+		if !done {
+			q := "SELECT 1 FROM " + b.qualifiedTable(ti.table) + " WHERE (" + vsql + ") IS NOT TRUE LIMIT 0"
+			ctx, cancel := context.WithTimeout(context.Background(), b.shared.timeout)
+			rows, qerr := b.shared.db.QueryContext(ctx, q)
+			if qerr == nil {
+				qerr = rows.Close()
+			}
+			cancel()
+			if qerr != nil {
+				err = fmt.Errorf("table %q: verifying the %s check: %w", ti.table.Name, w.op, qerr)
+			}
+			b.shared.filterChecks[key] = err
+		}
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (b *builder) addQueryFields(fields graphql.Fields, ti *tableInfo) {
@@ -773,7 +994,8 @@ func (b *builder) addQueryFields(fields graphql.Fields, ti *tableInfo) {
 	// offset-paginated list or standalone _count — offset scans don't scale to
 	// TiDB's billions-of-rows tables.
 	b.addAggregateField(fields, ti)
-	b.addVectorFields(fields, ti) // nearest-neighbor search per vector column
+	b.addVectorFields(fields, ti)      // nearest-neighbor search per vector column
+	b.addUniqueQueryFields(fields, ti) // <t>_by_<unique key cols>
 
 	tn := ti.table.Name
 	if b.pkExposable(ti) {
@@ -861,6 +1083,9 @@ func (b *builder) addConnectionField(fields graphql.Fields, ti *tableInfo) {
 			hasNext := len(rows) > first
 			if hasNext {
 				rows = rows[:first]
+			}
+			if err := countRows(p.Context, len(rows)); err != nil {
+				return nil, err
 			}
 			// A zero-size page (first: 0) must not claim a next page with no
 			// cursor to advance with; keep has_next_page consistent with
@@ -990,13 +1215,86 @@ func (b *builder) setInput(ti *tableInfo) *graphql.InputObject {
 	})
 }
 
+// returningAvailable reports whether this role's mutation responses for the
+// table carry `returning`: the role must read the table, and the rows are
+// found again by primary key (it need not be readable).
+func (b *builder) returningAvailable(ti *tableInfo) bool {
+	return ti.access.Select != nil && len(ti.table.PrimaryKey) > 0
+}
+
+// mutationResponse returns the table's <t>_mutation_response type: the
+// affected_rows count plus, when available, `returning` — the written rows as
+// the role may read them, with every relationship of the row type.
+func (b *builder) mutationResponse(ti *tableInfo) *graphql.Object {
+	tn := ti.table.Name
+	if o := b.mutRespTypes[tn]; o != nil {
+		return o
+	}
+	fields := graphql.Fields{
+		"affected_rows": &graphql.Field{
+			Type:        graphql.NewNonNull(b.countScalar()),
+			Description: "Number of rows the mutation wrote.",
+			Resolve:     func(p graphql.ResolveParams) (any, error) { return sourceKey(p, "affected_rows"), nil },
+		},
+	}
+	if b.returningAvailable(ti) {
+		fields["returning"] = &graphql.Field{
+			Type: graphql.NewNonNull(graphql.NewList(graphql.NewNonNull(b.objTypes[tn]))),
+			Description: "The written rows (deleted rows as they were), read inside the mutation's transaction " +
+				"through your select permission: rows it hides are written but not returned.",
+			Resolve: func(p graphql.ResolveParams) (any, error) {
+				rows, _ := sourceKey(p, "returning").([]map[string]any)
+				if rows == nil {
+					rows = []map[string]any{}
+				}
+				return rows, nil
+			},
+		}
+	}
+	o := graphql.NewObject(graphql.ObjectConfig{
+		Name:        b.shared.names.mutResp[tn],
+		Description: fmt.Sprintf("Result of a bulk mutation on %s.", tn),
+		Interfaces:  []*graphql.Interface{b.mutRespIface},
+		Fields:      fields,
+	})
+	b.mutRespTypes[tn] = o
+	return o
+}
+
+// wantsReturning reports whether the client selected `returning` on this
+// mutation field (fragments followed). Without it the write skips reading the
+// rows back.
+func (b *builder) wantsReturning(p graphql.ResolveParams) bool {
+	for _, f := range p.Info.FieldASTs {
+		for _, sub := range b.flattenFields(f.SelectionSet, p.Info) {
+			if sub.Name != nil && sub.Name.Value == "returning" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// mutationResult is the source map of a <t>_mutation_response.
+func mutationResult(affected int64, rows []map[string]any) map[string]any {
+	return map[string]any{"affected_rows": affected, "returning": rows}
+}
+
+// firstRow is the single-row mutation result: the row, or null.
+func firstRow(rows []map[string]any) any {
+	if len(rows) == 0 {
+		return nil
+	}
+	return rows[0]
+}
+
 func (b *builder) addMutationFields(fields graphql.Fields, ti *tableInfo) {
 	tn := ti.table.Name
 
 	if ti.access.Insert != nil {
 		if input := b.insertInput(ti); input != nil {
 			fields["insert_"+ti.typeName] = &graphql.Field{
-				Type:        graphql.NewNonNull(b.mutResp),
+				Type:        graphql.NewNonNull(b.mutationResponse(ti)),
 				Description: fmt.Sprintf("Insert rows into %s.", tn),
 				Args: graphql.FieldConfigArgument{
 					"objects": &graphql.ArgumentConfig{Type: graphql.NewNonNull(graphql.NewList(graphql.NewNonNull(input)))},
@@ -1007,16 +1305,17 @@ func (b *builder) addMutationFields(fields graphql.Fields, ti *tableInfo) {
 						return nil, err
 					}
 					objects, _ := p.Args["objects"].([]any)
-					affected, _, _, err := b.runInsert(p.Context, ti, id, objects)
+					ret := b.returningAvailable(ti) && b.wantsReturning(p)
+					affected, rows, err := b.runInsert(p.Context, ti, id, objects, ret)
 					if err != nil {
 						return nil, err
 					}
-					return map[string]any{"affected_rows": affected}, nil
+					return mutationResult(affected, rows), nil
 				},
 			}
 
 			// insert_one returns the inserted row, so it needs read access
-			// and a readable primary key to find the row again.
+			// and a readable primary key.
 			if b.pkExposable(ti) {
 				fields["insert_"+ti.typeName+"_one"] = &graphql.Field{
 					Type:        b.objTypes[tn],
@@ -1029,23 +1328,11 @@ func (b *builder) addMutationFields(fields graphql.Fields, ti *tableInfo) {
 						if err != nil {
 							return nil, err
 						}
-						obj := p.Args["object"]
-						_, lastID, values, err := b.runInsert(p.Context, ti, id, []any{obj})
+						_, rows, err := b.runInsert(p.Context, ti, id, []any{p.Args["object"]}, true)
 						if err != nil {
 							return nil, err
 						}
-						cond, ok := b.insertedPKCond(ti, lastID, values)
-						if !ok {
-							return nil, nil // PK unknown (e.g. composite key left to defaults)
-						}
-						rows, err := b.runSelect(p.Context, ti, id, listArgs{}, cond, true)
-						if err != nil {
-							return nil, err
-						}
-						if len(rows) == 0 {
-							return nil, nil
-						}
-						return rows[0], nil
+						return firstRow(rows), nil
 					},
 				}
 			}
@@ -1055,7 +1342,7 @@ func (b *builder) addMutationFields(fields graphql.Fields, ti *tableInfo) {
 	if ti.access.Update != nil && ti.access.Select != nil {
 		if setInput := b.setInput(ti); setInput != nil {
 			fields["update_"+ti.typeName] = &graphql.Field{
-				Type:        graphql.NewNonNull(b.mutResp),
+				Type:        graphql.NewNonNull(b.mutationResponse(ti)),
 				Description: fmt.Sprintf("Update rows of %s matching the filter (use where: {} to target all permitted rows).", tn),
 				Args: graphql.FieldConfigArgument{
 					"where": &graphql.ArgumentConfig{Type: graphql.NewNonNull(b.boolExps[tn])},
@@ -1072,11 +1359,12 @@ func (b *builder) addMutationFields(fields graphql.Fields, ti *tableInfo) {
 					if err != nil {
 						return nil, err
 					}
-					n, err := b.runUpdate(p.Context, ti, id, set, userCond)
+					opts := writeOpts{returning: b.returningAvailable(ti) && b.wantsReturning(p)}
+					n, rows, err := b.runUpdate(p.Context, ti, id, set, userCond, opts)
 					if err != nil {
 						return nil, err
 					}
-					return map[string]any{"affected_rows": n}, nil
+					return mutationResult(n, rows), nil
 				},
 			}
 
@@ -1097,30 +1385,52 @@ func (b *builder) addMutationFields(fields graphql.Fields, ti *tableInfo) {
 							return nil, err
 						}
 						set, _ := p.Args["_set"].(map[string]any)
-						n, err := b.runUpdate(p.Context, ti, id, set, cond)
+						_, rows, err := b.runUpdate(p.Context, ti, id, set, cond, writeOpts{returning: true})
 						if err != nil {
 							return nil, err
 						}
-						if n == 0 {
-							return nil, nil
-						}
-						rows, err := b.runSelect(p.Context, ti, id, listArgs{}, cond, true)
-						if err != nil {
-							return nil, err
-						}
-						if len(rows) == 0 {
-							return nil, nil
-						}
-						return rows[0], nil
+						return firstRow(rows), nil
 					},
 				}
+			}
+
+			for _, ul := range b.uniqueLookups(ti) {
+				if ul.names.update == "" {
+					continue
+				}
+				cols := ul.key.Columns
+				args := b.keyArgs(ti, cols)
+				args["_set"] = &graphql.ArgumentConfig{Type: graphql.NewNonNull(setInput)}
+				fields[ul.names.update] = &graphql.Field{
+					Type: b.objTypes[tn],
+					Description: fmt.Sprintf("Update one row of %s by its unique key %s (%s) and return it; "+
+						"_set may change the key itself.", tn, ul.key.Name, strings.Join(cols, ", ")),
+					Args: args,
+					Resolve: func(p graphql.ResolveParams) (any, error) {
+						id, err := identityFrom(p)
+						if err != nil {
+							return nil, err
+						}
+						cond, err := b.keyCond(ti, cols, p.Args)
+						if err != nil {
+							return nil, err
+						}
+						set, _ := p.Args["_set"].(map[string]any)
+						_, rows, err := b.runUpdate(p.Context, ti, id, set, cond, writeOpts{returning: true, keyCols: cols})
+						if err != nil {
+							return nil, err
+						}
+						return firstRow(rows), nil
+					},
+				}
+				b.optionalFields["mutation:"+ul.names.update] = true
 			}
 		}
 	}
 
 	if ti.access.Delete != nil && ti.access.Select != nil {
 		fields["delete_"+ti.typeName] = &graphql.Field{
-			Type:        graphql.NewNonNull(b.mutResp),
+			Type:        graphql.NewNonNull(b.mutationResponse(ti)),
 			Description: fmt.Sprintf("Delete rows of %s matching the filter (use where: {} to target all permitted rows).", tn),
 			Args: graphql.FieldConfigArgument{
 				"where": &graphql.ArgumentConfig{Type: graphql.NewNonNull(b.boolExps[tn])},
@@ -1135,11 +1445,12 @@ func (b *builder) addMutationFields(fields graphql.Fields, ti *tableInfo) {
 				if err != nil {
 					return nil, err
 				}
-				n, err := b.runDelete(p.Context, ti, id, userCond)
+				opts := writeOpts{returning: b.returningAvailable(ti) && b.wantsReturning(p)}
+				n, rows, err := b.runDelete(p.Context, ti, id, userCond, opts)
 				if err != nil {
 					return nil, err
 				}
-				return map[string]any{"affected_rows": n}, nil
+				return mutationResult(n, rows), nil
 			},
 		}
 
@@ -1157,47 +1468,43 @@ func (b *builder) addMutationFields(fields graphql.Fields, ti *tableInfo) {
 					if err != nil {
 						return nil, err
 					}
-					// Fetch first (respecting select + delete filters), then delete.
-					deleteCond, err := rbacCond(ti.access.Delete, id)
+					// The delete filter decides the row; the select filter only
+					// whether it is shown (read in the same transaction).
+					_, rows, err := b.runDelete(p.Context, ti, id, cond, writeOpts{returning: true})
 					if err != nil {
 						return nil, err
 					}
-					rows, err := b.runSelect(p.Context, ti, id, listArgs{}, combineConds(cond, deleteCond), true)
-					if err != nil {
-						return nil, err
-					}
-					n, err := b.runDelete(p.Context, ti, id, cond)
-					if err != nil {
-						return nil, err
-					}
-					if n == 0 || len(rows) == 0 {
-						return nil, nil
-					}
-					return rows[0], nil
+					return firstRow(rows), nil
 				},
 			}
 		}
-	}
-}
 
-// insertedPKCond figures out how to re-select a row that was just inserted.
-func (b *builder) insertedPKCond(ti *tableInfo, lastID int64, values map[string]any) (*condition, bool) {
-	pk := ti.table.PrimaryKey
-	if len(pk) == 1 {
-		col := ti.table.ColumnMap[pk[0]]
-		if col.AutoIncrement && lastID != 0 {
-			return &condition{sql: quoteIdent(col.Name) + " = ?", args: []any{lastID}}, true
+		for _, ul := range b.uniqueLookups(ti) {
+			if ul.names.delete == "" {
+				continue
+			}
+			cols := ul.key.Columns
+			fields[ul.names.delete] = &graphql.Field{
+				Type:        b.objTypes[tn],
+				Description: fmt.Sprintf("Delete one row of %s by its unique key %s (%s) and return it.", tn, ul.key.Name, strings.Join(cols, ", ")),
+				Args:        b.keyArgs(ti, cols),
+				Resolve: func(p graphql.ResolveParams) (any, error) {
+					id, err := identityFrom(p)
+					if err != nil {
+						return nil, err
+					}
+					cond, err := b.keyCond(ti, cols, p.Args)
+					if err != nil {
+						return nil, err
+					}
+					_, rows, err := b.runDelete(p.Context, ti, id, cond, writeOpts{returning: true, keyCols: cols})
+					if err != nil {
+						return nil, err
+					}
+					return firstRow(rows), nil
+				},
+			}
+			b.optionalFields["mutation:"+ul.names.delete] = true
 		}
 	}
-	var parts []string
-	var args []any
-	for _, pkName := range pk {
-		v, ok := values[pkName]
-		if !ok || v == nil {
-			return nil, false
-		}
-		parts = append(parts, quoteIdent(pkName)+" = ?")
-		args = append(args, v)
-	}
-	return &condition{sql: strings.Join(parts, " AND "), args: args}, true
 }

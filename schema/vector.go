@@ -163,6 +163,9 @@ func (b *builder) runNearest(ctx context.Context, ti *tableInfo, id *rbac.Identi
 	scanCols := append(append([]*introspect.Column{}, sel.Columns...), nil) // last slot = distance
 	out := []map[string]any{}
 	for rows.Next() {
+		if err := countRows(ctx, 1); err != nil {
+			return nil, err
+		}
 		vals := make([]any, len(scanCols))
 		ptrs := make([]any, len(scanCols))
 		for i := range vals {

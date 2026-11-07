@@ -35,6 +35,9 @@ CLI can mint dev tokens (`-print-token`).
   offset)`, `posts_by_pk(id)`, `posts_count(where)`, and mutations
   `insert_posts`, `insert_posts_one`, `update_posts(_by_pk)`,
   `delete_posts(_by_pk)` — each generated only if the role is allowed.
+  Bulk mutations return `affected_rows` plus **`returning { … }`** (with
+  relationships), and every UNIQUE index gets lookups and point mutations:
+  `users_by_email(email)`, `update_users_by_email`, `delete_users_by_email`.
 - **Relationships from foreign keys.** `posts { author { name } }` and
   `users { posts(where: …) { … } }` are generated from FK metadata, and the
   target table's RBAC (column set + row filter) applies to nested data too.
@@ -54,8 +57,10 @@ CLI can mint dev tokens (`-print-token`).
   literal string operators (`_ilike`, `_icontains`, `_starts_with`, …) are
   built in.
 - **Row-level security** via SQL filters with JWT claim bindings
-  (`filter: "author_id = :jwt.sub"`) and **column presets** that force values
-  from claims on insert/update (`presets: {author_id: ":jwt.sub"}`).
+  (`filter: "author_id = :jwt.sub"`), **column presets** that force values
+  from claims on insert/update (`presets: {author_id: ":jwt.sub"}`), and
+  **write checks** every inserted or updated row must pass, or the whole
+  mutation rolls back (`check: "org_id IN (:jwt.orgs)"`).
 - **Roles from your users table.** With `jwt.role_lookup`, tokens carry only
   the user id and the role is read from your identity table on each request —
   change a row's `role` column and it applies instantly, no token re-issue.
@@ -63,7 +68,9 @@ CLI can mint dev tokens (`-print-token`).
 - **Safe by construction**: claim values and all client inputs are always
   bound as SQL parameters; identifiers come from `information_schema` and are
   backtick-quoted; algorithm-pinned JWT verification (no alg confusion);
-  query depth limit; request body limit; DB errors masked unless `debug`.
+  query depth limit; request body limit; response row/byte limits; DB errors
+  masked unless `debug`, with expected ones (duplicate key, foreign key, …)
+  reported as safe messages with an `extensions.code`.
 
 ## Quickstart — one command
 
@@ -144,6 +151,8 @@ server:
   graphiql: true           # GET <path> serves GraphiQL — keep off in prod
   debug: true              # logs SQL+args, exposes DB errors — dev only
   max_query_depth: 15      # -1 disables
+  max_response_rows: 10000 # rows one request may return (0 = unlimited, the default)
+  max_response_bytes: 0    # size cap of the JSON response (0 = unlimited)
   hot_reload: true         # watch config + scripts, rebuild in place (dev only)
   reload_interval_seconds: 2
   cors:
@@ -191,10 +200,11 @@ roles:
     tables:
       "<table-or-*>":      # "*" is the fallback for tables not named explicitly
         select: true|false|{...}   # same shape for insert/update/delete
-        insert:
+        update:
           allow: true
           columns: [a, b]  # writable columns (select: readable). empty = all
           filter: "owner_id = :jwt.sub"   # rows the op may touch (select/update/delete)
+          check: "owner_id = :jwt.sub"    # insert/update: every written row must satisfy it
           presets:                        # forced values, hidden from the API
             owner_id: ":jwt.sub"          # from a claim — or a literal string
         # select (object form) also takes the `where` surface, all optional:
@@ -213,6 +223,7 @@ roles:
 | `select.filter` | SQL appended to every read — including `_by_pk`, `_count`, relationship hops, and mutation return values. `:jwt.<path>` binds claim values as parameters; arrays expand for `IN (…)`; an empty array matches nothing; a missing claim is an error, never "no filter". |
 | `insert/update.presets` | Server-forced column values. Preset columns are removed from the input types, so clients cannot even attempt to set them. |
 | `update/delete.filter` | Rows the role may touch. Everything else reports `affected_rows: 0`. |
+| `insert/update.check` | A row condition (same SQL + `:jwt.<path>` syntax as `filter`) that every inserted row, and every row an update leaves behind, must satisfy. One failing row rolls the whole mutation back with `extensions.code: permission_error`. See [Write checks](#write-checks). |
 | `"*"` wildcard | Applies to tables without an explicit entry. Unknown columns in wildcard rules are skipped per table; in named rules they are startup errors. |
 | `select.filterable_columns` | Which readable columns appear in `<table>_bool_exp` (default: all of them). A list (`[id, title]`) or a map of column → `all` / operator list. Non-filterable columns stay selectable. |
 | `select.filter_operators` | Table-wide operator allow-list, intersected with any per-column list (default: every operator, custom ones included; `[]` = none, i.e. no column filters on the table, and so no relationship filters either). |
@@ -222,9 +233,10 @@ Notes worth knowing:
 
 - Mutations other than plain `insert_<table>` require `select` on the same
   table (they return rows / take `where` filters built from readable columns).
-- `insert_<table>_one` / `update_<table>_by_pk` re-read the row through your
-  select filter — if the filter hides it, you get `null` back (the write still
-  happened).
+- `insert_<table>_one` / `update_<table>_by_pk` (and `returning`) re-read the
+  row through your select filter, inside the mutation's transaction — if the
+  filter hides it, you get `null` back (the write still happened). Use a
+  `check` to stop a role from writing rows it could not see.
 - Roles are startup-validated against the real schema: a typo'd table or
   column name in the YAML refuses to boot. The same goes for unknown
   operator names, operators that don't apply to a column's type (in named
@@ -285,15 +297,19 @@ posts_aggregate(where: posts_bool_exp): posts_aggregate_result!
   #   stddev_samp {..}  variance {..}  var_pop {..}  var_samp {..} }
 posts_nearest_by_<vectorcol>(to: Vector!, metric: vector_metric, first: Int, where: posts_bool_exp): [posts_neighbor!]!
   # posts_neighbor { node: posts!  distance: Float! }   (only for VECTOR columns)
+users_by_email(email: String!): users          # one per UNIQUE index (see "Lookups by unique key")
 
 # mutations
-insert_posts(objects: [posts_insert_input!]!): mutation_response!
+insert_posts(objects: [posts_insert_input!]!): posts_mutation_response!
 insert_posts_one(object: posts_insert_input!): posts
-update_posts(where: posts_bool_exp!, _set: posts_set_input!): mutation_response!
+update_posts(where: posts_bool_exp!, _set: posts_set_input!): posts_mutation_response!
 update_posts_by_pk(id: BigInt!, _set: posts_set_input!): posts
-delete_posts(where: posts_bool_exp!): mutation_response!
+delete_posts(where: posts_bool_exp!): posts_mutation_response!
 delete_posts_by_pk(id: BigInt!): posts
-  # mutation_response { affected_rows: Int! }
+update_users_by_email(email: String!, _set: users_set_input!): users
+delete_users_by_email(email: String!): users
+  # posts_mutation_response implements mutation_response { affected_rows: Int! }
+  #   and adds returning: [posts!]! (see "Mutation results")
   # (count, total_count and affected_rows are BigInt! with schema_gen.count_type: BigInt)
 
 # on each row type, per array relationship (here users <- posts.author_id)
@@ -331,7 +347,14 @@ Schema-generation details that just work:
   tables (or a table and a reserved name) would produce the same GraphQL
   field or type — e.g. `users` + `users_connection`, or a table named
   `order_by` — the server refuses to boot instead of silently dropping an
-  operation.
+  operation. The newer generated names never do: a unique-key field whose
+  name is already taken (by another generated field, or by a custom field
+  from `hooks/`, which keeps it) is left out with a startup warning, and
+  `<t>_mutation_response` gets a numeric suffix if a table already owns
+  that name — so a schema that booted before still boots.
+- **`AUTO_RANDOM` primary keys** are recognized (TiDB reports them in
+  `information_schema.tables`, not as `auto_increment`): they are optional
+  on insert, and `insert_<t>_one` / `returning` find the generated rows.
 
 ## Layout
 
@@ -347,7 +370,8 @@ rbac/                role resolution, row-filter compilation, claim lookup
 auth/                JWT verification middleware (alg-pinned) + DB role resolver
 schema/              per-role GraphQL schema, parameterized SQL, where/filter
                      surface (operators, relationship EXISTS), dataloader,
-                     keyset pagination, aggregates, vector search, hooks
+                     keyset pagination, aggregates, vector search, hooks,
+                     writes (returning, checks), error codes, response limits
 server/              HTTP handler, GraphiQL (embedded), CORS, depth limit
 options.go           hook resolution (YAML names → hooks/ registry) + JWT signer
 cmd/gqlgate/         CLI: serve (with startup retry) + -print-token
@@ -744,6 +768,181 @@ role filter and any `where`). `VECTOR` columns are exposed as a `Vector` scalar
 because gqlgate serves a per-role schema, GraphQL codegen produces types that
 are accurate for that role.
 
+### Mutation results (`returning`)
+
+`insert_<t>`, `update_<t>` and `delete_<t>` return `<t>_mutation_response`:
+the `affected_rows` count plus `returning`, the written rows with any
+fields and relationships of the row type:
+
+```graphql
+mutation {
+  insert_posts(objects: [{title: "a"}, {title: "b"}]) {
+    affected_rows
+    returning { id title author { name } }
+  }
+  delete_comments(where: {post_id: {_eq: 7}}) { affected_rows returning { id body } }
+}
+```
+
+TiDB has no `RETURNING` clause, so the rows are read back inside the
+mutation's own transaction, and only when `returning` is selected (otherwise
+an update or delete stays a single statement):
+
+- **insert** runs one `INSERT` per object and records each row's primary key —
+  the supplied value, or `LAST_INSERT_ID()` for an `AUTO_INCREMENT` /
+  `AUTO_RANDOM` key (one row per statement, so non-contiguous `AUTO_RANDOM`
+  values are exact). Rows come back in input order. A row whose key a column
+  default generates (e.g. `DEFAULT (UUID())`) cannot be found again and is
+  left out, as `insert_<t>_one` returns `null` for it — supply such keys
+  explicitly.
+- **update** locks the matching keys first (`SELECT <pk> … WHERE <where> AND
+  <update filter> FOR UPDATE`), updates exactly those rows and re-reads them
+  (by their new key if `_set` changed it). Rows come back in key order.
+- **delete** locks the keys matching `<where> AND <delete filter>`, reads those
+  rows, then deletes them. Which rows are deleted depends only on the DELETE
+  permission.
+
+`returning` shows rows through the role's **select** permission — its columns
+and row filter — so a row written (or deleted) that the role cannot read
+counts in `affected_rows` but is not returned. `returning` exists when the
+role can select the table and the table has a primary key (it need not be
+readable); otherwise the type has `affected_rows` only. Each
+`<t>_mutation_response` implements the `mutation_response` interface, so
+`... on mutation_response { affected_rows }` keeps working. Returned rows
+count against `server.max_response_rows`; going over rolls the mutation back.
+
+### Write checks
+
+`filter` decides which existing rows a role may update or delete. A
+**`check`** constrains the rows a write produces: every row an insert writes,
+and every row an update leaves behind, must satisfy it.
+
+```yaml
+roles:
+  author:
+    tables:
+      comments:
+        insert:
+          allow: true
+          columns: [post_id, body]
+          presets: {user_id: ":jwt.sub"}
+          # only comment on posts you can see
+          check: "post_id IN (SELECT id FROM posts WHERE published = 1 OR author_id = :jwt.sub)"
+      posts:
+        update:
+          allow: true
+          columns: [title, body, status, org_id]
+          filter: "org_id IN (:jwt.orgs)"   # rows you may touch ...
+          check: "org_id IN (:jwt.orgs)"    # ... and may not move out of reach
+```
+
+```graphql
+mutation { update_posts_by_pk(id: 7, _set: {org_id: 999}) { id } }
+# errors: [{ message: "permission check failed: … update check …", extensions: { code: "permission_error" } }]
+```
+
+- Same syntax as `filter`: SQL over the table's columns (subqueries allowed),
+  `:jwt.<path>` claims bound as parameters.
+- It runs inside the mutation's transaction, after the before-hooks and the
+  write and before the after-hooks: the rows are counted with
+  `SELECT COUNT(*) … WHERE <written keys> AND (<check>) IS NOT TRUE`, and any
+  such row — including one where the check comes out `NULL` — rolls the
+  **whole** mutation back (all objects of a bulk insert, all rows of a bulk
+  update). After-hooks never see rows that are about to be rolled back.
+- Presets are applied before the check sees the row, as are column defaults
+  and generated columns (the check reads the row as stored).
+- It applies to `insert_<t>`, `insert_<t>_one`, `update_<t>`,
+  `update_<t>_by_pk` and `update_<t>_by_<unique key>`. It is optional and
+  never inferred from `filter`.
+- The table needs a primary key (the written rows are found again by it);
+  a check on a table without one fails at startup. Every check is dry-run
+  against its table at startup, so a typo fails the boot (or a hot reload),
+  not every write. For an insert, a key generated by a column default (not
+  `AUTO_INCREMENT`/`AUTO_RANDOM`) must be supplied explicitly.
+- `check` is accepted on insert and update only. **`insert.filter`** — accepted
+  but ignored by earlier versions — is now enforced as the insert check (a
+  startup warning suggests renaming it); setting both is an error.
+
+### Lookups by unique key
+
+Every UNIQUE index whose columns are all `NOT NULL` gets a select-one root
+field, and point mutations where the role may update/delete:
+
+```graphql
+query { users_by_email(email: "ada@example.com") { id name } }
+query { tags_by_owner_id_and_slug(owner_id: 1, slug: "go") { id label } }
+mutation { update_users_by_email(email: "ada@example.com", _set: {email: "ada@new.example"}) { id email } }
+mutation { delete_users_by_username(username: "temp") { id } }
+```
+
+- Names are `<t>_by_<col1>_and_<col2>…` (`update_` / `delete_` prefixed for
+  mutations), arguments are the key columns (non-null). They behave like the
+  `_by_pk` fields: the role's select (and update/delete) row filters apply,
+  and they return the row or `null`. An update may change the key itself;
+  the row is re-read by its new key.
+- A role gets them only if it can **read** every key column and **filter** on
+  it with `_eq` (the lookup is that equality filter), so they never probe a
+  column the role's permissions hide. Point mutations also need the select
+  permission, like `_by_pk`.
+- Skipped: nullable unique indexes (they admit many `NULL`s), prefix
+  (`col(10)`) and expression indexes, and an index on the primary key's
+  columns (`_by_pk` covers it). A name that is already taken is skipped with a
+  startup warning (see the schema-generation notes above).
+
+### Errors
+
+Errors follow the GraphQL spec, and carry an `extensions.code`:
+
+| `extensions.code` | Cause (TiDB/MySQL error) |
+|---|---|
+| `constraint_violation` | duplicate value for a unique key (1062, 1586) |
+| `foreign_key_violation` | referenced row missing (1452) or row still referenced (1451) |
+| `not_null_violation` | `NULL` into a `NOT NULL` column (1048, 1364) |
+| `data_too_long` | value longer than the column (1406) |
+| `data_exception` | value out of range or invalid for the column (1264, 1690, 1265, 1292, 1366) |
+| `check_violation` | a table `CHECK` constraint failed (3819; needs `tidb_enable_check_constraint`) |
+| `conflict` | lock wait timeout, deadlock, write conflict or schema change during the transaction (1205, 1213, 8002, 8022, 8028, 9007) — retry |
+| `timeout` | the request ran past `database.query_timeout_seconds` |
+| `database_error` | anything else the database reported |
+| `permission_error` | a row failed the role's insert/update `check` |
+| `response_too_large` | `server.max_response_rows` / `max_response_bytes` exceeded |
+
+```json
+{ "data": { "insert_users_one": null },
+  "errors": [{ "message": "unique constraint violated: a row with the same key already exists",
+               "path": ["insert_users_one"], "extensions": { "code": "constraint_violation" } }] }
+```
+
+Messages are fixed, safe texts: the database's own message (which can quote
+the conflicting value, key names or SQL) is logged server-side and only
+returned with `server.debug: true`, which also adds `db_error_number`. The
+same mapping covers errors raised at `COMMIT` (e.g. an optimistic-transaction
+write conflict). Errors returned by hooks pass through unchanged.
+
+### Response limits
+
+List arguments are clamped one by one (`max_page_size`), but aliases and
+nested relationships multiply them. Two server settings bound a whole
+request:
+
+```yaml
+server:
+  max_response_rows: 10000   # rows one request may return (0 = unlimited)
+  max_response_bytes: 8388608  # size of the encoded JSON response (0 = unlimited)
+```
+
+- **Rows** counts every row a request returns: connection nodes, `_by_pk` and
+  unique-key lookups, relationship rows (each time they appear), vector
+  search results and mutation `returning` rows (aggregates are one row). The
+  request fails with `extensions.code: response_too_large` and `data: null`
+  as soon as it goes over. A mutation whose `returning` goes over is rolled
+  back; once a mutation has committed (a later field of the same request
+  goes over), its partial result is kept so the write is visible.
+- **Bytes** replaces a larger response with a single `response_too_large`
+  error (noting when a mutation was nonetheless applied).
+- Both default to 0 (unlimited), so existing configs behave as before. They
+  are read per request, so a hot reload changes them.
+
 ## Custom hooks & fields (the `hooks/` directory)
 
 gqlgate is extensible with your own Go code — for custom sign-up/sign-in and
@@ -791,7 +990,8 @@ What hook files can do:
   CRUD (`before_insert`, `after_update`, …, wired per table in YAML). They run
   **inside the mutation's transaction**: return an error to roll the write
   back; use `ev.Tx` to read/write atomically with it (e.g. audit rows).
-  `ev` carries `Op/Table/Role/Claims/Values/Affected`.
+  `ev` carries `Op/Table/Role/Claims/Values/Affected`. After-hooks run once
+  the role's write `check` has passed, so they never see rolled-back rows.
 - **`register.CustomField(def)`** — extra root queries/mutations with full
   graphql-go control over args/types/resolver, mounted only for the roles in
   `AllowedRoles` (empty = all). Inside a resolver,
@@ -875,6 +1075,17 @@ private database directly to verify what actually happened.
 - A role's select filter that doesn't resolve against its own table (see RBAC
   notes) disables relationship filters into that table for the role rather
   than failing startup — watch the startup log for the warning.
+- `returning` and write checks need a primary key on the table; `returning`
+  leaves out inserted rows whose key a column default (not `AUTO_INCREMENT`
+  / `AUTO_RANDOM`) generates, and a check refuses such inserts unless the key
+  is supplied. With `returning` or a check, an update/delete holds the keys
+  of all matching rows in memory (written in chunks of 1000).
+- Unique-key fields cover plain UNIQUE indexes on `NOT NULL` columns only (no
+  nullable, prefix or expression indexes); there is no YAML override for
+  their names.
+- `SELECT … FOR UPDATE` only blocks in pessimistic transactions (TiDB's
+  default); in optimistic mode a concurrent write to the same rows makes the
+  commit fail with `extensions.code: conflict` instead.
 
 ## Hardening notes
 
@@ -892,4 +1103,10 @@ escaped; aggregate and
 relationship selections are computed correctly even when the client wraps them
 in fragments; vector search skips NULL-vector rows; DB errors are masked from
 clients unless `server.debug` is on; and identifier/name collisions are
-rejected at startup rather than silently dropping an operation.
+rejected at startup rather than silently dropping an operation. Writes are
+checked inside their transaction (`insert/update.check`, NULL counts as a
+failure), a delete's rows depend only on the delete permission even when
+`returning` reads them through the select permission, unique-key lookups
+exist only for columns the role may read and `_eq`-filter, expected database
+errors carry codes without leaking the database's message, and response
+row/byte limits bound alias and relationship fan-out.

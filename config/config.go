@@ -103,6 +103,16 @@ type Server struct {
 	// HotReload is on. Default 2. (Polling is used rather than filesystem
 	// events because it is reliable across Docker bind mounts.)
 	ReloadIntervalSeconds int `yaml:"reload_interval_seconds"`
+	// MaxResponseRows caps the number of rows one request may read for its
+	// response (every page, relationship batch, vector search and mutation
+	// `returning` counts). A request that goes over fails with the error
+	// code response_too_large instead of returning a huge result. 0 (the
+	// default) = unlimited.
+	MaxResponseRows int `yaml:"max_response_rows"`
+	// MaxResponseBytes caps the size of the encoded JSON response; a larger
+	// one is replaced by a response_too_large error. 0 (the default) =
+	// unlimited.
+	MaxResponseBytes int `yaml:"max_response_bytes"`
 }
 
 // CORS configures cross-origin access (useful when GraphiQL or a SPA runs on
@@ -220,6 +230,7 @@ type TablePerm struct {
 //	  allow: true
 //	  columns: ["id", "title"]        # for select: readable; insert/update: writable
 //	  filter: "author_id = :jwt.sub"  # row-level filter, claims bound as params
+//	  check: "status IN ('draft', 'review')"  # insert/update: every written row must satisfy it
 //	  presets:                        # insert/update: server-forced column values
 //	    author_id: ":jwt.sub"
 //
@@ -238,6 +249,11 @@ type OpPerm struct {
 	Columns []string          `yaml:"columns"`
 	Filter  string            `yaml:"filter"`
 	Presets map[string]string `yaml:"presets"`
+	// Check is a row condition (same SQL + :jwt.<claim> syntax as Filter)
+	// that every row an insert writes, or an update leaves behind, must
+	// satisfy; otherwise the whole mutation is rolled back. insert/update
+	// only.
+	Check string `yaml:"check"`
 
 	// FilterableColumns restricts which readable columns appear in the
 	// role's <table>_bool_exp, optionally with per-column operator lists.
@@ -468,5 +484,40 @@ func (c *Config) validate() error {
 	if c.JWT.RoleLookup.Enabled() && c.JWT.RoleLookup.CacheSeconds < 0 {
 		return fmt.Errorf("jwt.role_lookup.cache_seconds must be >= 0")
 	}
+	if c.Server.MaxResponseRows < 0 {
+		return fmt.Errorf("server.max_response_rows must be >= 0 (0 = unlimited)")
+	}
+	if c.Server.MaxResponseBytes < 0 {
+		return fmt.Errorf("server.max_response_bytes must be >= 0 (0 = unlimited)")
+	}
+	if err := c.validateChecks(); err != nil {
+		return err
+	}
 	return c.validateFilterSurface()
+}
+
+// validateChecks rejects write checks where they have no meaning: a check
+// constrains the rows a write produces, so only insert and update take one.
+// An insert rule may not carry both filter (accepted as the check for
+// backward compatibility) and check.
+func (c *Config) validateChecks() error {
+	for roleName, role := range c.Roles {
+		if role == nil {
+			continue
+		}
+		for tableName, tp := range role.Tables {
+			if tp == nil {
+				continue
+			}
+			for opName, perm := range map[string]*OpPerm{"select": tp.Select, "delete": tp.Delete} {
+				if perm != nil && perm.Check != "" {
+					return fmt.Errorf("role %q, table %q: check applies to insert and update only, not %s (use filter to restrict which rows %s sees)", roleName, tableName, opName, opName)
+				}
+			}
+			if ins := tp.Insert; ins != nil && ins.Filter != "" && ins.Check != "" {
+				return fmt.Errorf("role %q, table %q: insert has both filter and check; an insert filter is enforced as the check, so keep only check", roleName, tableName)
+			}
+		}
+	}
+	return nil
 }

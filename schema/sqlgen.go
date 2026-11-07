@@ -2,7 +2,6 @@ package schema
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"sort"
 	"strings"
@@ -247,7 +246,15 @@ func (b *builder) runSelect(ctx context.Context, ti *tableInfo, id *rbac.Identit
 	query := "SELECT " + selectList(sel.Columns) + " FROM " + b.qualifiedTable(ti.table) +
 		" WHERE " + where.sql + orderClause + limitClause
 	args := append(append([]any{}, where.args...), limitArgs...)
-	return b.scanRows(ctx, sel.Columns, query, args)
+	rows, err := b.scanRows(ctx, sel.Columns, query, args)
+	if err != nil {
+		return nil, err
+	}
+	// Every caller returns all of these rows to the client.
+	if err := countRows(ctx, len(rows)); err != nil {
+		return nil, err
+	}
+	return rows, nil
 }
 
 func selectList(cols []*introspect.Column) string {
@@ -268,8 +275,14 @@ func (b *builder) scanRows(ctx context.Context, cols []*introspect.Column, query
 // scanRowsExtra is scanRows for a SELECT that lists nExtra raw values after
 // cols (e.g. key weights); those are returned per row, unconverted.
 func (b *builder) scanRowsExtra(ctx context.Context, cols []*introspect.Column, nExtra int, query string, args []any) ([]map[string]any, [][]any, error) {
+	return b.scanRowsOn(ctx, b.opt.DB, cols, nExtra, query, args)
+}
+
+// scanRowsOn is scanRowsExtra through q (the pool, or a mutation's
+// transaction).
+func (b *builder) scanRowsOn(ctx context.Context, q queryer, cols []*introspect.Column, nExtra int, query string, args []any) ([]map[string]any, [][]any, error) {
 	b.logSQL(query, args)
-	rows, err := b.opt.DB.QueryContext(ctx, query, args...)
+	rows, err := q.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, nil, b.dbErr(err)
 	}
@@ -536,90 +549,6 @@ func mergedRowValues(ti *tableInfo, oa *rbac.OpAccess, obj map[string]any, id *r
 	return cols, vals, nil
 }
 
-// runInsert inserts the given objects in one transaction and returns the
-// number of inserted rows and the last insert id of the final row.
-func (b *builder) runInsert(ctx context.Context, ti *tableInfo, id *rbac.Identity, objects []any) (int64, int64, map[string]any, error) {
-	oa := ti.access.Insert
-	if oa == nil {
-		return 0, 0, nil, fmt.Errorf("insert into %q is not permitted for role %q", ti.table.Name, b.role)
-	}
-	if len(objects) == 0 {
-		return 0, 0, nil, fmt.Errorf("objects must not be empty")
-	}
-
-	// Resolve every object's columns/values first, so lifecycle hooks see the
-	// full batch (with presets applied) before anything is written.
-	type mergedRow struct {
-		cols []*introspect.Column
-		vals []any
-	}
-	merged := make([]mergedRow, 0, len(objects))
-	eventValues := make([]map[string]any, 0, len(objects))
-	for _, item := range objects {
-		obj, ok := item.(map[string]any)
-		if !ok {
-			return 0, 0, nil, fmt.Errorf("insert objects must be objects")
-		}
-		cols, vals, err := mergedRowValues(ti, oa, obj, id)
-		if err != nil {
-			return 0, 0, nil, err
-		}
-		if len(cols) == 0 {
-			return 0, 0, nil, fmt.Errorf("insert object for %q has no columns", ti.table.Name)
-		}
-		merged = append(merged, mergedRow{cols, vals})
-		rowMap := make(map[string]any, len(cols))
-		for i, c := range cols {
-			rowMap[c.Name] = vals[i]
-		}
-		eventValues = append(eventValues, rowMap)
-	}
-
-	tx, err := b.opt.DB.BeginTx(ctx, nil)
-	if err != nil {
-		return 0, 0, nil, b.dbErr(err)
-	}
-	defer tx.Rollback()
-
-	ev := &MutationEvent{Op: OpInsert, Table: ti.table.Name, Role: b.role, Claims: id.Claims, Values: eventValues, Tx: tx}
-	if err := b.opt.Hooks.runBefore(ctx, ev); err != nil {
-		return 0, 0, nil, err
-	}
-
-	var affected, lastID int64
-	var lastValues map[string]any
-	for _, m := range merged {
-		names := make([]string, len(m.cols))
-		for i, c := range m.cols {
-			names[i] = quoteIdent(c.Name)
-		}
-		query := "INSERT INTO " + b.qualifiedTable(ti.table) +
-			" (" + strings.Join(names, ", ") + ") VALUES (" +
-			strings.TrimSuffix(strings.Repeat("?, ", len(m.cols)), ", ") + ")"
-		b.logSQL(query, m.vals)
-		res, err := tx.ExecContext(ctx, query, m.vals...)
-		if err != nil {
-			return 0, 0, nil, b.dbErr(err)
-		}
-		n, _ := res.RowsAffected()
-		affected += n
-		lastID, _ = res.LastInsertId()
-		lastValues = map[string]any{}
-		for i, c := range m.cols {
-			lastValues[c.Name] = m.vals[i]
-		}
-	}
-
-	ev.Affected = int(affected)
-	if err := b.opt.Hooks.runAfter(ctx, ev); err != nil {
-		return 0, 0, nil, err
-	}
-	if err := tx.Commit(); err != nil {
-		return 0, 0, nil, b.dbErr(err)
-	}
-	return affected, lastID, lastValues, nil
-}
-
 // setClause builds the SET part of an UPDATE from the _set input + presets.
 // It also returns the resolved column map (SQL names -> bound values, presets
 // merged) so callers can surface the true written values to lifecycle hooks.
@@ -661,133 +590,8 @@ func setClause(ti *tableInfo, oa *rbac.OpAccess, set map[string]any, id *rbac.Id
 	return strings.Join(parts, ", "), args, byCol, nil
 }
 
-func (b *builder) runUpdate(ctx context.Context, ti *tableInfo, id *rbac.Identity, set map[string]any, where *condition) (int64, error) {
-	oa := ti.access.Update
-	if oa == nil {
-		return 0, fmt.Errorf("update on %q is not permitted for role %q", ti.table.Name, b.role)
-	}
-	setSQL, setArgs, setValues, err := setClause(ti, oa, set, id)
-	if err != nil {
-		return 0, err
-	}
-	filterCond, err := rbacCond(oa, id)
-	if err != nil {
-		return 0, err
-	}
-	cond := combineConds(where, filterCond)
-	query := "UPDATE " + b.qualifiedTable(ti.table) + " SET " + setSQL + " WHERE " + cond.sql
-	args := append(setArgs, cond.args...)
-
-	return b.execInTx(ctx, func(tx *sql.Tx) (int64, error) {
-		// Values matches the insert path's contract: SQL column names, presets
-		// applied, values bound — so a hook sees what is actually written.
-		ev := &MutationEvent{Op: OpUpdate, Table: ti.table.Name, Role: b.role, Claims: id.Claims, Values: []map[string]any{setValues}, Tx: tx}
-		if err := b.opt.Hooks.runBefore(ctx, ev); err != nil {
-			return 0, err
-		}
-		b.logSQL(query, args)
-		res, err := tx.ExecContext(ctx, query, args...)
-		if err != nil {
-			return 0, b.dbErr(err)
-		}
-		n, _ := res.RowsAffected()
-		ev.Affected = int(n)
-		if err := b.opt.Hooks.runAfter(ctx, ev); err != nil {
-			return 0, err
-		}
-		return n, nil
-	})
-}
-
-func (b *builder) runDelete(ctx context.Context, ti *tableInfo, id *rbac.Identity, where *condition) (int64, error) {
-	oa := ti.access.Delete
-	if oa == nil {
-		return 0, fmt.Errorf("delete on %q is not permitted for role %q", ti.table.Name, b.role)
-	}
-	filterCond, err := rbacCond(oa, id)
-	if err != nil {
-		return 0, err
-	}
-	cond := combineConds(where, filterCond)
-	query := "DELETE FROM " + b.qualifiedTable(ti.table) + " WHERE " + cond.sql
-
-	return b.execInTx(ctx, func(tx *sql.Tx) (int64, error) {
-		ev := &MutationEvent{Op: OpDelete, Table: ti.table.Name, Role: b.role, Claims: id.Claims, Tx: tx}
-		if err := b.opt.Hooks.runBefore(ctx, ev); err != nil {
-			return 0, err
-		}
-		b.logSQL(query, cond.args)
-		res, err := tx.ExecContext(ctx, query, cond.args...)
-		if err != nil {
-			return 0, b.dbErr(err)
-		}
-		n, _ := res.RowsAffected()
-		ev.Affected = int(n)
-		if err := b.opt.Hooks.runAfter(ctx, ev); err != nil {
-			return 0, err
-		}
-		return n, nil
-	})
-}
-
-// execInTx runs fn inside a transaction, committing on success and rolling
-// back on error. It lets update/delete run their lifecycle hooks atomically
-// with the write (a hook returning an error rolls the whole thing back).
-func (b *builder) execInTx(ctx context.Context, fn func(tx *sql.Tx) (int64, error)) (int64, error) {
-	tx, err := b.opt.DB.BeginTx(ctx, nil)
-	if err != nil {
-		return 0, b.dbErr(err)
-	}
-	defer tx.Rollback()
-	n, err := fn(tx)
-	if err != nil {
-		return 0, err
-	}
-	if err := tx.Commit(); err != nil {
-		return 0, b.dbErr(err)
-	}
-	return n, nil
-}
-
-// pkCond builds the primary-key equality condition from by_pk arguments.
-func (b *builder) pkCond(ti *tableInfo, args map[string]any) (*condition, error) {
-	var parts []string
-	var vals []any
-	for _, pkName := range ti.table.PrimaryKey {
-		col := ti.table.ColumnMap[pkName]
-		v, ok := args[ti.colToField[pkName]]
-		if !ok || v == nil {
-			return nil, fmt.Errorf("missing primary key argument %q", ti.colToField[pkName])
-		}
-		bound, err := bindValue(col, v)
-		if err != nil {
-			return nil, err
-		}
-		parts = append(parts, quoteIdent(col.Name)+" = ?")
-		vals = append(vals, bound)
-	}
-	return &condition{sql: strings.Join(parts, " AND "), args: vals}, nil
-}
-
 func (b *builder) logSQL(query string, args []any) {
 	if b.opt.Config.Server.Debug && b.opt.Logger != nil {
 		b.opt.Logger.Debug("sql", "role", b.role, "query", query, "args", fmt.Sprintf("%v", args))
 	}
-}
-
-// dbErr hides database error details from clients unless debug mode is on.
-func (b *builder) dbErr(err error) error {
-	if err == nil {
-		return nil
-	}
-	if b.opt.Config.Server.Debug {
-		return err
-	}
-	if b.opt.Logger != nil {
-		b.opt.Logger.Error("database error", "role", b.role, "err", err)
-	}
-	if err == sql.ErrNoRows {
-		return err
-	}
-	return fmt.Errorf("database error (enable server.debug to see details)")
 }

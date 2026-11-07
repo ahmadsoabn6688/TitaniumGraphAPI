@@ -8,12 +8,15 @@ import (
 	"context"
 	_ "embed"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strings"
 	"time"
 
 	"github.com/graphql-go/graphql"
+	"github.com/graphql-go/graphql/gqlerrors"
 
 	"gqlgate/auth"
 	"gqlgate/config"
@@ -115,6 +118,8 @@ func (s *srv) execute(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	// Per-request relationship dataloaders (batch N+1 relationship queries).
 	ctx = gqlschema.WithLoaders(ctx)
+	// Per-request response row budget (server.max_response_rows).
+	ctx = gqlschema.WithResponseLimit(ctx, st.Cfg.Server.MaxResponseRows)
 
 	start := time.Now()
 	result := graphql.Do(graphql.Params{
@@ -124,6 +129,10 @@ func (s *srv) execute(w http.ResponseWriter, r *http.Request) {
 		OperationName:  req.OperationName,
 		Context:        ctx,
 	})
+	restoreExtensions(result.Errors)
+	if gqlschema.ResponseLimitExceeded(ctx) {
+		limitResult(result, gqlschema.MutationCommitted(ctx))
+	}
 	if st.Cfg.Server.Debug && s.logger != nil {
 		s.logger.Debug("graphql",
 			"role", id.Role,
@@ -132,10 +141,87 @@ func (s *srv) execute(w http.ResponseWriter, r *http.Request) {
 			"errors", len(result.Errors))
 	}
 
+	out, err := json.Marshal(result)
+	if err != nil {
+		if s.logger != nil {
+			s.logger.Error("encoding response", "err", err)
+		}
+		auth.WriteError(w, http.StatusInternalServerError, "could not encode the response")
+		return
+	}
+	if limit := st.Cfg.Server.MaxResponseBytes; limit > 0 && len(out) > limit {
+		out = tooLargeBody(len(out), limit, gqlschema.MutationCommitted(ctx))
+	}
 	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(result); err != nil && s.logger != nil {
+	if _, err := w.Write(append(out, '\n')); err != nil && s.logger != nil {
 		s.logger.Error("writing response", "err", err)
 	}
+}
+
+// restoreExtensions puts back the extensions (error codes) of errors that
+// graphql-go dropped: an error returned from a deferred (batched) resolver is
+// formatted without them. The code travels in the original error.
+func restoreExtensions(errs []gqlerrors.FormattedError) {
+	for i := range errs {
+		if errs[i].Extensions != nil {
+			continue
+		}
+		var err error = errs[i].OriginalError()
+		for depth := 0; err != nil && depth < 8; depth++ {
+			if ext, ok := err.(gqlerrors.ExtendedError); ok {
+				errs[i].Extensions = ext.Extensions()
+				break
+			}
+			switch e := err.(type) {
+			case gqlerrors.FormattedError:
+				err = e.OriginalError()
+			case *gqlerrors.Error:
+				err = e.OriginalError
+			default:
+				err = errors.Unwrap(err)
+			}
+		}
+	}
+}
+
+// limitResult turns a request that ran over server.max_response_rows into a
+// failure: the partial data is dropped (one response_too_large error stays)
+// unless a mutation already committed, whose partial result is kept so the
+// client can see the write happened.
+func limitResult(result *graphql.Result, committed bool) {
+	if committed {
+		return
+	}
+	result.Data = nil
+	var kept []gqlerrors.FormattedError
+	limitSeen := false
+	for _, e := range result.Errors {
+		if e.Extensions["code"] == gqlschema.CodeResponseTooLarge {
+			if limitSeen {
+				continue
+			}
+			limitSeen = true
+		}
+		kept = append(kept, e)
+	}
+	result.Errors = kept
+}
+
+// tooLargeBody is the response sent instead of one over
+// server.max_response_bytes.
+func tooLargeBody(size, limit int, committed bool) []byte {
+	msg := fmt.Sprintf("response too large: %d bytes exceeds server.max_response_bytes (%d); ask for fewer rows or fields", size, limit)
+	if committed {
+		msg += " (the mutation itself was applied)"
+	}
+	body, _ := json.Marshal(map[string]any{
+		"data": nil,
+		"errors": []map[string]any{{
+			"message":    msg,
+			"extensions": map[string]any{"code": gqlschema.CodeResponseTooLarge},
+		}},
+	})
+	return body
 }
 
 func wantsHTML(r *http.Request) bool {
