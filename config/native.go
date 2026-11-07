@@ -196,7 +196,10 @@ var nativeParamPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 // claim references (:jwt.x; declare an argument and preset it per role
 // instead) or the keywords of writes, locking reads, SELECT … INTO and DDL.
 // Quoted strings, quoted identifiers and comments are skipped, so a ':' or
-// '?' inside them is just text.
+// '?' inside them is just text. Comments are removed from the statement
+// (TiDB's /*T! … */ executable comments with them), except optimizer hints
+// (/*+ … */), which are kept verbatim; executable /*! … */ comments are
+// rejected.
 func CompileNativeSQL(src string) (*NativeSQL, error) {
 	s := strings.TrimRightFunc(src, isSQLSpace)
 	s = strings.TrimSuffix(s, ";")
@@ -239,6 +242,18 @@ func CompileNativeSQL(src string) (*NativeSQL, error) {
 			}
 			if i+2 < len(s) && s[i+2] == '!' {
 				return nil, fmt.Errorf("executable comments (/*! … */) are not allowed")
+			}
+			if i+2 < len(s) && s[i+2] == '+' {
+				// An optimizer hint (/*+ USE_INDEX(…) */) is kept verbatim so
+				// it reaches TiDB; it holds no parameters or placeholders.
+				body := s[i+3 : i+2+end]
+				if strings.ContainsAny(body, ";?") {
+					return nil, fmt.Errorf("optimizer hints (/*+ … */) may not contain ; or ?")
+				}
+				seg.WriteString(s[i : i+end+4])
+				i += end + 4
+				prevDot = false
+				continue
 			}
 			seg.WriteString(" ")
 			i += end + 4

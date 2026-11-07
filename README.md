@@ -811,7 +811,10 @@ WHERE <where> AND (<role filter>) [AND `post_id` > ? ORDER BY `post_id`] LIMIT ?
   filter. `root_fields.connection` renames it.
 - Types: `<T>`, `<T>_bool_exp`, `<T>_arguments`, `<T>_connection`, where
   `<T>` is `type_name` or the query name. Like every generated name they are
-  checked for collisions at startup.
+  checked for collisions at startup: a native root field or type that any
+  table already generates — including a unique-key lookup such as
+  `users_by_email` and the default `<t>_list` field — fails startup (or the
+  reload) instead of replacing the table's field.
 - Not generated: `_aggregate`, `_by_pk`, `order_by`/`offset` (collection
   reads stay cursor-only) and mutations. Count inside the statement, or use
   the connection's `total_count`.
@@ -827,7 +830,13 @@ locking reads and DDL (`INSERT`, `UPDATE`, `DELETE`, `REPLACE`, `INTO`,
 functions `INSERT(…)` / `REPLACE(…)` are fine). Since it only ever runs as a
 derived table, nothing but a query expression could execute anyway. Quoted
 strings, quoted identifiers and comments are skipped when looking for
-parameters.
+parameters. Comments are removed from the executed statement (TiDB's
+`/*T! … */` executable comments with them), except **optimizer hints**:
+`/*+ … */` is kept verbatim (it may not contain `;` or `?`), so
+`SELECT /*+ USE_INDEX(posts, idx_author) */ …` or `READ_FROM_STORAGE(…)`
+reaches TiDB. Hints apply to their own query block, which is now the derived
+table: statement-level hints such as `MAX_EXECUTION_TIME` are ignored by
+TiDB there — bound the time with `database.query_timeout_seconds` instead.
 
 **Arguments.** Every `:name` must be declared under `arguments` and every
 argument used; a name may appear several times (one bound value per use).
@@ -873,7 +882,15 @@ schema keeps serving. Then:
   literal, coerced to the argument's type. A preset argument is removed from
   the role's `<T>_arguments`, so the client cannot set or override it (also
   not through variables). A missing claim is an error, never "no preset"; a
-  non-scalar claim cannot be bound. Use a preset when the value must sit
+  non-scalar claim cannot be bound. A preset **never binds `NULL`** — inside
+  native SQL `NULL` often means "no restriction" (`:x IS NULL OR …`) — so a
+  claim that is JSON `null` fails the request too. Coercion is exact: a claim
+  (`"42"` or `42`) that is fractional, out of range for `Int` (32-bit) or of
+  the wrong kind (a boolean for `Int`, a number for `Boolean`) fails the
+  request instead of being truncated or dropped; a numeric claim bound to a
+  `String` is written in full (`1000000`). A literal preset is checked when
+  the role is built, so one that does not fit its type fails startup or the
+  reload. Use a preset when the value must sit
   *inside* the statement (before a `GROUP BY`, in a CTE); a row filter only
   sees the result.
 - `check` does not apply (native queries are read-only).

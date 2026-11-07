@@ -411,3 +411,118 @@ func TestDemoConfigNativeQueries(t *testing.T) {
 	env.GQL(t, "", `{ author_activity { views } }`, nil).MustFail(t, "Cannot query field")
 	env.GQL(t, "", `{ comment_inbox(args: {author: 1}) { comment_id } }`, nil).MustFail(t, "Cannot query field")
 }
+
+// scopedYAML is a native query whose Int argument is preset from the sub
+// claim in the "(:x IS NULL OR col = :x)" style, where a NULL binding would
+// mean "every author".
+const scopedYAML = `native_queries:
+  scoped_posts:
+    sql: |
+      SELECT /*+ USE_INDEX(posts, fk_posts_author) */ id, author_id
+      FROM posts WHERE (:author IS NULL OR author_id = :author)
+    arguments:
+      author: Int!
+    key: [id]
+`
+
+const scopedRoles = `roles:
+  admin:
+    native_queries:
+      scoped_posts: true
+  author:
+    native_queries:
+      scoped_posts:
+        allow: true
+        presets: {author: ":jwt.sub"}
+  anonymous:
+    tables:
+      users: {select: {allow: true, columns: [id]}}
+`
+
+// A claim that does not fit the preset argument's type exactly (out of the
+// Int range, fractional, boolean or null) fails the request; it is never
+// bound as NULL or truncated to another user's id.
+func TestNativeQueryPresetClaimCoercion(t *testing.T) {
+	t.Parallel()
+	env := New(t, WithExtraYAML(scopedYAML), WithRolesYAML(scopedRoles))
+
+	// admin passes the argument; the optimizer hint reaches TiDB intact.
+	r := env.MustGQL(t, env.Token(t, "admin", 4), `{ scoped_posts(args: {author: 1}) { id author_id } }`, nil)
+	if ids := r.IDs(t, "scoped_posts"); !reflect.DeepEqual(ids, []int64{1, 2}) && !reflect.DeepEqual(ids, []int64{2, 1}) {
+		t.Errorf("admin scoped_posts(author: 1): %s", r.Raw)
+	}
+
+	// author: the preset scopes the rows to the caller (string or numeric sub).
+	for _, sub := range []any{"2", float64(2)} {
+		r = env.MustGQL(t, env.Token(t, "author", sub), `{ scoped_posts { id author_id } }`, nil)
+		if ids := r.IDs(t, "scoped_posts"); !reflect.DeepEqual(ids, []int64{3}) {
+			t.Errorf("author sub=%#v: %s", sub, r.Raw)
+		}
+	}
+	// The argument cannot be passed by this role.
+	env.GQL(t, env.Token(t, "author", "2"), `{ scoped_posts(args: {author: 1}) { id } }`, nil).MustFail(t, "args")
+
+	bad := []struct {
+		sub  any
+		want string
+	}{
+		{"3000000000", "range of Int"},
+		{float64(3000000000), "range of Int"},
+		{float64(1.9), "is not an integer"},
+		{"1.9", "is not an integer"},
+		{true, "is not an integer"},
+		{nil, "null"},
+	}
+	for _, c := range bad {
+		tok := env.SignClaims(t, map[string]any{"role": "author", "sub": c.sub})
+		env.GQL(t, tok, `{ scoped_posts { id author_id } }`, nil).MustFail(t, c.want)
+		env.GQL(t, tok, `{ scoped_posts_connection { nodes { id } } }`, nil).MustFail(t, c.want)
+	}
+}
+
+// Literal presets that do not fit their argument and native root fields
+// that a table's generated fields already have fail the build (startup and
+// hot reload) instead of failing every request or hiding the table's field.
+func TestNativeQueryBuildChecksOnReload(t *testing.T) {
+	t.Parallel()
+	env := New(t, WithExtraYAML(scopedYAML), WithRolesYAML(scopedRoles))
+	grace := env.Token(t, "author", 2)
+
+	err := env.Reload(t, strings.Replace(scopedRoles, `":jwt.sub"`, `"not-a-number"`, 1))
+	if err == nil || !strings.Contains(err.Error(), `"not-a-number" is not an integer`) {
+		t.Fatalf("bad literal preset: err = %v", err)
+	}
+	err = env.Reload(t, strings.Replace(scopedRoles, `":jwt.sub"`, `"3000000000"`, 1))
+	if err == nil || !strings.Contains(err.Error(), "range of Int") {
+		t.Fatalf("out-of-range literal preset: err = %v", err)
+	}
+	if err := env.Reload(t, scopedRoles); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"users_by_email", "users_list"} {
+		err = env.ReloadExtra(t, scopedYAML+"  "+name+":\n    sql: \"SELECT id FROM users\"\n")
+		if err == nil || !strings.Contains(err.Error(), `"`+name+`" for native query "`+name+`" collides with table users`) {
+			t.Fatalf("native %s: err = %v", name, err)
+		}
+	}
+	err = env.ReloadExtra(t, scopedYAML+"  q:\n    sql: \"SELECT id FROM users\"\n    root_fields: {list: {name: users_by_username}}\n")
+	if err == nil || !strings.Contains(err.Error(), "collides with table users") {
+		t.Fatalf("native root field users_by_username: err = %v", err)
+	}
+
+	// The previous schema still serves; a valid literal preset works.
+	r := env.MustGQL(t, grace, `{ scoped_posts { id } }`, nil)
+	if ids := r.IDs(t, "scoped_posts"); !reflect.DeepEqual(ids, []int64{3}) {
+		t.Errorf("after rejected reloads: %s", r.Raw)
+	}
+	if err := env.ReloadExtra(t, scopedYAML); err != nil {
+		t.Fatal(err)
+	}
+	if err := env.Reload(t, strings.Replace(scopedRoles, `":jwt.sub"`, `"1"`, 1)); err != nil {
+		t.Fatal(err)
+	}
+	r = env.MustGQL(t, grace, `{ scoped_posts { id } }`, nil)
+	if ids := r.IDs(t, "scoped_posts"); !reflect.DeepEqual(ids, []int64{1, 2}) && !reflect.DeepEqual(ids, []int64{2, 1}) {
+		t.Errorf("literal preset 1: %s", r.Raw)
+	}
+}

@@ -334,11 +334,6 @@ func reserveNames(cat *introspect.Catalog, m *catalogModel) (*nameReservation, e
 		}
 	}
 
-	// Native queries' root fields and types are fixed names too.
-	if err := reserveNativeNames(m, queryFields, types); err != nil {
-		return nil, err
-	}
-
 	r := &nameReservation{
 		types:   types,
 		mutResp: map[string]string{},
@@ -396,6 +391,12 @@ func reserveNames(cat *introspect.Catalog, m *catalogModel) (*nameReservation, e
 		}
 		queryFields[name] = "table " + tn
 		r.list[tn] = name
+	}
+	// Native queries come last: their names are fixed, so one that a table's
+	// generated field or type (unique-key lookup and <t>_list included)
+	// already has fails the build instead of silently replacing it.
+	if err := reserveNativeNames(m, queryFields, types); err != nil {
+		return nil, err
 	}
 	return r, nil
 }

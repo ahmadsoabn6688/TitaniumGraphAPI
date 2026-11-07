@@ -25,6 +25,12 @@ func TestCompileNativeSQL(t *testing.T) {
 		// Qualified names and function forms of denied words are fine.
 		{"SELECT t.update, INSERT('abc', 1, 1, 'x'), REPLACE (a, 'b', 'c') FROM t", nil, "SELECT t.update, INSERT('abc', 1, 1, 'x'), REPLACE (a, 'b', 'c') FROM t"},
 		{"SELECT a-1--1 AS x FROM t", nil, "SELECT a-1--1 AS x FROM t"},
+		// Optimizer hints reach TiDB verbatim; a ':' inside one is not a
+		// parameter. TiDB's /*T! … */ executable comments are removed.
+		{"SELECT /*+ USE_INDEX(posts, ia) MAX_EXECUTION_TIME(10) */ id FROM posts WHERE a = :p", []string{"p"},
+			"SELECT /*+ USE_INDEX(posts, ia) MAX_EXECUTION_TIME(10) */ id FROM posts WHERE a = ?"},
+		{"SELECT /*+ READ_FROM_STORAGE(TIFLASH[t]) X(a:b) */ id FROM t", nil, "SELECT /*+ READ_FROM_STORAGE(TIFLASH[t]) X(a:b) */ id FROM t"},
+		{"SELECT /*T! , SLEEP(1) */ id FROM t", nil, "SELECT   id FROM t"},
 	}
 	for _, c := range ok {
 		n, err := CompileNativeSQL(c.sql)
@@ -70,6 +76,9 @@ func TestCompileNativeSQL(t *testing.T) {
 		{"SELECT 'unterminated FROM t", "unterminated"},
 		{"SELECT 1 /* open", "unterminated /*"},
 		{"SELECT 1 /*!50000 , SLEEP(1) */", "executable comments"},
+		{"SELECT /*+ X(?) */ 1", "optimizer hints"},
+		{"SELECT /*+ X(); */ 1", "optimizer hints"},
+		{"SELECT /*+ USE_INDEX(t, a) 1", "unterminated /*"},
 	}
 	for _, c := range bad {
 		_, err := CompileNativeSQL(c.sql)

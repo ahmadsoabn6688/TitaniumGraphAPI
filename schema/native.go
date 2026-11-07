@@ -3,6 +3,7 @@ package schema
 import (
 	"context"
 	"fmt"
+	"math"
 	"sort"
 	"strconv"
 	"strings"
@@ -404,6 +405,15 @@ func (b *builder) resolveNatives() error {
 		if na == nil {
 			continue
 		}
+		// A literal preset is the same on every request: one that does not
+		// fit its argument's type fails the build, not every request.
+		for _, a := range nm.args {
+			if p, ok := na.Presets[a.name]; ok && p.ClaimPath == "" {
+				if _, err := presetArgValue(a, p.Literal); err != nil {
+					return fmt.Errorf("role %q, native query %q: %w", b.role, name, err)
+				}
+			}
+		}
 		ti := &tableInfo{
 			table:      nm.tm.table,
 			model:      nm.tm,
@@ -742,41 +752,99 @@ func nativeBindValue(v any) any {
 }
 
 // presetArgValue coerces a preset value (a claim or a literal string) to the
-// argument's scalar, so it is bound with the declared type.
+// argument's scalar, so it is bound with the declared type. It is strict: a
+// preset never binds NULL (a null claim is an error, as NULL often means "no
+// restriction" in native SQL), and a value that does not fit the type exactly
+// (a fractional or out-of-range number for Int, a number for Boolean) is an
+// error instead of being rounded, truncated or dropped.
 func presetArgValue(a *nativeArg, v any) (any, error) {
-	if v == nil {
-		return nil, nil
+	bad := func(what string) error {
+		return fmt.Errorf("argument preset %q: %s is not %s", a.name, presetValueText(v), what)
 	}
-	if s, ok := v.(string); ok {
-		switch a.scalar.Name() {
-		case "Int", "BigInt":
-			n, err := strconv.ParseInt(strings.TrimSpace(s), 10, 64)
-			if err != nil {
-				return nil, fmt.Errorf("argument preset %q: %q is not an integer", a.name, s)
+	switch v.(type) {
+	case nil:
+		return nil, fmt.Errorf("argument preset %q: the value is null (a preset never binds NULL)", a.name)
+	case string, float64, bool:
+	default:
+		return nil, fmt.Errorf("argument preset %q: the value is not a scalar", a.name)
+	}
+	switch a.scalar.Name() {
+	case "Int", "BigInt":
+		var n int64
+		switch x := v.(type) {
+		case string:
+			var err error
+			if n, err = strconv.ParseInt(strings.TrimSpace(x), 10, 64); err != nil {
+				return nil, bad("an integer")
 			}
-			if a.scalar.Name() == "Int" {
-				return a.scalar.ParseValue(int(n)), nil
+		case float64:
+			// 2^63 is exactly representable; every float64 below it converts.
+			if x != math.Trunc(x) || x < -(1<<63) || x >= 1<<63 {
+				return nil, bad("an integer")
 			}
+			n = int64(x)
+		default:
+			return nil, bad("an integer")
+		}
+		if a.scalar.Name() == "BigInt" {
 			return n, nil
-		case "Float":
-			f, err := strconv.ParseFloat(strings.TrimSpace(s), 64)
-			if err != nil {
-				return nil, fmt.Errorf("argument preset %q: %q is not a number", a.name, s)
+		}
+		if n < math.MinInt32 || n > math.MaxInt32 {
+			return nil, bad("in the range of Int (32-bit)")
+		}
+		return int(n), nil
+	case "Float":
+		var f float64
+		switch x := v.(type) {
+		case string:
+			var err error
+			if f, err = strconv.ParseFloat(strings.TrimSpace(x), 64); err != nil {
+				return nil, bad("a number")
 			}
-			return f, nil
-		case "Boolean":
-			bv, err := strconv.ParseBool(strings.TrimSpace(s))
+		case float64:
+			f = x
+		default:
+			return nil, bad("a number")
+		}
+		if math.IsNaN(f) || math.IsInf(f, 0) {
+			return nil, bad("a finite number")
+		}
+		return f, nil
+	case "Boolean":
+		switch x := v.(type) {
+		case string:
+			bv, err := strconv.ParseBool(strings.TrimSpace(x))
 			if err != nil {
-				return nil, fmt.Errorf("argument preset %q: %q is not a boolean", a.name, s)
+				return nil, bad("a boolean")
 			}
 			return bv, nil
+		case bool:
+			return x, nil
+		}
+		return nil, bad("a boolean")
+	case "String":
+		switch x := v.(type) {
+		case string:
+			return x, nil
+		case float64:
+			return strconv.FormatFloat(x, 'f', -1, 64), nil // 1000000, not 1e+06
+		case bool:
+			return strconv.FormatBool(x), nil
 		}
 	}
 	out := a.scalar.ParseValue(v)
 	if out == nil {
-		return nil, fmt.Errorf("argument preset %q: the value does not fit type %s", a.name, a.scalar.Name())
+		return nil, fmt.Errorf("argument preset %q: %s does not fit type %s", a.name, presetValueText(v), a.scalar.Name())
 	}
 	return nativeBindValue(out), nil
+}
+
+// presetValueText renders a preset value for an error message.
+func presetValueText(v any) string {
+	if s, ok := v.(string); ok {
+		return strconv.Quote(s)
+	}
+	return fmt.Sprintf("%v", v)
 }
 
 // nativeFrom renders the FROM clause of one request: the statement with its

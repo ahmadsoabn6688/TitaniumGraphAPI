@@ -455,7 +455,9 @@ type ArgPreset struct {
 }
 
 // Value resolves the preset for the given claims. A missing claim is an
-// error (never "no preset"); only scalar claims can be bound.
+// error (never "no preset"); only scalar claims can be bound. A JSON-null
+// claim resolves to nil, which the native query layer rejects (a preset never
+// binds NULL).
 func (p ArgPreset) Value(claims map[string]any) (any, error) {
 	if p.ClaimPath == "" {
 		return p.Literal, nil

@@ -243,6 +243,11 @@ func TestNativeQueryRolePresetsAndFilter(t *testing.T) {
 	if len(res.Errors) == 0 {
 		t.Error("hidden column filter accepted from variables")
 	}
+	// A null claim fails closed too: the preset never binds NULL.
+	res = runNative(lim, "limited", map[string]any{"domain": nil, "banned": float64(1)}, `{ people_by_domain { id } }`, nil)
+	if len(res.Errors) == 0 || !strings.Contains(res.Errors[0].Message, "null") {
+		t.Errorf("null preset claim: %v", res.Errors)
+	}
 	// A missing claim fails closed.
 	res = runNative(lim, "limited", map[string]any{"banned": float64(1)}, `{ people_by_domain { id } }`, nil)
 	if len(res.Errors) == 0 || !strings.Contains(res.Errors[0].Message, "domain") {
@@ -309,6 +314,35 @@ q:
   relationships:
     p: {type: object, target: people, mapping: {id: email}}
 `, `full: {native_queries: {q: true}}`, "join-compatible"},
+		{"literal preset of the wrong type", `
+q:
+  sql: "SELECT id FROM people WHERE id > :min"
+  arguments: {min: Int!}
+  columns: {id: BigInt}
+`, `full: {native_queries: {q: {allow: true, presets: {min: "not-a-number"}}}}`, `"not-a-number" is not an integer`},
+		{"literal Int preset out of range", `
+q:
+  sql: "SELECT id FROM people WHERE id > :min"
+  arguments: {min: Int}
+  columns: {id: BigInt}
+`, `full: {native_queries: {q: {allow: true, presets: {min: "3000000000"}}}}`, "range of Int"},
+		{"literal Date preset", `
+q:
+  sql: "SELECT id FROM people WHERE :d IS NOT NULL"
+  arguments: {d: Date}
+  columns: {id: BigInt}
+`, `full: {native_queries: {q: {allow: true, presets: {d: "2026-13-45"}}}}`, "does not fit type Date"},
+		{"collision with a table's default list field", `
+people_list:
+  sql: "SELECT 1 AS id"
+  columns: {id: Int}
+`, `full: {tables: {people: {select: true}}}`, `"people_list" for native query "people_list" collides with table people`},
+		{"root field collision with a table's default list field", `
+q:
+  sql: "SELECT 1 AS id"
+  columns: {id: Int}
+  root_fields: {list: {name: people_list}}
+`, `full: {tables: {people: {select: true}}}`, `"people_list" for native query "q" collides with table people`},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -376,13 +410,66 @@ func TestPresetArgValue(t *testing.T) {
 		{arg(graphql.Boolean), "true", true, false},
 		{arg(graphql.String), "abc", "abc", false},
 		{arg(graphql.Float), "1.5", 1.5, false},
-		{arg(graphql.String), nil, nil, false},
 		{arg(dateScalar), "2026-01-02", "2026-01-02", false},
+		// A preset never binds NULL: a null claim is an error.
+		{arg(graphql.String), nil, nil, true},
+		{arg(graphql.Int), nil, nil, true},
+		// Out of the 32-bit range of Int: an error, never NULL.
+		{arg(graphql.Int), "3000000000", nil, true},
+		{arg(graphql.Int), float64(3000000000), nil, true},
+		{arg(graphql.Int), "-2147483648", -2147483648, false},
+		{arg(bigIntScalar), "3000000000", int64(3000000000), false},
+		{arg(bigIntScalar), float64(1 << 63), nil, true},
+		// Fractional numbers are not truncated to an integer.
+		{arg(graphql.Int), float64(1.9), nil, true},
+		{arg(bigIntScalar), float64(1.9), nil, true},
+		{arg(graphql.Int), "1.9", nil, true},
+		// Booleans are not integers, numbers are not booleans.
+		{arg(graphql.Int), true, nil, true},
+		{arg(graphql.Boolean), float64(1), nil, true},
+		{arg(graphql.Boolean), false, false, false},
+		{arg(graphql.Float), "NaN", nil, true},
+		{arg(graphql.Float), true, nil, true},
+		{arg(graphql.Float), float64(2.5), 2.5, false},
+		// Numeric claims bound to a String are written in full.
+		{arg(graphql.String), float64(1000000), "1000000", false},
+		{arg(graphql.String), true, "true", false},
+		{arg(dateScalar), "not-a-date", nil, true},
+		{arg(dateScalar), float64(1), nil, true},
+		{arg(decimalScalar), true, nil, true},
+		{arg(decimalScalar), "12.50", "12.50", false},
+		{arg(graphql.String), []any{"a"}, nil, true},
 	}
 	for _, c := range cases {
 		got, err := presetArgValue(c.a, c.in)
 		if (err != nil) != c.err || !reflect.DeepEqual(got, c.want) {
 			t.Errorf("presetArgValue(%s, %#v) = %#v, %v; want %#v (err %v)", c.a.scalar.Name(), c.in, got, err, c.want, c.err)
 		}
+	}
+}
+
+// A native query whose root field is a table's unique-key lookup fails the
+// build instead of silently dropping the lookup.
+func TestNativeQueryUniqueKeyCollision(t *testing.T) {
+	cat := peopleCatalog()
+	cat.Tables["people"].UniqueKeys = []*introspect.UniqueKey{{Name: "uk_email", Columns: []string{"email"}}}
+	cfg := nativeConfig(t, `
+people_by_email:
+  sql: "SELECT 1 AS id"
+  columns: {id: Int}
+`, `full: {tables: {people: {select: true}}}`)
+	_, err := BuildAll(Options{Catalog: cat, Config: cfg})
+	if err == nil || !strings.Contains(err.Error(), `"people_by_email" for native query "people_by_email" collides with table people`) {
+		t.Fatalf("err = %v", err)
+	}
+	// Without the native query the lookup exists.
+	cfg.NativeQueries = nil
+	s, err := BuildAll(Options{Catalog: cat, Config: cfg})
+	if err != nil {
+		t.Fatal(err)
+	}
+	full := s["full"]
+	if full.QueryType().Fields()["people_by_email"] == nil {
+		t.Error("people_by_email lookup missing")
 	}
 }
