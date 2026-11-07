@@ -9,8 +9,9 @@ role may see and do (RBAC down to rows and columns).
 Built for TiDB specifically: collection reads use **keyset cursor pagination**
 on the clustered primary key (a range scan, no sort, constant cost per page —
 viable over billions of rows), plus **aggregates**, TiDB JSON/REGEXP filter
-operators, and native **vector (similarity) search**. It also runs against
-plain MySQL for the non-TiDB-specific parts.
+operators, and native **vector (similarity) search**. TiDB is the only
+supported (and tested) database: several features use TiDB-specific SQL
+(`APPROX_COUNT_DISTINCT`, `AUTO_RANDOM` keys, `VECTOR` distance functions).
 
 gqlgate only **verifies** tokens. Signup / login / token issuance is your
 application's job — issue JWTs with the same secret (or key pair) and a role
@@ -25,6 +26,50 @@ CLI can mint dev tokens (`-print-token`).
                                                │  RBAC filters → TiDB    │
                                                └─────────────────────────┘
 ```
+
+## Features at a glance
+
+| Area | What gqlgate generates / supports | Configured by | Details |
+|---|---|---|---|
+| Reads | `<t>_connection` (keyset cursor pages on the PK, `total_count`), `<t>_by_pk`, lookups by every unique key (`users_by_email`), bounded `<t>_list` for keyless tables/views | automatic | [Generated API](#generated-api-per-table-role-permitting), [Pagination](#pagination--cursor-only-keyset) |
+| Filtering | `where` with `_and/_or/_not`, comparison, `_in`, `_is_null`, `_like`/`_ilike`, regex, literal `_contains`/`_starts_with`/`_ends_with` (+ case-insensitive), JSON `_contains`/`_has_key`, custom SQL-template operators, filters through object and array relationships | `schema_gen.custom_operators` | [Filter operators](#filter-operators), [Relationship filters](#filtering-through-relationships) |
+| Aggregates | `count`, `sum`, `avg`, `min`/`max`, per-column and distinct counts (exact or approximate), stddev/variance; nested `<rel>_aggregate` on every array relationship; optional 64-bit counts | `schema_gen.count_type` | [Aggregates](#aggregates) |
+| Relationships | from foreign keys or declared in YAML (no FK needed), batched (no N+1), nested `where`/`order_by`/`limit`/`offset` on array relationships | `tables.<t>.relationships` | [Declared relationships](#declared-relationships), [Dataloader](#relationship-batching-dataloader) |
+| Modeling | read-only views, logical keys for views and keyless tables, renamed types/fields/root fields, descriptions (YAML or DB `COMMENT`s), `@deprecated`, typed JSON columns | `tables:`, `json_types:`, `schema_gen.descriptions_from_comments` | [Modeling](#modeling-views-keys-relationships-names) |
+| Native queries | parameterized read-only `SELECT`/`WITH` as root fields with typed arguments, `where`, per-role columns, row filters, argument presets, cursor connection, relationships | `native_queries:`, `roles.<r>.native_queries` | [Native queries](#native-queries) |
+| Mutations | insert (many / one), update and delete (by filter, by PK, by unique key), `returning` with relationships, column presets, write `check`s, coded DB errors | `roles.<r>.tables.<t>.insert/update/delete`, `schema_gen.mutation_response` | [Mutation results](#mutation-results-returning), [Write checks](#write-checks), [Errors](#errors) |
+| Subscriptions | live queries over WebSocket (`graphql-transport-ws`) on the read root fields and native queries, pushed only on change, re-authenticated while open | `server.subscriptions`, `select.subscribe`, `tables.<t>.subscriptions` | [Subscriptions](#subscriptions-live-queries) |
+| Auth & RBAC | alg-pinned JWT verification, role from a claim, the users table or a Go hook, per-request role selection header, per-role schemas, row filters with `:jwt.<claim>` parameters, column lists, restricted filter surface | `jwt:`, `roles:` | [YAML config](#the-yaml-config), [RBAC semantics](#rbac-semantics), [Role selection](#role-selection-allowed-roles) |
+| Vector search | `<t>_nearest_by_<col>` top-K over `VECTOR` columns (cosine, L2, L1, inner product) | automatic | [Vector search](#vector-search-similarity--nearest) |
+| Extensibility | compiled-in Go hooks: mutation lifecycle hooks, custom root fields, computed fields on table types, custom role resolution | `hooks/`, `hooks:` | [Custom hooks](#custom-hooks--fields-the-hooks-directory) |
+| Operations | concurrent query root fields, depth limit, body limit, response row/byte limits, query timeout, hot config reload, GraphiQL | `server:` | [Concurrent root fields](#concurrent-root-fields), [Response limits](#response-limits), [Hot reload](#hot-config-reload-dev) |
+
+### Compared with Hasura v3
+
+gqlgate shares many of Hasura's concepts — role-aware generated CRUD,
+`where` boolean expressions, aggregates, argument presets, allowed roles with
+a role header, native queries, write checks, per-role filter surfaces — and
+keeps the familiar snake_case names (`<t>_by_pk`, `<t>_aggregate`,
+`<t>_bool_exp`, `returning`, `_eq`/`_ilike`/…). Hasura v3 generates
+camelCase names such as `postsById` by default; in gqlgate most type, field
+and root-field names can be changed under `tables:`. It is a much smaller
+tool: one TiDB schema behind one gateway, configured by one YAML file, not a
+supergraph of data connectors. It covers a useful subset of what Hasura DDN
+(v3) offers for a single SQL database and differs on purpose in places:
+
+- **Pagination is cursor-only.** Top-level collections have no `offset` and
+  no `order_by`; they page by the primary key (or a declared key), which is
+  a range scan on TiDB at any depth.
+- **Subscriptions poll.** TiDB has no `LISTEN/NOTIFY` or triggers, so each
+  subscription re-runs its query on an interval; identical subscriptions are
+  not multiplexed, and there are no streaming (`_stream`) subscriptions.
+- **Custom logic is Go code** compiled into the gateway (`hooks/`), not
+  connectors, lambdas or webhooks.
+- **Not (yet) available:** upserts, nested inserts, update operators other
+  than `_set` (`_inc`, JSON append, …), `update_many`, `GROUP BY` and
+  aggregate predicates in `where`, `distinct_on`, native mutations, inherited
+  roles, Relay global IDs, Apollo Federation, persisted queries / allow-lists,
+  response caching and rate limiting. See [Limitations](#limitations-deliberate-v1).
 
 ## Highlights
 
@@ -122,6 +167,29 @@ Get a dev token to play with (user `1` = an author, `4` = admin) and paste
 
 ```sh
 docker compose exec gqlgate gqlgate -config /etc/gqlgate/gqlgate.yaml -print-token 1
+```
+
+A few things to try in the demo (the demo `gqlgate.yaml` comments explain
+each piece of config):
+
+```graphql
+# any role: a cursor page with a relationship filter, a declared
+# relationship (stats, from a view) and a nested aggregate
+{ posts_connection(first: 5, where: {author: {name: {_ilike: "%ada%"}}}) {
+    nodes { id title stats { commentCount } tags { tag } comments_aggregate { count } }
+    page_info { has_next_page end_cursor } } }
+
+# admin (token 4): a native query with a window function, typed JSON, unique-key lookup
+{ author_activity(args: {since: "2026-01-01"}) { name posts view_rank author { email } }
+  users_by_email(email: "ada@example.com") { name metadata { tier tags } } }
+
+# author (token 1): comments on the caller's own posts — `author` is preset
+# from the token. With token 4 plus the header "X-Gqlgate-Role": "author",
+# admin is served the author schema (_role: "author", and an empty inbox).
+{ _role comment_inbox_connection(first: 2) { nodes { post_title body } } }
+
+# author (token 1) or anonymous: a live query (GraphiQL runs subscriptions too)
+subscription { posts_aggregate { count } }
 ```
 
 **You touch exactly two things:**
@@ -329,7 +397,7 @@ roles:
 
 | Piece | Meaning |
 |---|---|
-| `select.columns` | Only these columns exist in the role's object type, `where`, and `order_by`. |
+| `select.columns` | Only these columns exist in the role's object type, `where`, aggregates and the `order_by` of nested array relationships. |
 | `select.filter` | SQL appended to every read — including `_by_pk`, `_count`, relationship hops, and mutation return values. `:jwt.<path>` binds claim values as parameters; arrays expand for `IN (…)`; an empty array matches nothing; a missing claim is an error, never "no filter". |
 | `insert/update.presets` | Server-forced column values. Preset columns are removed from the input types, so clients cannot even attempt to set them. |
 | `update/delete.filter` | Rows the role may touch. Everything else reports `affected_rows: 0`. |
@@ -2003,20 +2071,41 @@ A runnable template with a per-row and a batched field is
 Unit tests need no database:
 
 ```sh
-go test ./...
+go build ./... && go vet ./... && go test ./...
+# or without a local Go toolchain (the named volumes cache modules and builds):
+docker run --rm -v "$PWD:/src" -v gqlgate-gomod:/go/pkg/mod -v gqlgate-gobuild:/root/.cache/go-build \
+  -w /src golang:1.25 sh -c "go build ./... && go vet ./... && go test ./..."
 ```
 
 The **end-to-end suite** (`e2e/`) runs the real gateway in-process
 (`gqlgate.Open` behind an `httptest` server) against a live TiDB and drives it
-with GraphQL-over-HTTP requests as different roles. It is opt-in: set
+with GraphQL-over-HTTP (and WebSocket) requests as different roles,
+including the negative RBAC cases: hidden columns, tables, operators and
+relationships must be rejected, and row filters must hold on every read and
+write path. It is opt-in: set
 `GQLGATE_E2E_DSN` to a go-sql-driver DSN for the TiDB server (no database
 name needed); without it every e2e test skips, so `go test ./...` stays
-database-free. Against the compose demo TiDB, from Docker:
+database-free. Against the compose demo TiDB (network `tidb-net`), from Docker:
 
 ```sh
 docker compose up -d tidb
-docker run --rm --network tidb-net -v "$PWD:/src" -w /src   -e GQLGATE_E2E_DSN="root@tcp(tidb:4000)/" golang:1.25 go test -count=1 ./e2e/...
+docker run --rm --network tidb-net -v "$PWD:/src" -v gqlgate-gomod:/go/pkg/mod -v gqlgate-gobuild:/root/.cache/go-build \
+  -w /src -e GQLGATE_E2E_DSN="root@tcp(tidb:4000)/" golang:1.25 go test -count=1 ./e2e/...
 ```
+
+| File | Covers |
+|---|---|
+| `e2e/smoke_test.go` | row filters, presets, cursor pagination, auth rejections |
+| `e2e/harness_unit_test.go` | the harness only ever creates and drops its own `gqlgate_e2e_*` databases |
+| `e2e/integrity_test.go` | same-named FKs, binary-key cursors, locked reads in mutations, hook ordering |
+| `e2e/filter_test.go`, `filter_joincols_test.go` | string/custom operators, filter surface, relationship filters |
+| `e2e/aggregate_test.go` | aggregate functions, nested aggregates, 64-bit counts |
+| `e2e/mutations_test.go`, `mutations_keys_test.go` | `returning`, write checks, error codes, response limits, unique keys |
+| `e2e/modeling_test.go`, `modeling_keys_test.go` | views, logical keys, keyless tables, declared relationships, names, descriptions |
+| `e2e/relkeys_test.go` | collation-aware relationship keys, nested reads in multi-mutation requests |
+| `e2e/runtime_test.go` | role header, concurrent root fields, object fields, typed JSON |
+| `e2e/native_test.go` | native queries, argument presets, connections |
+| `e2e/subscriptions_test.go` | subscriptions over a real WebSocket, re-authentication, limits |
 
 (or, with Go installed locally, `GQLGATE_E2E_DSN='root@tcp(127.0.0.1:4000)/'
 go test -count=1 ./e2e/...`). Unset any `GQLGATE_DB_*` variables first; the
