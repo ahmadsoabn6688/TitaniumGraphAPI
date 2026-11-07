@@ -58,13 +58,15 @@ func isDistinctCountable(c *introspect.Column) bool {
 // `sum` in `sum { views }`. Each bucket becomes a <t>_<name>_fields object
 // with one field per role-readable column it applies to.
 type aggFunc struct {
-	name    string // GraphQL field name; the type is <t>_<name>_fields
-	desc    string
-	sql     func(colRef string) string
-	applies func(*introspect.Column) bool
-	out     func(*introspect.Column) graphql.Output
-	convert func(*introspect.Column, any) (any, error)
-	isCount bool // an empty group yields 0, not null
+	name string // GraphQL field name; the type is <t>_<typeName()>_fields
+	// typeStem overrides name in the type name (see approx_count_distinct).
+	typeStem string
+	desc     string
+	sql      func(colRef string) string
+	applies  func(*introspect.Column) bool
+	out      func(*introspect.Column) graphql.Output
+	convert  func(*introspect.Column, any) (any, error)
+	isCount  bool // an empty group yields 0, not null
 }
 
 func sqlFn(fn string) func(string) string {
@@ -104,7 +106,10 @@ var aggFuncs = []*aggFunc{
 		sql:     func(c string) string { return "COUNT(DISTINCT " + c + ")" },
 		applies: isDistinctCountable, out: countOut, convert: countConv, isCount: true},
 	{name: "approx_count_distinct", desc: "Approximate number of distinct non-null values per column (TiDB APPROX_COUNT_DISTINCT, HyperLogLog): much cheaper than count_distinct on large tables.",
-		sql: sqlFn("APPROX_COUNT_DISTINCT"), applies: isDistinctCountable, out: countOut, convert: countConv, isCount: true},
+		// Its type is <t>_count_distinct_approx_fields: <t>_approx_count_distinct_fields
+		// would also be the count_distinct type of a table named <t>_approx.
+		typeStem: "count_distinct_approx",
+		sql:      sqlFn("APPROX_COUNT_DISTINCT"), applies: isDistinctCountable, out: countOut, convert: countConv, isCount: true},
 	statFunc("stddev", "STDDEV_SAMP", "Sample standard deviation per numeric column (same as stddev_samp)."),
 	statFunc("stddev_pop", "STDDEV_POP", "Population standard deviation per numeric column."),
 	statFunc("stddev_samp", "STDDEV_SAMP", "Sample standard deviation per numeric column."),
@@ -121,23 +126,36 @@ var aggFuncByName = func() map[string]*aggFunc {
 	return m
 }()
 
+// typeSuffix is the suffix of the function's <t>_..._fields type name. No
+// suffix may end in "_" + another one, or a table named <t>_<x> would claim
+// the same type name as table <t> (TestAggTypeSuffixesUnambiguous).
+func (f *aggFunc) typeSuffix() string {
+	stem := f.name
+	if f.typeStem != "" {
+		stem = f.typeStem
+	}
+	return "_" + stem + "_fields"
+}
+
 // aggTypeSuffixes are the type-name suffixes of the per-function field types
 // (reserved per table by the collision check).
 func aggTypeSuffixes() []string {
 	out := make([]string, len(aggFuncs))
 	for i, f := range aggFuncs {
-		out[i] = "_" + f.name + "_fields"
+		out[i] = f.typeSuffix()
 	}
 	return out
 }
 
 // countScalar is the GraphQL scalar of row counts (count, total_count,
-// affected_rows), per schema_gen.count_type: BigInt unless Int was chosen.
+// affected_rows), per schema_gen.count_type: Int (the backward-compatible
+// default, also for configs built in code without it) unless BigInt was
+// chosen. The per-column counts are new fields and always BigInt.
 func (b *builder) countScalar() *graphql.Scalar {
-	if b.opt.Config != nil && b.opt.Config.SchemaGen.CountType == config.CountTypeInt {
-		return graphql.Int
+	if b.opt.Config != nil && b.opt.Config.SchemaGen.CountType == config.CountTypeBigInt {
+		return bigIntScalar
 	}
-	return bigIntScalar
+	return graphql.Int
 }
 
 // addAggregateField adds the <t>_aggregate query field.
@@ -155,7 +173,7 @@ func (b *builder) addAggregateField(fields graphql.Fields, ti *tableInfo) {
 			}
 			where, _ := p.Args["where"].(map[string]any)
 			req := b.collectAggSelections(ti, p.Info)
-			return b.runAggregate(p.Context, ti, id, where, req)
+			return b.runAggregate(p.Context, ti, id, where, req, nil)
 		},
 	}
 }
@@ -188,7 +206,7 @@ func (b *builder) buildAggregateType(ti *tableInfo) *graphql.Object {
 			continue
 		}
 		name := fn.name
-		t := graphql.NewObject(graphql.ObjectConfig{Name: ti.typeName + "_" + name + "_fields", Fields: colFields})
+		t := graphql.NewObject(graphql.ObjectConfig{Name: ti.typeName + fn.typeSuffix(), Fields: colFields})
 		fields[name] = &graphql.Field{
 			Type:        t,
 			Description: fn.desc,
@@ -411,11 +429,11 @@ func (b *builder) aggWhere(ti *tableInfo, id *rbac.Identity, where map[string]an
 }
 
 // runAggregate runs one SELECT computing exactly the requested aggregates,
-// applying the role's row filter, and shapes the row into the nested source
-// the aggregate types read.
-func (b *builder) runAggregate(ctx context.Context, ti *tableInfo, id *rbac.Identity, where map[string]any, req aggRequest) (map[string]any, error) {
+// applying the role's row filter (and extra, e.g. one parent's key), and
+// shapes the row into the nested source the aggregate types read.
+func (b *builder) runAggregate(ctx context.Context, ti *tableInfo, id *rbac.Identity, where map[string]any, req aggRequest, extra *condition) (map[string]any, error) {
 	exprs, plan := aggPlan(req)
-	cond, err := b.aggWhere(ti, id, where, nil)
+	cond, err := b.aggWhere(ti, id, where, extra)
 	if err != nil {
 		return nil, err
 	}
@@ -442,19 +460,28 @@ func (b *builder) runAggregate(ctx context.Context, ti *tableInfo, id *rbac.Iden
 // AND <role filter> GROUP BY <join cols>` serves every parent row of a batch.
 // keyCols are the parent columns the join columns reference; group keys are
 // normalized through them so they match the parent rows' key signatures.
-// Parents without matching rows are absent from the result (the caller
-// substitutes emptyAggResult).
+// Character join columns group by collation, so the value reported for a
+// group is an arbitrary member ('ABC' for parent 'abc' under *_ci, 'def'
+// for 'def ' under PAD SPACE): such groups are matched to their parent by the
+// column's WEIGHT_STRING instead (see keyIndex). Parents without matching
+// rows are absent from the result (the caller substitutes emptyAggResult).
 func (b *builder) runAggregateByKeys(ctx context.Context, ti *tableInfo, id *rbac.Identity, joinCols []string, keyCols []*introspect.Column, keys [][]any, where map[string]any, req aggRequest) (map[string][]map[string]any, error) {
 	exprs, plan := aggPlan(req)
 	cond, err := b.aggWhere(ti, id, where, inCondition(joinCols, keys))
 	if err != nil {
 		return nil, err
 	}
+	ki, err := b.newKeyIndex(ctx, ti, joinCols, keys)
+	if err != nil {
+		return nil, err
+	}
+	weights := ki.weightExprs()
 	group := make([]string, len(joinCols))
 	for i, c := range joinCols {
 		group[i] = quoteIdent(c)
 	}
-	query := "SELECT " + strings.Join(group, ", ") + ", " + strings.Join(exprs, ", ") +
+	head := append(append([]string{}, group...), weights...)
+	query := "SELECT " + strings.Join(head, ", ") + ", " + strings.Join(exprs, ", ") +
 		" FROM " + b.qualifiedTable(ti.table) + " WHERE " + cond.sql +
 		" GROUP BY " + strings.Join(group, ", ")
 	b.logSQL(query, cond.args)
@@ -465,9 +492,9 @@ func (b *builder) runAggregateByKeys(ctx context.Context, ti *tableInfo, id *rba
 	}
 	defer rows.Close()
 	out := map[string][]map[string]any{}
-	n := len(joinCols)
+	n, nw := len(joinCols), len(weights)
 	for rows.Next() {
-		vals := make([]any, n+len(plan))
+		vals := make([]any, n+nw+len(plan))
 		ptrs := make([]any, len(vals))
 		for i := range vals {
 			ptrs[i] = &vals[i]
@@ -484,10 +511,12 @@ func (b *builder) runAggregateByKeys(ctx context.Context, ti *tableInfo, id *rba
 			key[i] = v
 		}
 		res := emptyAggResult(req)
-		if err := b.fillAggResult(res, plan, vals[n:]); err != nil {
+		if err := b.fillAggResult(res, plan, vals[n+nw:]); err != nil {
 			return nil, err
 		}
-		out[keySig(key)] = []map[string]any{res}
+		for _, k := range ki.match(key, vals[n:n+nw]) {
+			out[keySig(keys[k])] = []map[string]any{res}
+		}
 	}
 	if err := rows.Err(); err != nil {
 		return nil, b.dbErr(err)
@@ -534,6 +563,16 @@ func (b *builder) addArrayRelAggField(fields graphql.Fields, rel *relInfo) {
 				key[i] = v
 			}
 			where, _ := p.Args["where"].(map[string]any)
+			if serialMutation(p.Info) {
+				// Resolve now, before the next root mutation runs (see
+				// serialMutation): one query for this parent.
+				parts := make([]string, len(fk.Columns))
+				for i, c := range fk.Columns {
+					parts[i] = quoteIdent(c) + " = ?"
+				}
+				return b.runAggregate(p.Context, child, id, where, req,
+					&condition{sql: strings.Join(parts, " AND "), args: key})
+			}
 			sig, err := json.Marshal(where)
 			if err != nil {
 				return nil, fmt.Errorf("encoding where: %w", err)

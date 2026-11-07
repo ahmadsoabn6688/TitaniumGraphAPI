@@ -57,15 +57,16 @@ func TestAggregateResultShape(t *testing.T) {
 	if strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Errorf("posts_aggregate_result fields = %v, want %v", got, want)
 	}
-	// Counts are 64-bit by default.
-	if ty := objectFieldType(t, s, "posts_aggregate_result", "count"); ty != "BigInt!" {
-		t.Errorf("count type = %s, want BigInt!", ty)
+	// Without count_type the pre-existing count fields keep their Int! type
+	// (backward compatibility); the new per-column counts are 64-bit.
+	if ty := objectFieldType(t, s, "posts_aggregate_result", "count"); ty != "Int!" {
+		t.Errorf("count type = %s, want Int!", ty)
 	}
-	if ty := objectFieldType(t, s, "posts_connection", "total_count"); ty != "BigInt!" {
-		t.Errorf("total_count type = %s, want BigInt!", ty)
+	if ty := objectFieldType(t, s, "posts_connection", "total_count"); ty != "Int!" {
+		t.Errorf("total_count type = %s, want Int!", ty)
 	}
-	if ty := objectFieldType(t, s, "mutation_response", "affected_rows"); ty != "BigInt!" {
-		t.Errorf("affected_rows type = %s, want BigInt!", ty)
+	if ty := objectFieldType(t, s, "mutation_response", "affected_rows"); ty != "Int!" {
+		t.Errorf("affected_rows type = %s, want Int!", ty)
 	}
 	if ty := objectFieldType(t, s, "posts_count_distinct_fields", "author_id"); ty != "BigInt!" {
 		t.Errorf("count_distinct column type = %s, want BigInt!", ty)
@@ -86,7 +87,7 @@ func TestAggregateResultShape(t *testing.T) {
 	if got := objectFields(t, s, "posts_count_columns_fields"); strings.Join(got, ",") != "author_id,body,id,published_on,title" {
 		t.Errorf("count_columns fields = %v", got)
 	}
-	for _, typ := range []string{"posts_count_distinct_fields", "posts_approx_count_distinct_fields"} {
+	for _, typ := range []string{"posts_count_distinct_fields", "posts_count_distinct_approx_fields"} {
 		if got := objectFields(t, s, typ); strings.Join(got, ",") != "author_id,id,published_on,title" {
 			t.Errorf("%s fields = %v (TEXT must be excluded)", typ, got)
 		}
@@ -98,28 +99,32 @@ func TestAggregateResultShape(t *testing.T) {
 	}
 }
 
-func TestCountTypeInt(t *testing.T) {
+func TestCountTypes(t *testing.T) {
 	cfg := &config.Config{Roles: map[string]*config.Role{"r": selectDeleteAll()}}
 	cfg.SchemaGen.DefaultPageSize = 25
 	cfg.SchemaGen.MaxPageSize = 200
-	cfg.SchemaGen.CountType = config.CountTypeInt
-	schemas, err := BuildAll(Options{Catalog: filterCatalog(), Config: cfg})
-	if err != nil {
-		t.Fatal(err)
-	}
-	s := schemas["r"]
-	for _, tc := range [][2]string{
-		{"posts_aggregate_result", "count"},
-		{"posts_connection", "total_count"},
-		{"mutation_response", "affected_rows"},
+	for countType, want := range map[string]string{
+		config.CountTypeInt: "Int!", config.CountTypeBigInt: "BigInt!", "": "Int!",
 	} {
-		if ty := objectFieldType(t, s, tc[0], tc[1]); ty != "Int!" {
-			t.Errorf("%s.%s = %s, want Int! under count_type: Int", tc[0], tc[1], ty)
+		cfg.SchemaGen.CountType = countType
+		schemas, err := BuildAll(Options{Catalog: filterCatalog(), Config: cfg})
+		if err != nil {
+			t.Fatal(err)
 		}
-	}
-	// The new per-column counts stay 64-bit regardless.
-	if ty := objectFieldType(t, s, "posts_count_distinct_fields", "id"); ty != "BigInt!" {
-		t.Errorf("count_distinct column type = %s, want BigInt!", ty)
+		s := schemas["r"]
+		for _, tc := range [][2]string{
+			{"posts_aggregate_result", "count"},
+			{"posts_connection", "total_count"},
+			{"mutation_response", "affected_rows"},
+		} {
+			if ty := objectFieldType(t, s, tc[0], tc[1]); ty != want {
+				t.Errorf("%s.%s = %s, want %s under count_type %q", tc[0], tc[1], ty, want, countType)
+			}
+		}
+		// The new per-column counts stay 64-bit regardless.
+		if ty := objectFieldType(t, s, "posts_count_distinct_fields", "id"); ty != "BigInt!" {
+			t.Errorf("count_distinct column type = %s, want BigInt!", ty)
+		}
 	}
 }
 
@@ -322,7 +327,7 @@ func TestNestedAggregateBatched(t *testing.T) {
 		return nil, nil, errors.New("unexpected query: " + q)
 	}
 	db, log := newFakeDB(answer)
-	_, s, err := tryBuildFilterRoleDB(db, role)
+	_, s, err := tryBuildFilterRoleCfg(db, role, func(c *config.Config) { c.SchemaGen.CountType = config.CountTypeBigInt })
 	if err != nil {
 		t.Fatal(err)
 	}

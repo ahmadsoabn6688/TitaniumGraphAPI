@@ -179,17 +179,17 @@ func TestAggregate64Bit(t *testing.T) {
 	env := New(t, WithSQL(
 		"CREATE TABLE ledger (id BIGINT PRIMARY KEY, amount BIGINT NOT NULL, note VARCHAR(20) NULL)",
 		"INSERT INTO ledger VALUES (1, 9223372036854775000, 'a'), (2, 9223372036854775000, 'b'), (3, 9007199254740993, NULL)",
-	))
+	), WithConfig(func(c *config.Config) { c.SchemaGen.CountType = config.CountTypeBigInt }))
 	admin := env.Token(t, "admin", 4)
 
-	// Counts are BigInt by default (64-bit; wire format is a JSON number) ...
+	// With count_type: BigInt counts are 64-bit (wire format: a JSON number) ...
 	for _, tc := range [][2]string{
 		{"posts_aggregate_result", "count"},
 		{"posts_connection", "total_count"},
 		{"mutation_response", "affected_rows"},
 		{"posts_count_distinct_fields", "author_id"},
 		{"posts_count_columns_fields", "title"},
-		{"posts_approx_count_distinct_fields", "title"},
+		{"posts_count_distinct_approx_fields", "title"},
 	} {
 		if got := typeOfField(t, env, admin, tc[0], tc[1]); got != "BigInt!" {
 			t.Errorf("%s.%s = %s, want BigInt!", tc[0], tc[1], got)
@@ -210,22 +210,70 @@ func TestAggregate64Bit(t *testing.T) {
 	wantInt(t, r, "ledger_connection.total_count", 3)
 }
 
-func TestAggregateCountTypeInt(t *testing.T) {
+// TestAggregateCountTypeDefault: a config without count_type (every config
+// written before it existed) keeps the Int! count fields; Int can also be
+// set explicitly. The new per-column counts are BigInt! either way.
+func TestAggregateCountTypeDefault(t *testing.T) {
 	t.Parallel()
-	env := New(t, WithConfig(func(c *config.Config) { c.SchemaGen.CountType = config.CountTypeInt }))
-	admin := env.Token(t, "admin", 4)
-	for _, tc := range [][2]string{
-		{"posts_aggregate_result", "count"},
-		{"posts_connection", "total_count"},
-		{"mutation_response", "affected_rows"},
+	for name, opt := range map[string]Option{
+		"default":  WithConfig(func(*config.Config) {}),
+		"explicit": WithConfig(func(c *config.Config) { c.SchemaGen.CountType = config.CountTypeInt }),
 	} {
-		if got := typeOfField(t, env, admin, tc[0], tc[1]); got != "Int!" {
-			t.Errorf("%s.%s = %s, want Int! with count_type: Int", tc[0], tc[1], got)
-		}
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			env := New(t, opt)
+			if env.Config.SchemaGen.CountType != config.CountTypeInt {
+				t.Fatalf("count_type resolved to %q", env.Config.SchemaGen.CountType)
+			}
+			admin := env.Token(t, "admin", 4)
+			for _, tc := range [][3]string{
+				{"posts_aggregate_result", "count", "Int!"},
+				{"posts_connection", "total_count", "Int!"},
+				{"mutation_response", "affected_rows", "Int!"},
+				{"posts_count_distinct_fields", "author_id", "BigInt!"},
+			} {
+				if got := typeOfField(t, env, admin, tc[0], tc[1]); got != tc[2] {
+					t.Errorf("%s.%s = %s, want %s", tc[0], tc[1], got, tc[2])
+				}
+			}
+			r := env.MustGQL(t, admin, `{ posts_aggregate { count count_distinct { author_id } } }`, nil)
+			wantInt(t, r, "posts_aggregate.count", 4)
+			wantInt(t, r, "posts_aggregate.count_distinct.author_id", 3)
+			// The anonymous role sees the same Int! type over its own rows.
+			anon := env.MustGQL(t, "", `{ posts_aggregate { count } posts_connection { total_count } }`, nil)
+			wantInt(t, anon, "posts_aggregate.count", 3)
+			wantInt(t, anon, "posts_connection.total_count", 3)
+		})
 	}
-	r := env.MustGQL(t, admin, `{ posts_aggregate { count count_distinct { author_id } } }`, nil)
-	wantInt(t, r, "posts_aggregate.count", 4)
-	wantInt(t, r, "posts_aggregate.count_distinct.author_id", 3)
+}
+
+// TestAggregateTableSuffixNames: tables <t> and <t>_approx (or <t>_count,
+// <t>_stddev …) coexist; the aggregate type names stay distinct.
+func TestAggregateTableSuffixNames(t *testing.T) {
+	t.Parallel()
+	env := New(t, WithSQL(
+		"CREATE TABLE events (id BIGINT PRIMARY KEY, kind VARCHAR(20) NOT NULL)",
+		"CREATE TABLE events_approx (id BIGINT PRIMARY KEY, kind VARCHAR(20) NOT NULL)",
+		"CREATE TABLE events_count (id BIGINT PRIMARY KEY, n INT NOT NULL)",
+		"INSERT INTO events VALUES (1, 'a'), (2, 'a'), (3, 'b')",
+		"INSERT INTO events_approx VALUES (1, 'x')",
+	))
+	admin := env.Token(t, "admin", 4)
+	r := env.MustGQL(t, admin, `{
+		events_aggregate { count_distinct { kind } approx_count_distinct { kind } }
+		events_approx_aggregate { count_distinct { kind } approx_count_distinct { kind } }
+	}`, nil)
+	wantInt(t, r, "events_aggregate.count_distinct.kind", 2)
+	wantInt(t, r, "events_aggregate.approx_count_distinct.kind", 2)
+	wantInt(t, r, "events_approx_aggregate.count_distinct.kind", 1)
+	if got := typeOfField(t, env, admin, "events_count_distinct_approx_fields", "kind"); got != "BigInt!" {
+		t.Errorf("events_count_distinct_approx_fields.kind = %s", got)
+	}
+	if got := typeOfField(t, env, admin, "events_approx_count_distinct_fields", "kind"); got != "BigInt!" {
+		t.Errorf("events_approx_count_distinct_fields.kind = %s", got)
+	}
+	// The anonymous role has no grant on these tables at all.
+	env.GQL(t, "", `{ events_aggregate { count } }`, nil).MustFail(t, "events_aggregate")
 }
 
 func TestNestedAggregates(t *testing.T) {

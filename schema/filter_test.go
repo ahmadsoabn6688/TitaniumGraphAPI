@@ -82,10 +82,15 @@ func tryBuildFilterRole(role *config.Role, ops ...config.CustomOperator) (*build
 // tryBuildFilterRoleDB is tryBuildFilterRole with a database for the startup
 // checks (custom operator dry runs, collation probe, row filter checks).
 func tryBuildFilterRoleDB(db *sql.DB, role *config.Role, ops ...config.CustomOperator) (*builder, graphql.Schema, error) {
+	return tryBuildFilterRoleCfg(db, role, func(cfg *config.Config) { cfg.SchemaGen.CustomOperators = ops })
+}
+
+// tryBuildFilterRoleCfg is tryBuildFilterRoleDB with a config hook.
+func tryBuildFilterRoleCfg(db *sql.DB, role *config.Role, mutate func(*config.Config)) (*builder, graphql.Schema, error) {
 	cfg := &config.Config{Roles: map[string]*config.Role{"r": role}}
 	cfg.SchemaGen.DefaultPageSize = 25
 	cfg.SchemaGen.MaxPageSize = 200
-	cfg.SchemaGen.CustomOperators = ops
+	mutate(cfg)
 	opt := Options{DB: db, Catalog: filterCatalog(), Config: cfg}
 	shared, err := newBuildShared(opt)
 	if err != nil {

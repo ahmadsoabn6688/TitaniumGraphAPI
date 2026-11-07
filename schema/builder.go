@@ -559,7 +559,7 @@ func (b *builder) addObjectRelField(fields graphql.Fields, rel *relInfo) {
 				key[i] = v
 			}
 
-			if !batchable {
+			if !batchable || serialMutation(p.Info) {
 				parts := make([]string, len(fk.RefColumns))
 				for i, rc := range fk.RefColumns {
 					parts[i] = quoteIdent(rc) + " = ?"
@@ -580,11 +580,7 @@ func (b *builder) addObjectRelField(fields graphql.Fields, rel *relInfo) {
 				func() *relLoader {
 					return newRelLoader(func(ctx context.Context, keys [][]any) (map[string][]map[string]any, error) {
 						// To-one: each referenced key yields at most one row.
-						rows, err := b.runSelectByKeys(ctx, target, id, fk.RefColumns, keys, nil, nil, 0)
-						if err != nil {
-							return nil, err
-						}
-						return groupByColumns(rows, fk.RefColumns), nil
+						return b.runSelectByKeys(ctx, target, id, fk.RefColumns, keys, nil, nil, 0)
 					})
 				})
 			loader.enqueue(key)
@@ -631,7 +627,7 @@ func (b *builder) addArrayRelField(fields graphql.Fields, rel *relInfo) {
 				return nil, err
 			}
 
-			if !batchable {
+			if !batchable || serialMutation(p.Info) {
 				parts := make([]string, len(fk.Columns))
 				for i, cc := range fk.Columns {
 					parts[i] = quoteIdent(cc) + " = ?"
@@ -660,11 +656,7 @@ func (b *builder) addArrayRelField(fields graphql.Fields, rel *relInfo) {
 				loaderKey("in", fk.ConstraintName, argsSignature(la)),
 				func() *relLoader {
 					return newRelLoader(func(ctx context.Context, keys [][]any) (map[string][]map[string]any, error) {
-						rows, err := b.runSelectByKeys(ctx, child, id, fk.Columns, keys, la.where, la.orderBy, perKey)
-						if err != nil {
-							return nil, err
-						}
-						return groupByColumns(rows, fk.Columns), nil
+						return b.runSelectByKeys(ctx, child, id, fk.Columns, keys, la.where, la.orderBy, perKey)
 					})
 				})
 			loader.enqueue(key)

@@ -176,9 +176,10 @@ type SchemaGen struct {
 	CustomOperators []CustomOperator `yaml:"custom_operators"`
 	// CountType is the GraphQL scalar of row counts (<t>_aggregate.count,
 	// <t>_connection.total_count and mutation_response.affected_rows):
-	// "BigInt" (the default; 64-bit, so counts past 2^31-1 never overflow) or
-	// "Int" (GraphQL's 32-bit Int, for clients generated against an older
-	// schema; a count above 2147483647 then fails the field).
+	// "Int" (the default, unchanged from earlier versions: GraphQL's 32-bit
+	// Int, so a count above 2147483647 fails the field) or "BigInt" (64-bit,
+	// recommended for new deployments and large tables; it changes the
+	// declared type of those fields, which matters to generated clients).
 	CountType string `yaml:"count_type"`
 }
 
@@ -419,7 +420,8 @@ func (c *Config) applyDefaults() {
 		c.SchemaGen.MaxPageSize = 200
 	}
 	if c.SchemaGen.CountType == "" {
-		c.SchemaGen.CountType = CountTypeBigInt
+		// Int keeps existing configs' schemas unchanged; BigInt is opt-in.
+		c.SchemaGen.CountType = CountTypeInt
 	}
 }
 

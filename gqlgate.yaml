@@ -49,8 +49,8 @@ schema_gen:
       argument: Int
       applies_to: [Date, DateTime]
       sql: "YEAR({column}) = {value}"
-  # Row counts (posts_aggregate.count, total_count, affected_rows) are 64-bit
-  # BigInt; set Int only for clients generated against an Int! schema.
+  # Row counts (posts_aggregate.count, total_count, affected_rows) as 64-bit
+  # BigInt. Without this line they stay Int! (the backward-compatible default).
   count_type: BigInt
 
 # Custom logic lives in the hooks/ directory (compiled in on build; any Go

@@ -42,7 +42,8 @@ CLI can mint dev tokens (`-print-token`).
   avg, min/max, per-column and distinct counts (exact or TiDB's approximate
   HyperLogLog) and standard deviation/variance in one query, and every array
   relationship gets `<rel>_aggregate` (`users { posts_aggregate { count } }`),
-  batched into one `GROUP BY` per page of parents. Counts are 64-bit.
+  batched into one `GROUP BY` per page of parents. Counts can be 64-bit
+  (`schema_gen.count_type: BigInt`).
 - **Filter through relationships.** `where: {author: {name: {_eq: "Ada"}},
   comments: {}}` compiles to correlated `EXISTS` subqueries that apply the
   related table's row filter for the role — in connections, aggregates,
@@ -183,7 +184,7 @@ schema_gen:
       argument: Int        # GraphQL scalar of the argument
       applies_to: [Date, DateTime]   # column scalars that get it (default: [argument])
       sql: "YEAR({column}) = {value}"
-  count_type: BigInt       # scalar of count/total_count/affected_rows: BigInt (default, 64-bit) or Int
+  count_type: BigInt       # scalar of count/total_count/affected_rows: Int (default) or BigInt (64-bit)
 
 roles:
   <role-name>:
@@ -276,10 +277,10 @@ In both modes:
 ```graphql
 # queries (collection reads are cursor-only)
 posts_connection(first: Int, after: String, where: posts_bool_exp): posts_connection!
-  # posts_connection { nodes: [posts!]!  page_info { has_next_page end_cursor }  total_count: BigInt! }
+  # posts_connection { nodes: [posts!]!  page_info { has_next_page end_cursor }  total_count: Int! }
 posts_by_pk(id: BigInt!): posts
 posts_aggregate(where: posts_bool_exp): posts_aggregate_result!
-  # { count: BigInt!  sum {..}  avg {..}  min {..}  max {..}  count_columns {..}
+  # { count: Int!  sum {..}  avg {..}  min {..}  max {..}  count_columns {..}
   #   count_distinct {..}  approx_count_distinct {..}  stddev {..}  stddev_pop {..}
   #   stddev_samp {..}  variance {..}  var_pop {..}  var_samp {..} }
 posts_nearest_by_<vectorcol>(to: Vector!, metric: vector_metric, first: Int, where: posts_bool_exp): [posts_neighbor!]!
@@ -292,7 +293,8 @@ update_posts(where: posts_bool_exp!, _set: posts_set_input!): mutation_response!
 update_posts_by_pk(id: BigInt!, _set: posts_set_input!): posts
 delete_posts(where: posts_bool_exp!): mutation_response!
 delete_posts_by_pk(id: BigInt!): posts
-  # mutation_response { affected_rows: BigInt! }
+  # mutation_response { affected_rows: Int! }
+  # (count, total_count and affected_rows are BigInt! with schema_gen.count_type: BigInt)
 
 # on each row type, per array relationship (here users <- posts.author_id)
 users { posts(where, order_by, limit, offset): [posts!]!
@@ -369,6 +371,22 @@ otherwise it falls back to a per-row query (never a correctness or RBAC
 compromise). Nested aggregates (`users { posts_aggregate { count } }`) always
 batch into one `GROUP BY` query per wave of parents: the child's FK columns
 are only used as the grouping key there, never returned.
+
+String keys follow the column's collation, as SQL equality does: with a
+`*_ci` collation a child whose FK holds `'ABC'` belongs to the parent `'abc'`,
+and with a PAD SPACE collation (every `*_bin`/`*_ci` one except the
+`utf8mb4_0900_*` family) `'def'` belongs to `'def '`. The list, the
+`_aggregate` and the object relationship all agree on this: when a join
+column is a character column, rows are matched to their parent by the
+column's `WEIGHT_STRING()` (one extra small query per batch computes the
+parents' weights). Integer, date and binary keys compare by value as before.
+
+**Mutations with several root fields.** GraphQL runs `mutation { a: … b: … }`
+one field after another, but batched relationship fields would only be read
+after the last one. So in such a request every relationship and
+`<rel>_aggregate` field resolves right away, one query per parent row, and
+the rows nested under `a` show the database as `a` left it (not after `b`). A
+request with a single mutation, and every query, keeps batching.
 
 ## Hot config reload (dev)
 
@@ -467,11 +485,14 @@ query { posts_aggregate(where: {published: {_eq: true}}) {
 ```
 
 The shape is function-first like the original `sum`/`avg`/`min`/`max`: each
-function is an object with one field per column it applies to.
+function is an object with one field per column it applies to, typed
+`<t>_<function>_fields` (`approx_count_distinct`'s type is
+`<t>_count_distinct_approx_fields`, so a table named `<t>_approx` can't clash
+with it).
 
 | Field | SQL | Columns | Result |
 |---|---|---|---|
-| `count` | `COUNT(*)` | — | `BigInt!` (see `count_type`) |
+| `count` | `COUNT(*)` | — | `Int!`, or `BigInt!` (see `count_type`) |
 | `sum` | `SUM(c)` | numeric | `Decimal` (exact string) |
 | `avg` | `AVG(c)` | numeric | `Float` |
 | `min` / `max` | `MIN(c)` / `MAX(c)` | every readable column | the column's scalar |
@@ -495,11 +516,14 @@ Notes:
   `approx_count_distinct` uses TiDB's HyperLogLog and stays cheap. Distinct
   counts are not offered on JSON, VECTOR or BLOB/TEXT columns.
 - **64-bit counts.** `count`, the connection's `total_count` and mutations'
-  `affected_rows` are `BigInt!`, so counts past 2,147,483,647 (GraphQL `Int`'s
-  limit) work. `BigInt` is a JSON number on the wire, so responses look exactly
-  as before; only the declared type changed from `Int!`. Clients generated
-  against the old schema that need `Int!` can set `schema_gen.count_type: Int`
-  (such a count above 2^31-1 then fails the field). The per-column counts are
+  `affected_rows` are `Int!` by default, exactly as before, so existing
+  configs and generated clients see an unchanged schema; a count above
+  2,147,483,647 (GraphQL `Int`'s limit) then fails the field. Set
+  `schema_gen.count_type: BigInt` (as the demo `gqlgate.yaml` does; recommended
+  for new deployments and large tables) to make them `BigInt!`. `BigInt` is a
+  JSON number on the wire, so responses look the same; only the declared type
+  changes, which matters to clients generated from the schema (strict-scalar
+  codegen needs a `BigInt` mapping). The per-column counts are new fields and
   always `BigInt!`. `sum` stays an exact `Decimal` string, so integer sums
   can't overflow or lose precision either (even past the 64-bit range).
   `avg` and the statistics are `Float` (a double); for an exact average of
@@ -530,7 +554,8 @@ query { users_connection { nodes {
   COUNT(*), SUM(views) … FROM posts WHERE author_id IN (…) AND <where> AND
   <role filter> GROUP BY author_id` (composite foreign keys use
   `(a, b) IN ((?, ?), …)`). Parents without matching rows get `count: 0` and
-  `null` sums.
+  `null` sums. String keys group by their collation, like the `IN` (see
+  [Relationship batching](#relationship-batching-dataloader)).
 - The **child table's** row filter and column permissions apply, exactly as
   for `<child>_aggregate`; `where` is the child's `bool_exp`, including its
   filter surface and relationship filters.

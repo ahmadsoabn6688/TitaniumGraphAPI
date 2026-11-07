@@ -261,37 +261,48 @@ func selectList(cols []*introspect.Column) string {
 // scanRows executes a SELECT and maps each row into a column-name-keyed map,
 // applying convertValue per column. Shared by runSelect and runSelectByKeys.
 func (b *builder) scanRows(ctx context.Context, cols []*introspect.Column, query string, args []any) ([]map[string]any, error) {
+	rows, _, err := b.scanRowsExtra(ctx, cols, 0, query, args)
+	return rows, err
+}
+
+// scanRowsExtra is scanRows for a SELECT that lists nExtra raw values after
+// cols (e.g. key weights); those are returned per row, unconverted.
+func (b *builder) scanRowsExtra(ctx context.Context, cols []*introspect.Column, nExtra int, query string, args []any) ([]map[string]any, [][]any, error) {
 	b.logSQL(query, args)
 	rows, err := b.opt.DB.QueryContext(ctx, query, args...)
 	if err != nil {
-		return nil, b.dbErr(err)
+		return nil, nil, b.dbErr(err)
 	}
 	defer rows.Close()
 
 	var out []map[string]any
+	var extras [][]any
 	for rows.Next() {
-		vals := make([]any, len(cols))
-		ptrs := make([]any, len(cols))
+		vals := make([]any, len(cols)+nExtra)
+		ptrs := make([]any, len(vals))
 		for i := range vals {
 			ptrs[i] = &vals[i]
 		}
 		if err := rows.Scan(ptrs...); err != nil {
-			return nil, b.dbErr(err)
+			return nil, nil, b.dbErr(err)
 		}
 		row := make(map[string]any, len(cols))
 		for i, c := range cols {
 			v, err := convertValue(c, vals[i])
 			if err != nil {
-				return nil, b.dbErr(err)
+				return nil, nil, b.dbErr(err)
 			}
 			row[c.Name] = v
 		}
 		out = append(out, row)
+		if nExtra > 0 {
+			extras = append(extras, vals[len(cols):])
+		}
 	}
 	if err := rows.Err(); err != nil {
-		return nil, b.dbErr(err)
+		return nil, nil, b.dbErr(err)
 	}
-	return out, nil
+	return out, extras, nil
 }
 
 // pkOrderClause orders by the primary key ascending — the clustered-index
@@ -353,14 +364,16 @@ func (b *builder) runKeysetPage(ctx context.Context, ti *tableInfo, id *rbac.Ide
 // selects rows whose joinCols match any of the given key tuples, applying the
 // role's row filter and (for to-many relations) the field's where/order_by, so
 // one query serves every parent row (defeating the N+1 pattern). All key
-// values are bound as parameters; the caller groups by joinCols and slices
-// each parent's page in memory.
+// values are bound as parameters. The rows come back bucketed by the
+// signature of the key(s) they match (see keyIndex: character keys match by
+// collation, as the IN did), each bucket in ORDER BY order, so the caller
+// only slices each parent's page.
 //
 // perKeyLimit bounds how many rows are fetched PER parent key via a
 // ROW_NUMBER() window (0 = unbounded, used by to-one where each key yields one
 // row). Without it a nested to-many query could pull an entire child table
 // into memory; with it the batch is capped at len(keys) * perKeyLimit rows.
-func (b *builder) runSelectByKeys(ctx context.Context, ti *tableInfo, id *rbac.Identity, joinCols []string, keys [][]any, userWhere map[string]any, orderBy []any, perKeyLimit int) ([]map[string]any, error) {
+func (b *builder) runSelectByKeys(ctx context.Context, ti *tableInfo, id *rbac.Identity, joinCols []string, keys [][]any, userWhere map[string]any, orderBy []any, perKeyLimit int) (map[string][]map[string]any, error) {
 	sel := ti.access.Select
 	if sel == nil {
 		return nil, fmt.Errorf("select on %q is not permitted for role %q", ti.table.Name, b.role)
@@ -384,7 +397,23 @@ func (b *builder) runSelectByKeys(ctx context.Context, ti *tableInfo, id *rbac.I
 	if err != nil {
 		return nil, err
 	}
+	ki, err := b.newKeyIndex(ctx, ti, joinCols, keys)
+	if err != nil {
+		return nil, err
+	}
+	// Collation weights of character join columns ride along as extra
+	// columns: as expressions in a plain query, and through the window's
+	// derived table under __gqlgate_kw<i> aliases.
+	weights := ki.weightExprs()
+	var innerExtra, outerExtra string
+	for i, w := range weights {
+		alias := quoteIdent(fmt.Sprintf("__gqlgate_kw%d", i))
+		innerExtra += ", " + w + " AS " + alias
+		outerExtra += ", " + alias
+	}
 
+	var query string
+	var args []any
 	if perKeyLimit > 0 {
 		winOrder, err := b.windowOrder(ti, orderBy, joinCols)
 		if err != nil {
@@ -396,20 +425,24 @@ func (b *builder) runSelectByKeys(ctx context.Context, ti *tableInfo, id *rbac.I
 		}
 		// Rank rows within each parent partition and keep only the first
 		// perKeyLimit; the outer ORDER BY makes each group contiguous and
-		// ordered so groupByColumns + applyPage produce the right page.
-		inner := "SELECT " + selectList(sel.Columns) +
+		// ordered so the buckets + applyPage produce the right page.
+		inner := "SELECT " + selectList(sel.Columns) + innerExtra +
 			", ROW_NUMBER() OVER (PARTITION BY " + strings.Join(partition, ", ") +
 			" ORDER BY " + winOrder + ") AS __gqlgate_rn" +
 			" FROM " + b.qualifiedTable(ti.table) + " WHERE " + where.sql
-		query := "SELECT " + selectList(sel.Columns) + " FROM (" + inner +
+		query = "SELECT " + selectList(sel.Columns) + outerExtra + " FROM (" + inner +
 			") AS __gqlgate_w WHERE __gqlgate_rn <= ?" + orderClause
-		args := append(append([]any{}, where.args...), perKeyLimit)
-		return b.scanRows(ctx, sel.Columns, query, args)
+		args = append(append([]any{}, where.args...), perKeyLimit)
+	} else {
+		query = "SELECT " + selectList(sel.Columns) + innerExtra + " FROM " + b.qualifiedTable(ti.table) +
+			" WHERE " + where.sql + orderClause
+		args = where.args
 	}
-
-	query := "SELECT " + selectList(sel.Columns) + " FROM " + b.qualifiedTable(ti.table) +
-		" WHERE " + where.sql + orderClause
-	return b.scanRows(ctx, sel.Columns, query, where.args)
+	rows, extras, err := b.scanRowsExtra(ctx, sel.Columns, len(weights), query, args)
+	if err != nil {
+		return nil, err
+	}
+	return ki.group(rows, extras), nil
 }
 
 // inCondition builds "col IN (?, ?, …)" for a single join column, or the
