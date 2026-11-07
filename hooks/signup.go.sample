@@ -1,7 +1,7 @@
 // Sample compiled hook file. To activate: rename to signup.go and rebuild
-// (docker compose up --build). It adds a `signup` mutation with REAL bcrypt
-// password hashing (a third-party lib — impossible in interpreted scripts)
-// and a before-insert validation hook you can wire in YAML as:
+// (docker compose up --build). It adds a `signup_author` mutation with REAL
+// bcrypt password hashing (a third-party lib — impossible in interpreted
+// scripts) and a before-insert validation hook you can wire in YAML as:
 //
 //   hooks:
 //     tables:
@@ -34,9 +34,12 @@ func init() {
 	})
 
 	// A custom mutation: create a user with a bcrypt-hashed password and
-	// return a signed JWT. Only the anonymous role sees this field.
+	// return a signed JWT. Only the anonymous role sees this field. It is a
+	// minimal variant of the `signup` mutation hooks/auth.go already
+	// registers; custom field names must be unique per role, so it has a
+	// name of its own (two fields named `signup` would fail startup).
 	register.CustomField(register.CustomFieldDef{
-		Name:         "signup",
+		Name:         "signup_author",
 		Operation:    "mutation",
 		AllowedRoles: []string{"anonymous"},
 		Field: &graphql.Field{

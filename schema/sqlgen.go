@@ -335,11 +335,8 @@ func (b *builder) pkOrderClause(ti *tableInfo) string {
 // keysetCondition builds the seek predicate "(pk...) > (?, ...)" that skips
 // everything up to and including the cursor row. Single-column keys use the
 // plain form; composite keys use TiDB's row-value comparison.
-func keysetCondition(pkCols []string, vals []string) *condition {
-	args := make([]any, len(vals))
-	for i, v := range vals {
-		args[i] = v
-	}
+func keysetCondition(pkCols []string, vals []any) *condition {
+	args := append([]any{}, vals...)
 	if len(pkCols) == 1 {
 		return &condition{sql: quoteIdent(pkCols[0]) + " > ?", args: args}
 	}

@@ -58,8 +58,9 @@ import (
 // and its caller's max_connections_per_identity — so unauthenticated sockets
 // cannot crowd out authenticated ones. A role with no Subscription root is
 // refused at connection_init. Every execution (a poll, or a query or
-// mutation sent over a socket) takes a slot of max_concurrent_polls, so
-// live queries cannot take every pooled connection from HTTP requests.
+// mutation sent over a socket) and every re-check's role lookup takes a slot
+// of max_concurrent_polls (granted in arrival order), so live queries cannot
+// take every pooled connection from HTTP requests.
 //
 // Hot reload: every poll re-reads the serving state. When it changed, the
 // connection re-authenticates against the new verifier, and each operation
@@ -86,7 +87,7 @@ const (
 const wsWriteTimeout = 10 * time.Second
 
 // wsAuthTimeout bounds one (re-)authentication (role lookups).
-const wsAuthTimeout = 10 * time.Second
+var wsAuthTimeout = 10 * time.Second // a var so tests can shorten it
 
 func isWebSocketUpgrade(r *http.Request) bool {
 	if !strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
@@ -253,51 +254,101 @@ func (h *wsHub) releaseOp(key string) {
 	}
 }
 
-// wsLimiter is a counting semaphore whose size is read on every acquire, so
-// a reload that changes max_concurrent_polls applies to the next poll.
+// wsLimiter is a FIFO counting semaphore whose size is read whenever slots
+// are granted, so a reload that changes max_concurrent_polls applies to the
+// next grant. Requests are granted strictly in arrival order: a waiting
+// request is never overtaken by a later one, so a query that needs several
+// slots cannot be starved by a stream of single-slot polls; and a release
+// wakes only the requests it can grant, not every waiter.
 type wsLimiter struct {
-	mu   sync.Mutex
-	used int
-	wake chan struct{} // closed (and dropped) on every release
+	mu    sync.Mutex
+	used  int
+	limit func() int  // the size (<= 0 = unlimited), from the latest acquire
+	queue []*wsWaiter // waiting requests, oldest first
 }
 
-// acquire takes n slots of limit() (<= 0 = unlimited), waiting until they
-// are free or ctx ends (ok false). n is capped at the limit, and a request
-// is granted whenever nothing else holds a slot, so a shrunken limit never
-// deadlocks. It returns the number of slots taken, for release.
+// wsWaiter is one queued acquire.
+type wsWaiter struct {
+	n       int
+	granted bool          // under wsLimiter.mu
+	ready   chan struct{} // closed when granted
+}
+
+// acquire takes n slots of limit() (<= 0 = unlimited), waiting in line until
+// they are granted or ctx ends (ok false). n is capped at the limit, and a
+// request is granted whenever nothing else holds a slot, so a shrunken
+// limit never deadlocks. It returns the number of slots taken, for release.
 func (l *wsLimiter) acquire(ctx context.Context, n int, limit func() int) (int, bool) {
-	for {
-		l.mu.Lock()
-		max := limit()
-		if max > 0 && n > max {
-			n = max
-		}
-		if max <= 0 || l.used == 0 || l.used+n <= max {
-			l.used += n
-			l.mu.Unlock()
-			return n, true
-		}
-		if l.wake == nil {
-			l.wake = make(chan struct{})
-		}
-		wake := l.wake
+	l.mu.Lock()
+	l.limit = limit
+	if max := limit(); max > 0 && n > max {
+		n = max
+	}
+	if len(l.queue) == 0 && l.fitsLocked(n) {
+		l.used += n
 		l.mu.Unlock()
-		select {
-		case <-wake:
-		case <-ctx.Done():
-			return 0, false
+		return n, true
+	}
+	w := &wsWaiter{n: n, ready: make(chan struct{})}
+	l.queue = append(l.queue, w)
+	l.mu.Unlock()
+	select {
+	case <-w.ready:
+		return w.n, true
+	case <-ctx.Done():
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if w.granted { // granted as ctx ended: hand the slots back
+		l.used -= w.n
+	} else {
+		for i, q := range l.queue {
+			if q == w {
+				l.queue = append(l.queue[:i], l.queue[i+1:]...)
+				break
+			}
 		}
 	}
+	// The head may have changed (or slots freed): grant whoever fits now.
+	l.grantLocked()
+	return 0, false
 }
 
 func (l *wsLimiter) release(n int) {
 	l.mu.Lock()
 	l.used -= n
-	if l.wake != nil {
-		close(l.wake)
-		l.wake = nil
-	}
+	l.grantLocked()
 	l.mu.Unlock()
+}
+
+// fitsLocked reports whether n more slots may be taken now (under mu).
+func (l *wsLimiter) fitsLocked(n int) bool {
+	max := 0
+	if l.limit != nil {
+		max = l.limit()
+	}
+	return max <= 0 || l.used == 0 || l.used+n <= max
+}
+
+// grantLocked grants queued requests in order while the oldest one fits
+// (under mu).
+func (l *wsLimiter) grantLocked() {
+	for len(l.queue) > 0 {
+		w := l.queue[0]
+		if l.limit != nil {
+			if max := l.limit(); max > 0 && w.n > max {
+				w.n = max // the limit shrank while it waited
+			}
+		}
+		if !l.fitsLocked(w.n) {
+			return
+		}
+		l.queue[0] = nil
+		l.queue = l.queue[1:]
+		l.used += w.n
+		w.granted = true
+		close(w.ready)
+	}
 }
 
 // serve upgrades one request and runs the connection until it closes.
@@ -382,12 +433,30 @@ func (h *wsHub) shutdown(ctx context.Context) error {
 	case <-done:
 		return nil
 	case <-ctx.Done():
-		for _, c := range conns {
-			c.ws.CloseNow()
-		}
-		return ctx.Err()
 	}
+	// The close handshakes did not finish in time (clients that do not
+	// read). The library's CloseNow cannot cut a Close already under way,
+	// but ending a connection's context does: its pending Read (and any
+	// write) then closes the socket at once, and every operation of the
+	// connection stops. Wait (briefly) for the connections and their
+	// operations to end, so the caller can release the database pool
+	// without executions still running on it.
+	h.mu.Lock()
+	for c := range h.conns {
+		c.cancel()
+	}
+	h.mu.Unlock()
+	select {
+	case <-done:
+	case <-time.After(wsShutdownGrace):
+	}
+	return ctx.Err()
 }
+
+// wsShutdownGrace bounds how long shutdown waits, after cutting the
+// connections whose close handshake overran its context, for their
+// operations to stop.
+const wsShutdownGrace = 3 * time.Second
 
 // wsConn is one WebSocket connection.
 type wsConn struct {
@@ -417,7 +486,11 @@ type wsConn struct {
 
 	mu  sync.Mutex
 	ops map[string]*wsOp
-	wg  sync.WaitGroup // running operations
+	// running counts the operations whose goroutine has not exited yet —
+	// including ones the client already completed (they leave ops at once)
+	// — and is what max_subscriptions_per_connection limits.
+	running int
+	wg      sync.WaitGroup // running operations
 
 	closeOnce sync.Once
 	closeDone chan struct{} // closed when the close handshake closeWith started is over
@@ -425,13 +498,18 @@ type wsConn struct {
 
 // wsOp is one running operation (subscribe message) of a connection.
 type wsOp struct {
-	id      string
-	query   string
-	vars    map[string]any
-	opName  string
-	ctx     context.Context
-	cancel  context.CancelFunc
-	removed bool // under wsConn.mu: completed by the client
+	id     string
+	query  string
+	vars   map[string]any
+	opName string
+	ctx    context.Context
+	cancel context.CancelFunc
+	// sendMu is held across checking done and writing a message for this
+	// operation, so once the client's complete has been processed (done
+	// set under sendMu) nothing more is ever sent under this id — even if
+	// the client reuses the id right away.
+	sendMu sync.Mutex
+	done   bool // under sendMu: completed by the client, or ended by the server
 }
 
 // wsMessage is one graphql-transport-ws message.
@@ -580,12 +658,16 @@ func (c *wsConn) handle(data []byte) bool {
 		c.mu.Lock()
 		op := c.ops[msg.ID]
 		if op != nil {
-			op.removed = true
 			delete(c.ops, msg.ID)
 		}
 		c.mu.Unlock()
 		if op != nil {
 			op.cancel()
+			// Wait for a message of this operation being written right now;
+			// after this, the operation never sends again.
+			op.sendMu.Lock()
+			op.done = true
+			op.sendMu.Unlock()
 		}
 	default:
 		c.closeWith(closeBadRequest, "Invalid message received: unknown type "+msg.Type)
@@ -707,7 +789,7 @@ func (c *wsConn) subscribe(msg wsMessage) bool {
 		c.closeWith(closeDuplicateID, "Subscriber for "+msg.ID+" already exists")
 		return false
 	}
-	if len(c.ops) >= max {
+	if c.running >= max {
 		c.mu.Unlock()
 		c.sendErrors(msg.ID, []gqlerrors.FormattedError{gqlerrors.NewFormattedError(
 			fmt.Sprintf("too many operations on this connection (server.subscriptions.max_subscriptions_per_connection is %d)", max))})
@@ -722,24 +804,44 @@ func (c *wsConn) subscribe(msg wsMessage) bool {
 	ctx, cancel := context.WithCancel(c.ctx)
 	op := &wsOp{id: msg.ID, query: req.Query, vars: req.Variables, opName: req.OperationName, ctx: ctx, cancel: cancel}
 	c.ops[msg.ID] = op
+	c.running++
 	c.wg.Add(1)
 	c.mu.Unlock()
 	go c.runOp(op)
 	return true
 }
 
-// finishOp forgets an operation that ended on the server side. It reports
-// whether the client had not completed it already (so a final message may
-// still be sent for it).
-func (c *wsConn) finishOp(op *wsOp) bool {
+// finish ends an operation on the server side: unless the client completed
+// it already, it is forgotten (its id free again) and its final messages
+// are sent.
+func (c *wsConn) finish(op *wsOp, msgs ...wsMessage) {
+	op.sendMu.Lock()
+	defer op.sendMu.Unlock()
+	if op.done {
+		return
+	}
+	op.done = true
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	if op.removed {
+	if c.ops[op.id] == op {
+		delete(c.ops, op.id)
+	}
+	c.mu.Unlock()
+	for _, m := range msgs {
+		if !c.send(m) {
+			return
+		}
+	}
+}
+
+// sendLive sends one message for an operation the client has not
+// completed; false when it was completed or the connection is gone.
+func (c *wsConn) sendLive(op *wsOp, msg wsMessage) bool {
+	op.sendMu.Lock()
+	defer op.sendMu.Unlock()
+	if op.done {
 		return false
 	}
-	op.removed = true
-	delete(c.ops, op.id)
-	return true
+	return c.send(msg)
 }
 
 // prepared is an operation parsed and validated against one role's schema.
@@ -750,6 +852,9 @@ type prepared struct {
 	doc      *ast.Document
 	opType   string
 	interval time.Duration
+	// roots is the number of root fields the operation selects (what a
+	// query may run in parallel).
+	roots int
 }
 
 // prepare parses and validates an operation for the role in st, the way an
@@ -790,8 +895,9 @@ func prepare(st *State, role string, op *wsOp) (*prepared, []gqlerrors.Formatted
 	if p.opType == ast.OperationTypeMutation && schema.MutationType() == nil {
 		return nil, []gqlerrors.FormattedError{gqlerrors.NewFormattedError("role " + role + " has no mutations")}
 	}
+	names := rootFieldNames(operation.SelectionSet, fragmentsOf(doc))
+	p.roots = len(names)
 	if p.opType == ast.OperationTypeSubscription {
-		names := rootFieldNames(operation.SelectionSet, fragmentsOf(doc))
 		if len(names) != 1 {
 			return nil, []gqlerrors.FormattedError{gqlerrors.NewFormattedError(
 				fmt.Sprintf("a subscription must select exactly one root field (got %d)", len(names)))}
@@ -887,25 +993,36 @@ func rootFieldNames(set *ast.SelectionSet, frags map[string]*ast.FragmentDefinit
 // for a subscription.
 func (c *wsConn) runOp(op *wsOp) {
 	defer c.wg.Done()
+	defer func() {
+		c.mu.Lock()
+		c.running--
+		c.mu.Unlock()
+	}()
 	defer c.hub.releaseOp(c.key)
 	defer op.cancel()
 
-	st, id, ok := c.authorize()
-	if !ok {
+	st, id, res := c.authorize()
+	switch {
+	case res == authClosed:
+		return
+	case res == authRetry:
+		c.finish(op, errorsMessage(op.id, errAuthUnavailable))
+		return
+	case op.ctx.Err() != nil: // completed while waiting: skip the parse
 		return
 	}
 	p, errs := prepare(st, id.Role, op)
 	if errs != nil {
-		if c.finishOp(op) {
-			c.sendErrors(op.id, errs)
-		}
+		c.finish(op, errorsMessage(op.id, errs))
 		return
 	}
 	if p.opType != ast.OperationTypeSubscription {
-		out, ok := c.execute(op, p, id)
-		if ok && c.finishOp(op) {
-			c.send(wsMessage{ID: op.id, Type: "next", Payload: out})
-			c.send(wsMessage{ID: op.id, Type: "complete"})
+		out, res := c.execute(op, p, id)
+		switch res {
+		case execOK:
+			c.finish(op, wsMessage{ID: op.id, Type: "next", Payload: out}, wsMessage{ID: op.id, Type: "complete"})
+		case execBusy:
+			c.finish(op, errorsMessage(op.id, errBusy(p.st)))
 		}
 		return
 	}
@@ -914,40 +1031,44 @@ func (c *wsConn) runOp(op *wsOp) {
 	sent := false
 	timer := time.NewTimer(0)
 	defer timer.Stop()
+	first := true
 	for {
 		select {
 		case <-op.ctx.Done():
 			return
 		case <-timer.C:
 		}
-		st, id, ok := c.authorize()
-		if !ok {
+		if !first {
+			st, id, res = c.authorize()
+		}
+		first = false
+		switch res {
+		case authClosed:
 			return
+		case authRetry: // nothing runs on an unconfirmed identity; try again later
+			timer.Reset(p.interval)
+			continue
 		}
 		if st != p.st {
 			// A reload swapped the serving state: re-validate against the
 			// role's new schema (and pick up its new interval).
 			np, errs := prepare(st, id.Role, op)
 			if errs != nil {
-				if c.finishOp(op) {
-					c.sendErrors(op.id, errs)
-				}
+				c.finish(op, errorsMessage(op.id, errs))
 				return
 			}
 			p = np
 		}
-		out, ok := c.execute(op, p, id)
-		if !ok {
+		out, res := c.execute(op, p, id)
+		switch res {
+		case execEnded:
 			return
+		case execBusy: // no slot in time: skip this poll
+			timer.Reset(p.interval)
+			continue
 		}
 		if sum := sha256.Sum256(out); !sent || sum != last {
-			c.mu.Lock()
-			live := !op.removed
-			c.mu.Unlock()
-			if !live {
-				return
-			}
-			if !c.send(wsMessage{ID: op.id, Type: "next", Payload: out}) {
+			if !c.sendLive(op, wsMessage{ID: op.id, Type: "next", Payload: out}) {
 				return
 			}
 			last, sent = sum, true
@@ -956,20 +1077,47 @@ func (c *wsConn) runOp(op *wsOp) {
 	}
 }
 
-// execute runs a prepared operation once and encodes its result. ok is false
-// when the operation (or the connection) ended meanwhile.
-func (c *wsConn) execute(op *wsOp, p *prepared, id *rbac.Identity) (json.RawMessage, bool) {
+// Outcomes of execute.
+const (
+	execOK    = iota
+	execEnded // the operation (or the connection) ended meanwhile
+	execBusy  // no max_concurrent_polls slot within the wait limit
+)
+
+// slotWait bounds how long an execution waits for max_concurrent_polls
+// slots: the query timeout (database.query_timeout_seconds), or 30s.
+func slotWait(st *State) time.Duration {
+	if s := st.Cfg.Database.QueryTimeoutSeconds; s > 0 {
+		return time.Duration(s) * time.Second
+	}
+	return 30 * time.Second
+}
+
+func errBusy(st *State) []gqlerrors.FormattedError {
+	return []gqlerrors.FormattedError{gqlerrors.NewFormattedError(fmt.Sprintf(
+		"server busy: no free execution slot within %s (server.subscriptions.max_concurrent_polls); try again", slotWait(st)))}
+}
+
+var errAuthUnavailable = []gqlerrors.FormattedError{gqlerrors.NewFormattedError(
+	"the connection could not be re-authenticated just now (role lookup busy or slow); try again")}
+
+// execute runs a prepared operation once and encodes its result.
+func (c *wsConn) execute(op *wsOp, p *prepared, id *rbac.Identity) (json.RawMessage, int) {
 	// A query may run its root fields in parallel, each on its own pooled
-	// connection: it takes that many slots of max_concurrent_polls.
+	// connection: it takes one slot of max_concurrent_polls per root field,
+	// up to max_parallel_root_fields.
 	weight := 1
 	if p.opType == ast.OperationTypeQuery && p.st.Cfg.Server.MaxParallelRootFields > 1 {
-		weight = p.st.Cfg.Server.MaxParallelRootFields
+		weight = max(1, min(p.roots, p.st.Cfg.Server.MaxParallelRootFields))
 	}
-	n, ok := c.hub.polls.acquire(op.ctx, weight, func() int {
-		return c.hub.s.current().Cfg.Server.Subscriptions.MaxConcurrentPolls
-	})
+	waitCtx, cancelWait := context.WithTimeout(op.ctx, slotWait(p.st))
+	n, ok := c.hub.polls.acquire(waitCtx, weight, c.hub.pollLimit)
+	cancelWait()
 	if !ok {
-		return nil, false
+		if op.ctx.Err() != nil {
+			return nil, execEnded
+		}
+		return nil, execBusy
 	}
 	defer c.hub.polls.release(n)
 	ctx, cancel := requestContext(op.ctx, p.st, id)
@@ -983,60 +1131,95 @@ func (c *wsConn) execute(op *wsOp, p *prepared, id *rbac.Identity) (json.RawMess
 		Context:       ctx,
 	})
 	if op.ctx.Err() != nil {
-		return nil, false
+		return nil, execEnded
 	}
 	out, err := c.hub.s.encodeResult(ctx, p.st, result, id.Role, op.opName, start)
 	if err != nil {
 		c.closeWith(closeInternalError, "could not encode the response")
-		return nil, false
+		return nil, execEnded
 	}
-	return out, true
+	return out, execOK
 }
+
+// pollLimit is the current max_concurrent_polls.
+func (h *wsHub) pollLimit() int {
+	return h.s.current().Cfg.Server.Subscriptions.MaxConcurrentPolls
+}
+
+// Outcomes of authorize.
+const (
+	authOK     = iota
+	authClosed // the connection is closing (or was just closed: 4401/4403)
+	authRetry  // a re-check could not complete in time; nothing may run now
+)
+
+// wsReauthGrace is how long past a due re-check transient failures (a role
+// lookup timing out, no slot for it) are retried before the connection is
+// closed with 4403 after all.
+const wsReauthGrace = time.Minute
 
 // authorize returns the state and identity to run the next execution with.
 // It re-authenticates when the serving state changed (hot reload) or the
 // re-check interval passed, closing the connection when the caller is no
 // longer accepted (4401 for an expired token, 4403 otherwise).
-func (c *wsConn) authorize() (*State, *rbac.Identity, bool) {
+//
+// A re-check runs its role lookups (jwt.role_lookup, allowed roles) in a
+// max_concurrent_polls slot like an execution, so a hot reload that makes
+// every socket re-authenticate cannot flood the database pool. A re-check
+// that times out — waiting for that slot or in the lookup itself — is
+// treated as transient (authRetry: nothing runs until a later re-check
+// succeeds); only when that keeps happening wsReauthGrace past the due
+// re-check does the connection close with 4403.
+func (c *wsConn) authorize() (*State, *rbac.Identity, int) {
 	c.authMu.Lock()
 	defer c.authMu.Unlock()
 	if c.ctx.Err() != nil || c.closing.Load() {
-		return nil, nil, false
+		return nil, nil, authClosed
 	}
 	st := c.hub.s.current()
 	if !st.Cfg.Server.Subscriptions.On() {
 		c.closeWith(websocket.StatusGoingAway, wsDisabledReason)
-		return nil, nil, false
+		return nil, nil, authClosed
 	}
 	every := time.Duration(st.Cfg.Server.Subscriptions.ReauthIntervalSeconds) * time.Second
 	if st == c.st && time.Since(c.authAt) < every {
-		return c.st, c.id, true
+		return c.st, c.id, authOK
 	}
 	ctx, cancel := context.WithTimeout(c.ctx, wsAuthTimeout)
-	id, _, err := st.Verifier.IdentifyHeaders(ctx, c.headers)
-	cancel()
+	defer cancel()
+	var id *rbac.Identity
+	var err error
+	if n, ok := c.hub.polls.acquire(ctx, 1, c.hub.pollLimit); ok {
+		id, _, err = st.Verifier.IdentifyHeaders(ctx, c.headers)
+		c.hub.polls.release(n)
+	} else {
+		err = ctx.Err()
+	}
 	if err != nil {
 		if c.ctx.Err() != nil {
-			return nil, nil, false
+			return nil, nil, authClosed
 		}
 		c.logDebug("websocket re-authentication failed", "err", err)
+		if errors.Is(err, context.DeadlineExceeded) && time.Since(c.authAt) < every+wsReauthGrace {
+			return nil, nil, authRetry
+		}
 		if auth.IsExpired(err) {
 			c.closeWith(closeUnauthorized, "Token expired")
 		} else {
 			c.closeWith(closeForbidden, "Forbidden: "+err.Error())
 		}
-		return nil, nil, false
+		return nil, nil, authClosed
 	}
 	if id.Role != c.id.Role {
 		c.closeWith(closeForbidden, fmt.Sprintf("Forbidden: the role changed from %s to %s; reconnect", c.id.Role, id.Role))
-		return nil, nil, false
+		return nil, nil, authClosed
 	}
 	if _, ok := st.Schemas[id.Role]; !ok {
 		c.closeWith(closeForbidden, "Forbidden: no schema for role "+id.Role)
-		return nil, nil, false
+		return nil, nil, authClosed
 	}
 	c.st, c.id, c.authAt = st, id, time.Now()
-	return st, id, true
+	return st, id, authOK
 }
 
 // send writes one message; false when the connection is gone.
@@ -1056,12 +1239,16 @@ func (c *wsConn) send(msg wsMessage) bool {
 }
 
 func (c *wsConn) sendErrors(id string, errs []gqlerrors.FormattedError) {
+	c.send(errorsMessage(id, errs))
+}
+
+// errorsMessage is the error message that ends operation id.
+func errorsMessage(id string, errs []gqlerrors.FormattedError) wsMessage {
 	payload, err := json.Marshal(errs)
 	if err != nil {
-		c.closeWith(closeInternalError, "could not encode a message")
-		return
+		payload = []byte(`[{"message":"could not encode the errors"}]`)
 	}
-	c.send(wsMessage{ID: id, Type: "error", Payload: payload})
+	return wsMessage{ID: id, Type: "error", Payload: payload}
 }
 
 func (c *wsConn) logDebug(msg string, args ...any) {

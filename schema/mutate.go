@@ -90,8 +90,18 @@ func quotedList(cols []string) string {
 
 // inTx runs fn in a transaction, committing on success (and recording the
 // commit for the response-limit accounting) and rolling back on error.
+//
+// The transaction is READ COMMITTED: in TiDB's (default) pessimistic mode
+// every statement then reads the latest committed data. Under REPEATABLE
+// READ only the locking statements (lockKeys' SELECT … FOR UPDATE and the
+// DML) would; the plain SELECTs that read `returning` and evaluate the write
+// check would see the transaction's start snapshot — a row another
+// transaction changed (and committed) while this one waited for its lock
+// would be returned, and checked, as it was before. Rows this transaction
+// has locked cannot change under it, so each statement still sees them as
+// this transaction left them.
 func (b *builder) inTx(ctx context.Context, fn func(tx *sql.Tx) error) error {
-	tx, err := b.opt.DB.BeginTx(ctx, nil)
+	tx, err := b.opt.DB.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
 		return b.dbErr(err)
 	}
@@ -225,17 +235,17 @@ func (b *builder) runInsert(ctx context.Context, ti *tableInfo, id *rbac.Identit
 				return err
 			}
 		}
-		ev.Affected = int(affected)
-		if err := b.opt.Hooks.runAfter(ctx, ev); err != nil {
-			return err
-		}
+		// returning is read (and counted against max_response_rows) before
+		// the after-hooks, so a read that fails or goes over the limit rolls
+		// the insert back before any after-hook has acted on it.
 		if returning {
 			var err error
 			if out, err = b.readRows(ctx, tx, ti, id, pk, keys); err != nil {
 				return err
 			}
 		}
-		return nil
+		ev.Affected = int(affected)
+		return b.opt.Hooks.runAfter(ctx, ev)
 	})
 	if err != nil {
 		return 0, nil, err
@@ -742,17 +752,15 @@ func (b *builder) runUpdate(ctx context.Context, ti *tableInfo, id *rbac.Identit
 				}
 			}
 		}
-		ev.Affected = int(n)
-		if err := b.opt.Hooks.runAfter(ctx, ev); err != nil {
-			return err
-		}
+		// As for insert: returning first, then the after-hooks.
 		if opts.returning {
 			var err error
 			if out, err = b.readRows(ctx, tx, ti, id, keyCols, keys); err != nil {
 				return err
 			}
 		}
-		return nil
+		ev.Affected = int(n)
+		return b.opt.Hooks.runAfter(ctx, ev)
 	})
 	if err != nil {
 		return 0, nil, err

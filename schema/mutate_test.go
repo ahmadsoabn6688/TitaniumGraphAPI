@@ -351,6 +351,41 @@ func TestMutationResponseTypes(t *testing.T) {
 	}
 }
 
+// schema_gen.mutation_response: shared keeps the pre-returning shape: one
+// mutation_response OBJECT with affected_rows only, returned by every bulk
+// mutation (so __typename and generated client types stay unchanged).
+func TestMutationResponseShared(t *testing.T) {
+	all := &config.OpPerm{Allow: true}
+	cfg := &config.Config{Roles: map[string]*config.Role{"r": {Tables: map[string]*config.TablePerm{
+		"posts": {Select: all, Insert: all, Update: all, Delete: all},
+	}}}}
+	cfg.SchemaGen.DefaultPageSize, cfg.SchemaGen.MaxPageSize = 25, 200
+	cfg.SchemaGen.MutationResponse = config.MutationResponseShared
+	schemas, err := BuildAll(Options{Catalog: uniqueKeyCatalog(), Config: cfg})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := schemas["r"]
+	if _, ok := s.Type("mutation_response").(*graphql.Object); !ok {
+		t.Fatalf("mutation_response must be an object in shared mode, got %T", s.Type("mutation_response"))
+	}
+	if got := objectFields(t, s, "mutation_response"); !reflect.DeepEqual(got, []string{"affected_rows"}) {
+		t.Errorf("mutation_response fields = %v", got)
+	}
+	if s.Type("posts_mutation_response") != nil {
+		t.Error("no per-table response type in shared mode")
+	}
+	for _, f := range []string{"insert_posts", "update_posts", "delete_posts"} {
+		if got := s.MutationType().Fields()[f].Type.String(); got != "mutation_response!" {
+			t.Errorf("%s returns %s", f, got)
+		}
+	}
+	// The single-row fields are unaffected.
+	if got := s.MutationType().Fields()["update_posts_by_pk"].Type.String(); got != "posts" {
+		t.Errorf("update_posts_by_pk returns %s", got)
+	}
+}
+
 func TestMutationResponseNameCollision(t *testing.T) {
 	c := cat("x", "x_mutation_response")
 	m, err := buildModel(c, nil)
@@ -511,5 +546,45 @@ func TestMutationResponseAvoidsCustomTypes(t *testing.T) {
 	}
 	if got := s.MutationType().Fields()["insert_comments"].Type.String(); got != "comments_mutation_response!" {
 		t.Errorf("unaffected tables keep their names, got %s", got)
+	}
+}
+
+// A legacy insert.filter is only enforced where each inserted row's key is
+// always known afterwards; otherwise enforcing it would refuse inserts that
+// worked while it was ignored (e.g. a DEFAULT (UUID()) key the role cannot
+// even write).
+func TestLegacyInsertKeyUnknown(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		col      introspect.Column
+		writable bool
+		preset   bool
+		unknown  bool
+	}{
+		{"auto_increment, not writable", introspect.Column{AutoIncrement: true}, false, false, false},
+		{"auto_random", introspect.Column{AutoRandom: true}, true, false, false},
+		{"writable, no default", introspect.Column{}, true, false, false},
+		{"preset over a default", introspect.Column{HasDefault: true}, false, true, false},
+		{"UUID default, not writable", introspect.Column{HasDefault: true}, false, false, true},
+		{"UUID default, writable", introspect.Column{HasDefault: true}, true, false, true},
+		{"not writable, no default", introspect.Column{}, false, false, true},
+		{"generated", introspect.Column{Generated: true}, false, false, true},
+	} {
+		col := tc.col
+		col.Name, col.DataType, col.ColumnType = "id", "varchar", "varchar(36)"
+		body := &introspect.Column{Name: "body", DataType: "text", ColumnType: "text", Ordinal: 1}
+		tbl := &introspect.Table{Name: "notes", Columns: []*introspect.Column{&col, body}, PrimaryKey: []string{"id"},
+			ColumnMap: map[string]*introspect.Column{"id": &col, "body": body}}
+		oa := &rbac.OpAccess{Columns: []*introspect.Column{body}, ColumnSet: map[string]bool{"body": true}}
+		if tc.writable {
+			oa.Columns = append([]*introspect.Column{&col}, oa.Columns...)
+			oa.ColumnSet["id"] = true
+		}
+		if tc.preset {
+			oa.Presets = []rbac.Preset{{Column: &col, Literal: "x"}}
+		}
+		if err := legacyInsertKeyUnknown(tbl, oa); (err != nil) != tc.unknown {
+			t.Errorf("%s: err = %v, want unknown=%v", tc.name, err, tc.unknown)
+		}
 	}
 }

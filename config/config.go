@@ -266,7 +266,21 @@ type SchemaGen struct {
 	// fields (a description under tables: still wins). Off by default:
 	// comments written for DBAs become visible in every role's schema.
 	DescriptionsFromComments bool `yaml:"descriptions_from_comments"`
+	// MutationResponse is the result type of the bulk mutations
+	// (insert_<t>, update_<t>, delete_<t>): "per_table" (the default) gives
+	// each table its own <t>_mutation_response with affected_rows and
+	// returning, all implementing the mutation_response interface;
+	// "shared" keeps the single mutation_response OBJECT with affected_rows
+	// only (no returning) that earlier versions generated, for clients whose
+	// generated types or caches depend on that typename.
+	MutationResponse string `yaml:"mutation_response"`
 }
+
+// Values accepted by schema_gen.mutation_response.
+const (
+	MutationResponsePerTable = "per_table"
+	MutationResponseShared   = "shared"
+)
 
 // Count scalar names accepted by schema_gen.count_type.
 const (
@@ -552,6 +566,9 @@ func (c *Config) applyDefaults() {
 		// Int keeps existing configs' schemas unchanged; BigInt is opt-in.
 		c.SchemaGen.CountType = CountTypeInt
 	}
+	if c.SchemaGen.MutationResponse == "" {
+		c.SchemaGen.MutationResponse = MutationResponsePerTable
+	}
 }
 
 var validAlgorithms = map[string]bool{
@@ -593,6 +610,9 @@ func (c *Config) validate() error {
 	}
 	if ct := c.SchemaGen.CountType; ct != CountTypeBigInt && ct != CountTypeInt {
 		return fmt.Errorf("schema_gen.count_type %q is not supported (use BigInt or Int)", ct)
+	}
+	if mr := c.SchemaGen.MutationResponse; mr != MutationResponsePerTable && mr != MutationResponseShared {
+		return fmt.Errorf("schema_gen.mutation_response %q is not supported (use per_table or shared)", mr)
 	}
 	if c.JWT.RoleLookup.Enabled() && c.JWT.RoleLookup.CacheSeconds < 0 {
 		return fmt.Errorf("jwt.role_lookup.cache_seconds must be >= 0")

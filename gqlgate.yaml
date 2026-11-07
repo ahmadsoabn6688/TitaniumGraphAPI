@@ -142,7 +142,8 @@ native_queries:
 # type (avatar_url, published_posts): rename it to .go and rebuild. To
 # activate the other sample, rename hooks/signup.go.sample to
 # hooks/signup.go, rebuild, and uncomment the wiring below (the sample
-# registers `validate_post`; its `signup` mutation mounts automatically):
+# registers `validate_post`; its `signup_author` mutation mounts
+# automatically next to the `signup`/`signin` that hooks/auth.go provides):
 # hooks:
 #   tables:
 #     posts:
@@ -241,7 +242,10 @@ roles:
       documents:
         select: true
       post_tags:
-        select: true
+        select:
+          allow: true
+          # tags of drafts would reveal that the draft exists
+          filter: "post_id IN (SELECT id FROM posts WHERE published = 1)"
       post_stats:
         select:
           allow: true

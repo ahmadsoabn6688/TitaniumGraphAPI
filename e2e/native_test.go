@@ -1,6 +1,8 @@
 package e2e
 
 import (
+	"encoding/base64"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -233,16 +235,45 @@ func TestNativeQueryConnection(t *testing.T) {
 
 	// The author's connection pages its own (preset) rows only.
 	grace := env.Token(t, "author", 2)
-	r = env.MustGQL(t, grace, `{ post_stats_connection { nodes { post_id } total_count } }`, nil)
+	r = env.MustGQL(t, grace, `{ post_stats_connection { nodes { post_id } total_count page_info { end_cursor } } }`, nil)
 	if r.Int(t, "post_stats_connection.total_count") != 1 || r.Int(t, "post_stats_connection.nodes.0.post_id") != 3 {
 		t.Errorf("author connection: %s", r.Raw)
 	}
-	// Another user's cursor (other preset values) does not apply.
+	graceCursor := r.String(t, "post_stats_connection.page_info.end_cursor")
+	// The cursor's shape hash leaves the (hidden) preset values out, so it
+	// cannot be brute-forced back into them: ada's and grace's cursors carry
+	// the same shape. Another user's cursor only contributes a key to seek
+	// after; the caller's own presets still decide the rows.
 	ada := env.Token(t, "author", 1)
-	r = env.MustGQL(t, ada, `{ post_stats_connection(first: 1) { page_info { end_cursor } } }`, nil)
+	r = env.MustGQL(t, ada, `{ post_stats_connection(first: 1) { nodes { post_id } page_info { end_cursor } } }`, nil)
 	adaCursor := r.String(t, "post_stats_connection.page_info.end_cursor")
-	env.GQL(t, grace, `query($c: String) { post_stats_connection(after: $c) { nodes { post_id } } }`,
+	if a, g := cursorShapeOf(t, adaCursor), cursorShapeOf(t, graceCursor); a != g {
+		t.Errorf("cursor shapes differ by preset value: %q vs %q", a, g)
+	}
+	r = env.MustGQL(t, grace, `query($c: String) { post_stats_connection(after: $c) { nodes { post_id } } }`,
+		map[string]any{"c": adaCursor})
+	if ids := r.List(t, "post_stats_connection.nodes"); len(ids) != 1 || r.Int(t, "post_stats_connection.nodes.0.post_id") != 3 {
+		t.Errorf("grace with ada's cursor must page her own rows only: %s", r.Raw)
+	}
+	// The client's own filter and arguments stay part of the shape.
+	env.GQL(t, ada, `query($c: String) { post_stats_connection(after: $c, where: {views: {_gt: 0}}) { nodes { post_id } } }`,
 		map[string]any{"c": adaCursor}).MustFail(t, "cursor does not match")
+}
+
+// cursorShapeOf decodes an end_cursor and returns its shape hash.
+func cursorShapeOf(t *testing.T, cursor string) string {
+	t.Helper()
+	raw, err := base64.RawURLEncoding.DecodeString(cursor)
+	if err != nil {
+		t.Fatalf("cursor %q: %v", cursor, err)
+	}
+	var c struct {
+		S string `json:"s"`
+	}
+	if err := json.Unmarshal(raw, &c); err != nil {
+		t.Fatalf("cursor %q: %v", cursor, err)
+	}
+	return c.S
 }
 
 func TestNativeQueryRelationships(t *testing.T) {

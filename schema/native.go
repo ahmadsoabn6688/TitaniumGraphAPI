@@ -640,9 +640,9 @@ func (b *builder) addNativeConnectionField(fields graphql.Fields, ni *nativeInfo
 			if first > b.opt.Config.SchemaGen.MaxPageSize {
 				first = b.opt.Config.SchemaGen.MaxPageSize
 			}
-			// The cursor is bound to the query, its argument values (presets
-			// included) and the filter.
-			shape := nativeCursorShape(nm.name, values, where)
+			// The cursor is bound to the query, the client's argument values
+			// and the filter.
+			shape := nativeCursorShape(nm.name, ni.clientArgs, values, where)
 			var after *condition
 			if a, ok := p.Args["after"].(string); ok && a != "" {
 				keys, err := decodeCursor(a, shape, len(key))
@@ -668,9 +668,9 @@ func (b *builder) addNativeConnectionField(fields graphql.Fields, ni *nativeInfo
 			var endCursor any
 			if len(rows) > 0 {
 				last := rows[len(rows)-1]
-				keys := make([]string, len(key))
+				keys := make([]any, len(key))
 				for i, k := range key {
-					keys[i] = stringifyKey(last[k])
+					keys[i] = cursorKey(last[k])
 				}
 				endCursor = encodeCursor(keys, shape)
 			}
@@ -692,10 +692,19 @@ func (b *builder) addNativeConnectionField(fields graphql.Fields, ni *nativeInfo
 	}
 }
 
-// nativeCursorShape scopes a cursor to one native query, its argument
-// values and its filter.
-func nativeCursorShape(name string, values, where map[string]any) string {
-	return cursorShape("\x00native:"+name, map[string]any{"args": values, "where": where})
+// nativeCursorShape scopes a cursor to one native query, the values of the
+// arguments the client may pass (clientArgs) and its filter. The role's
+// argument presets are left out on purpose: the shape travels to the client
+// inside the cursor as an unkeyed hash, and a literal preset is meant to
+// stay hidden — hashing it would let a client confirm guesses offline.
+// Presets are re-applied on every request anyway, and the seek uses only
+// key values.
+func nativeCursorShape(name string, clientArgs []*nativeArg, values, where map[string]any) string {
+	client := make(map[string]any, len(clientArgs))
+	for _, a := range clientArgs {
+		client[a.name] = values[a.name]
+	}
+	return cursorShape("\x00native:"+name, map[string]any{"args": client, "where": where})
 }
 
 // nativeValues resolves the value of every argument for one request: the

@@ -3,6 +3,7 @@ package e2e
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -468,5 +469,22 @@ func TestDemoConfigModeling(t *testing.T) {
 	r = env.MustGQL(t, env.Token(t, "author", 1), `{ post_stats_connection { nodes { post_id } } }`, nil)
 	if n := len(r.List(t, "post_stats_connection.nodes")); n != 2 {
 		t.Errorf("author 1 sees stats of %d posts, want 2", n)
+	}
+
+	// A tag on a draft (post 2) must not reveal the draft to anonymous —
+	// neither listed nor confirmed by filtering on its post_id.
+	env.Exec(t, "INSERT INTO post_tags (post_id, tag) VALUES (2, 'secret')")
+	const draftTags = `{ post_tags_connection(where: {post_id: {_eq: 2}}) { nodes { tag } } }`
+	if n := len(env.MustGQL(t, "", draftTags, nil).List(t, "post_tags_connection.nodes")); n != 0 {
+		t.Errorf("anonymous sees %d tags of a draft", n)
+	}
+	r = env.MustGQL(t, "", `{ post_tags_connection { nodes { post_id } } }`, nil)
+	for i := range r.List(t, "post_tags_connection.nodes") {
+		if r.Int(t, "post_tags_connection.nodes."+strconv.Itoa(i)+".post_id") == 2 {
+			t.Errorf("anonymous post_tags lists the draft: %s", r.Raw)
+		}
+	}
+	if n := len(env.MustGQL(t, env.Token(t, "admin", 4), draftTags, nil).List(t, "post_tags_connection.nodes")); n != 1 {
+		t.Errorf("admin sees %d tags of the draft, want 1", n)
 	}
 }

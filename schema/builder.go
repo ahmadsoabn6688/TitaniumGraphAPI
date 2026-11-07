@@ -478,6 +478,10 @@ type builder struct {
 	// keeps working); mutRespTypes caches those types per table.
 	mutRespIface *graphql.Interface
 	mutRespTypes map[string]*graphql.Object
+	// mutRespShared is the single mutation_response OBJECT every bulk
+	// mutation returns under schema_gen.mutation_response: shared (nil
+	// otherwise; mutRespIface is then nil).
+	mutRespShared *graphql.Object
 	// optionalFields are generated root fields a custom field of the same
 	// name may replace ("query:<name>" / "mutation:<name>"): the unique-key
 	// fields, which are newer than any custom field that might use the name.
@@ -552,15 +556,29 @@ func buildRoleBuilder(opt Options, shared *buildShared, roleName string, access 
 			"desc": &graphql.EnumValueConfig{Value: "DESC"},
 		},
 	})
-	b.mutRespIface = graphql.NewInterface(graphql.InterfaceConfig{
-		Name:        "mutation_response",
-		Description: "The result of a bulk insert/update/delete; implemented by each <table>_mutation_response.",
-		Fields: graphql.Fields{
-			"affected_rows": &graphql.Field{Type: graphql.NewNonNull(b.countScalar())},
-		},
-		// No field returns the interface itself; resolution is never needed.
-		ResolveType: func(graphql.ResolveTypeParams) *graphql.Object { return nil },
-	})
+	if opt.Config.SchemaGen.MutationResponse == config.MutationResponseShared {
+		b.mutRespShared = graphql.NewObject(graphql.ObjectConfig{
+			Name:        "mutation_response",
+			Description: "The result of a bulk insert/update/delete.",
+			Fields: graphql.Fields{
+				"affected_rows": &graphql.Field{
+					Type:        graphql.NewNonNull(b.countScalar()),
+					Description: "Number of rows the mutation wrote.",
+					Resolve:     func(p graphql.ResolveParams) (any, error) { return sourceKey(p, "affected_rows"), nil },
+				},
+			},
+		})
+	} else {
+		b.mutRespIface = graphql.NewInterface(graphql.InterfaceConfig{
+			Name:        "mutation_response",
+			Description: "The result of a bulk insert/update/delete; implemented by each <table>_mutation_response.",
+			Fields: graphql.Fields{
+				"affected_rows": &graphql.Field{Type: graphql.NewNonNull(b.countScalar())},
+			},
+			// No field returns the interface itself; resolution is never needed.
+			ResolveType: func(graphql.ResolveTypeParams) *graphql.Object { return nil },
+		})
+	}
 
 	// Pass 1: per-role table views for every table the role can touch at all.
 	for _, tn := range opt.Catalog.TableOrder {
@@ -1246,6 +1264,9 @@ func (b *builder) validateWriteChecks(ti *tableInfo) error {
 			}
 			continue
 		}
+		if err == nil {
+			err = legacyInsertKeyUnknown(ti.table, w.oa)
+		}
 		if err != nil {
 			if b.opt.Logger != nil {
 				b.opt.Logger.Warn("insert.filter cannot be enforced on this table and is ignored, as before; replace it with a check that fits the table",
@@ -1268,6 +1289,36 @@ func (b *builder) validateWriteChecks(ti *tableInfo) error {
 
 // verifyWriteCheck checks that one write check can be enforced on its table:
 // the table has a primary key and (with a database) the check runs.
+// legacyInsertKeyUnknown reports why a legacy insert.filter (enforced as the
+// insert check) could block inserts that worked before it was enforced: the
+// check finds each inserted row again by its primary key, so that key must
+// always be known after the INSERT. It is when every key column is
+// AUTO_INCREMENT / AUTO_RANDOM (LAST_INSERT_ID), preset, or writable by the
+// role with no column default (so every insert must supply it). A key column
+// a default or generation fills, or that the role cannot write, may be
+// unknown — and the check would then refuse the insert outright.
+func legacyInsertKeyUnknown(t *introspect.Table, oa *rbac.OpAccess) error {
+	preset := map[string]bool{}
+	for _, p := range oa.Presets {
+		preset[p.Column.Name] = true
+	}
+	for _, name := range t.PrimaryKey {
+		c := t.ColumnMap[name]
+		switch {
+		case c == nil:
+			return fmt.Errorf("primary key column %q is unknown", name)
+		case c.AutoIncrement || c.AutoRandom || preset[name]:
+		case c.Generated:
+			return fmt.Errorf("primary key column %q is generated", name)
+		case !oa.ColumnSet[name]:
+			return fmt.Errorf("primary key column %q is not writable by the role, so an inserted row's key may be unknown", name)
+		case c.HasDefault:
+			return fmt.Errorf("primary key column %q is filled by a column default, so an inserted row's key may be unknown", name)
+		}
+	}
+	return nil
+}
+
 func (b *builder) verifyWriteCheck(ti *tableInfo, op string, check *rbac.Filter) error {
 	if len(ti.table.PrimaryKey) == 0 {
 		return fmt.Errorf("table %q: the %s check needs a primary key to find the written rows", ti.table.Name, op)
@@ -1454,9 +1505,9 @@ func (b *builder) addConnectionField(fields graphql.Fields, ti *tableInfo) {
 			var endCursor any
 			if len(rows) > 0 {
 				last := rows[len(rows)-1]
-				keys := make([]string, len(ti.model.readKey))
+				keys := make([]any, len(ti.model.readKey))
 				for i, pk := range ti.model.readKey {
-					keys[i] = stringifyKey(last[pk])
+					keys[i] = cursorKey(last[pk])
 				}
 				endCursor = encodeCursor(keys, shape)
 			}
@@ -1582,15 +1633,19 @@ func (b *builder) setInput(ti *tableInfo) *graphql.InputObject {
 
 // returningAvailable reports whether this role's mutation responses for the
 // table carry `returning`: the role must read the table, and the rows are
-// found again by primary key (it need not be readable).
+// found again by primary key (it need not be readable). Never under
+// schema_gen.mutation_response: shared.
 func (b *builder) returningAvailable(ti *tableInfo) bool {
-	return ti.access.Select != nil && len(ti.table.PrimaryKey) > 0
+	return b.mutRespShared == nil && ti.access.Select != nil && len(ti.table.PrimaryKey) > 0
 }
 
 // mutationResponse returns the table's <t>_mutation_response type: the
 // affected_rows count plus, when available, `returning` — the written rows as
 // the role may read them, with every relationship of the row type.
 func (b *builder) mutationResponse(ti *tableInfo) *graphql.Object {
+	if b.mutRespShared != nil {
+		return b.mutRespShared
+	}
 	tn := ti.table.Name
 	if o := b.mutRespTypes[tn]; o != nil {
 		return o

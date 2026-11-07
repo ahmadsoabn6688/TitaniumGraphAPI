@@ -344,8 +344,10 @@ var opDescriptions = map[string]string{
 type relInfo struct {
 	name string
 	// key identifies the relationship for request-scoped loaders: the FK's
-	// constraint name, or "\x00cfg:<table>.<name>" for a declared one (a
-	// constraint name cannot contain NUL, so the two never collide).
+	// table and constraint name (fkKey: a constraint name is unique per
+	// table only, so two tables may each have an fk_x pointing at different
+	// tables), or "\x00cfg:<table>.<name>" for a declared one (a table name
+	// is never empty, so the two never collide).
 	key string
 	// aggKey identifies its <rel>_aggregate loader.
 	aggKey     string
@@ -371,6 +373,9 @@ type relInfo struct {
 // config gives that another relationship of the role already has is an error
 // (recorded in ti.relErr).
 func (b *builder) relations(ti *tableInfo) []*relInfo {
+	// fkKey identifies a foreign key across the schema: its table plus its
+	// constraint name.
+	fkKey := func(fk *introspect.ForeignKey) string { return fk.Table + "\x00" + fk.ConstraintName }
 	if ti.relsDone {
 		return ti.rels
 	}
@@ -404,7 +409,7 @@ func (b *builder) relations(ti *tableInfo) []*relInfo {
 		}
 		name := relFieldName(taken, candidate, fk.Columns)
 		taken[name] = true
-		ti.rels = append(ti.rels, &relInfo{name: name, key: fk.ConstraintName, aggKey: fk.Table + "." + fk.ConstraintName,
+		ti.rels = append(ti.rels, &relInfo{name: name, key: fkKey(fk), aggKey: fkKey(fk),
 			fk: fk, outgoing: true, target: target, localCols: fk.Columns, targetCols: fk.RefColumns,
 			description: fmt.Sprintf("Row of %s referenced by %s", fk.RefTable, strings.Join(fk.Columns, ", "))})
 		nameCols = append(nameCols, fk.Columns)
@@ -417,7 +422,7 @@ func (b *builder) relations(ti *tableInfo) []*relInfo {
 		}
 		name := relFieldName(taken, graphqlName(fk.Table), fk.Columns)
 		taken[name] = true
-		ti.rels = append(ti.rels, &relInfo{name: name, key: fk.ConstraintName, aggKey: fk.Table + "." + fk.ConstraintName,
+		ti.rels = append(ti.rels, &relInfo{name: name, key: fkKey(fk), aggKey: fkKey(fk),
 			fk: fk, outgoing: false, target: child, localCols: fk.RefColumns, targetCols: fk.Columns,
 			description: fmt.Sprintf("Rows of %s whose %s reference this row", fk.Table, strings.Join(fk.Columns, ", "))})
 		nameCols = append(nameCols, fk.Columns)

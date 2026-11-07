@@ -31,8 +31,9 @@ CLI can mint dev tokens (`-print-token`).
 - **One GraphQL schema per role.** Introspection (and GraphiQL autocompletion)
   only shows the tables/columns that role can access — hidden columns aren't
   "denied", they simply don't exist in that role's schema.
-- **Hasura-style query surface** per table: `posts(where, order_by, limit,
-  offset)`, `posts_by_pk(id)`, `posts_count(where)`, and mutations
+- **Hasura-style query surface** per table: `posts_connection(first, after,
+  where)` (keyset cursor pages), `posts_by_pk(id)`, `posts_aggregate(where)`,
+  and mutations
   `insert_posts`, `insert_posts_one`, `update_posts(_by_pk)`,
   `delete_posts(_by_pk)` — each generated only if the role is allowed.
   Bulk mutations return `affected_rows` plus **`returning { … }`** (with
@@ -247,6 +248,7 @@ schema_gen:
       sql: "YEAR({column}) = {value}"
   count_type: BigInt       # scalar of count/total_count/affected_rows: Int (default) or BigInt (64-bit)
   descriptions_from_comments: false  # true: TiDB table/column COMMENTs become GraphQL descriptions
+  mutation_response: per_table  # per_table (default): <t>_mutation_response with returning; shared: the old single type
 
 tables:                    # optional per-table modeling (see "Modeling: views, keys, relationships, names")
   post_stats:              # a view, or a table without a primary key
@@ -818,7 +820,8 @@ roles:
     post_id title commentCount author { name } comments(limit: 3) { body } comments_aggregate { count } } }
 
 # author: `author` is preset from the token, so args holds min_views only (and is optional)
-{ author_post_stats_connection(first: 10, after: $cursor) {
+query ($cursor: String) {
+  author_post_stats_connection(first: 10, after: $cursor) {
     nodes { post_id title } page_info { has_next_page end_cursor } total_count } }
 ```
 
@@ -838,9 +841,12 @@ WHERE <where> AND (<role filter>) [AND `post_id` > ? ORDER BY `post_id`] LIMIT ?
 - `<name>_connection(args, where, first, after): <T>_connection!` — only
   with `key:`, and only for roles that can read every key column: keyset
   pages in key order, `page_info`, and `total_count` (a `COUNT` only when
-  selected). The cursor is bound to the query, its argument values (presets
-  included, so one user's cursor never applies to another's rows) and the
-  filter. `root_fields.connection` renames it.
+  selected). The cursor is bound to the query, the argument values the
+  client passed and the filter. Argument presets are deliberately left out
+  of it — a cursor is readable by the client, and a hashed literal preset
+  could be guessed offline — so a cursor handed to another user only gives
+  them a key to seek after: their own presets and row filter still decide
+  every row they get. `root_fields.connection` renames it.
 - Types: `<T>`, `<T>_bool_exp`, `<T>_arguments`, `<T>_connection`, where
   `<T>` is `type_name` or the query name. Like every generated name they are
   checked for collisions at startup: a native root field or type that any
@@ -1164,8 +1170,13 @@ connections. Afterwards:
   re-verifies the token and re-resolves the role — a role lookup that now
   fails, names an unconfigured role or **a different role** than the socket
   started with, or a token the current config rejects closes it with
-  **4403**. A transient database error during that re-check also closes the
-  socket (fail closed); clients reconnect.
+  **4403**. The re-check's lookups take a `max_concurrent_polls` slot like a
+  poll, so a reload that makes every socket re-authenticate cannot flood
+  the database pool. A re-check that merely times out (no slot, or a slow
+  lookup, within 10 s) is retried on the next poll, and nothing runs for the
+  socket until it succeeds; if it keeps timing out for a minute past its due
+  time, or fails in any other way (a database error included), the socket
+  is closed with 4403 (fail closed) and clients reconnect.
 
 The browser `Origin` of the upgrade must be the gateway's own (same host),
 or — when CORS is enabled — one of `server.cors.allowed_origins` compared as
@@ -1207,15 +1218,22 @@ authenticated ones:
   claim; a caller without one — the anonymous role — counts per role and
   client address. Behind a reverse proxy every anonymous client has the
   proxy's address and so shares one budget: raise these (or set `-1`) there;
-- `max_subscriptions_per_connection` (further operations get an `error`
-  message);
+- `max_subscriptions_per_connection` — operations running on one socket
+  (further operations get an `error` message). An operation the client
+  completed counts until it has actually stopped (normally at once; longer
+  while it waits for a re-check or finishes an execution), so a
+  subscribe/complete loop cannot pile up work on one socket;
 - `max_concurrent_polls` — executions running at once across the gateway
-  (each poll of a subscription, each query or mutation sent over a socket;
-  a query counts as `max_parallel_root_fields`). A poll waits for a free
-  slot, so with many subscribers the effective interval stretches instead
-  of the polls taking every pooled connection from HTTP requests. The
-  default is half of `database.max_open_conns`; above 1 it must be less
-  than `max_open_conns`;
+  (each poll of a subscription, each query or mutation sent over a socket,
+  and each re-check's role lookup; a query takes one slot per root field,
+  up to `max_parallel_root_fields`). Slots are granted strictly in arrival
+  order, so a multi-field query cannot be starved by a stream of polls. A
+  poll waits for its slot, so with many subscribers the effective interval
+  stretches instead of the polls taking every pooled connection from HTTP
+  requests; a wait longer than `database.query_timeout_seconds` skips that
+  poll (a query or mutation instead ends with a "server busy" `error`
+  message). The default is half of `database.max_open_conns`; above 1 it
+  must be less than `max_open_conns`;
 - `connection_init_timeout_seconds`, WebSocket pings every
   `keepalive_seconds` with `ping_timeout_seconds` to answer, and the 1 MiB
   message limit of HTTP requests.
@@ -1225,7 +1243,12 @@ authenticated ones:
 `server.subscriptions.enabled: false` closes every open socket (1001, idle
 ones included, within about a second) and the endpoint. `Gate.Close` and the
 built-in server's shutdown close every socket with 1001 and wait for the
-polls to stop; an embedding host serving `gate.Handler()` itself calls
+polls to stop. A client that does not answer the close handshake within the
+shutdown deadline (5 s for `Gate.Close`) has its socket cut and its
+operations cancelled, and shutdown waits (up to 3 s more) for them to stop
+before the database pool is closed. Once the server has processed a
+client's `complete`, nothing more is sent under that id, even when the id
+is reused at once. An embedding host serving `gate.Handler()` itself calls
 `gate.Close()` on shutdown (`http.Server.Shutdown` does not track
 WebSockets).
 
@@ -1324,9 +1347,9 @@ pk LIMIT n`) is a **range scan with no sort** and **constant cost per page** no
 matter how deep you've paged — the opposite of `OFFSET`, which re-scans and
 discards every skipped row and collapses on billions of rows. So the connection
 always orders by the PK (there is deliberately no offset list field and no
-arbitrary `order_by`). The cursor is opaque, encodes the last row's PK, and is
-bound to the query's `where`, so it can't be replayed against a different
-filter. `first` is clamped to `schema_gen.max_page_size`. `total_count` is a
+arbitrary `order_by`). The cursor is opaque, encodes the last row's PK
+exactly (`BINARY`/`VARBINARY` key bytes included), and is bound to the
+query's `where`, so it can't be replayed against a different filter. `first` is clamped to `schema_gen.max_page_size`. `total_count` is a
 separate field whose `COUNT` runs only when selected (skip it for the fastest
 paging on huge tables). Connections are generated for tables whose primary key
 (or declared `primary_key`, for views and keyless tables) the role can read;
@@ -1652,6 +1675,32 @@ an update or delete stays a single statement):
 - **delete** locks the keys matching `<where> AND <delete filter>`, reads those
   rows, then deletes them. Which rows are deleted depends only on the DELETE
   permission.
+- Every mutation runs in a **`READ COMMITTED`** transaction, so each of these
+  reads (and the write check below) sees the rows as they are once locked —
+  including a change another transaction committed while this one waited
+  for the lock — never an older snapshot. (Under TiDB's default `REPEATABLE
+  READ` only the locking statements would; with
+  `tidb_txn_mode = optimistic` such a concurrent change makes the commit
+  fail instead.)
+- `returning` is read before the after-hooks run, so it shows the rows as
+  the mutation wrote them; changes an after-hook makes through `ev.Tx` are
+  not reflected in it.
+
+**Upgrade note (client-visible schema change).** Earlier versions returned
+one `mutation_response` **object** (`affected_rows` only) from every bulk
+mutation. Now each table has its own `<t>_mutation_response` object and
+`mutation_response` is an **interface** they implement. Selections such as
+`{ affected_rows }` and `... on mutation_response { affected_rows }` keep
+working, but `__typename` becomes e.g. `"posts_mutation_response"`, so:
+regenerate typed clients (graphql-codegen, Apollo iOS/Kotlin), add the
+interface to Apollo Client's `possibleTypes` / urql Graphcache's schema
+(fragments on an interface need it), and update code that branches on
+`__typename`. To keep the old shape instead — no `returning` — set
+
+```yaml
+schema_gen:
+  mutation_response: shared
+```
 
 `returning` shows rows through the role's **select** permission — its columns
 and row filter — so a row written (or deleted) that the role cannot read
@@ -1703,7 +1752,10 @@ mutation { update_posts_by_pk(id: 7, _set: {org_id: 999}) { id } }
   `SELECT COUNT(*), SUM((<check>) IS NOT TRUE) … WHERE <written keys>`, and
   any failing row — including one where the check comes out `NULL` — rolls
   the **whole** mutation back (all objects of a bulk insert, all rows of a
-  bulk update). After-hooks never see rows that are about to be rolled back.
+  bulk update). The check and the `returning` read (with its
+  `max_response_rows` accounting) both happen before the after-hooks, so a
+  failure in either rolls back before any after-hook ran; only a failing
+  commit itself can still follow an after-hook.
 - It **fails closed**: every written row must be found again by its key
   (in its stored form, see `returning` above), or the mutation is rolled
   back with `permission_error` ("could not be found again by their key").
@@ -1730,9 +1782,19 @@ mutation { update_posts_by_pk(id: 7, _set: {org_id: 999}) { id } }
   enforced on a table — the table has no primary key, or the dry run fails
   there (e.g. a `"*"` rule naming a column that table lacks) — is skipped for
   that table with a startup warning, i.e. ignored there as before. An
-  explicit `check` in the same situation still fails the boot. A legacy
-  filter that is enforced follows the rules above, so an insert into such a
-  table must supply keys a column default would otherwise generate.
+  explicit `check` in the same situation still fails the boot. The same
+  applies when an inserted row's key may not be known after the `INSERT` —
+  a key column filled by a column default (e.g. `DEFAULT (UUID())`) or
+  generated, or one the role cannot write (not in its insert `columns`,
+  not preset) — because enforcing the filter there would refuse every such
+  insert; only `AUTO_INCREMENT`/`AUTO_RANDOM`, preset, or always-supplied
+  keys keep it enforced.
+
+  **Upgrade note:** where a legacy `insert.filter` *is* enforced, an insert
+  that does not satisfy it — accepted by earlier versions — now fails with
+  `permission_error`. Check the startup warnings ("insert.filter is enforced
+  as the insert check") and either rename the key to `check` (to keep the
+  enforcement) or remove it (to keep the old, unfiltered behaviour).
 
 ### Lookups by unique key
 
@@ -1858,8 +1920,10 @@ Then reference hook names from `gqlgate.yaml` (`hooks.tables.posts.before_insert
 [validate_post]`); custom fields mount automatically. The build runs `go mod
 tidy`, so new imports resolve with no manual dependency management. A complete,
 runnable template is [`hooks/signup.go.sample`](hooks/signup.go.sample) — rename
-it to `hooks/signup.go` and rebuild to activate a real bcrypt-hashing `signup`
-mutation.
+it to `hooks/signup.go` and rebuild to activate a real bcrypt-hashing
+`signup_author` mutation (the demo's `signup`/`signin` already come from
+`hooks/auth.go`; custom field names must be unique per role, and two fields
+with the same name fail startup).
 
 What hook files can do:
 
@@ -1867,8 +1931,12 @@ What hook files can do:
   CRUD (`before_insert`, `after_update`, …, wired per table in YAML). They run
   **inside the mutation's transaction**: return an error to roll the write
   back; use `ev.Tx` to read/write atomically with it (e.g. audit rows).
-  `ev` carries `Op/Table/Role/Claims/Values/Affected`. After-hooks run once
-  the role's write `check` has passed, so they never see rolled-back rows.
+  `ev` carries `Op/Table/Role/Claims/Values/Affected`. After-hooks run last —
+  once the role's write `check` has passed and `returning` has been read —
+  so the only thing that can still roll the write back after them is a
+  failing commit (or another after-hook's error). Side effects outside
+  `ev.Tx` (emails, webhooks) are best sent after the commit, e.g. from a
+  queue the hook writes to through `ev.Tx`.
 - **`register.CustomField(def)`** — extra root queries/mutations with full
   graphql-go control over args/types/resolver, mounted only for the roles in
   `AllowedRoles` (empty = all). Inside a resolver,
