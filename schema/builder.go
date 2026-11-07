@@ -177,8 +177,10 @@ func reservedNames(cat *introspect.Catalog) (map[string]string, error) {
 		typeOf := []string{
 			n, n + "_bool_exp", n + "_order_by", n + "_insert_input", n + "_set_input",
 			n + "_connection", n + "_aggregate_result",
-			n + "_sum_fields", n + "_avg_fields", n + "_min_fields", n + "_max_fields",
 			n + "_neighbor",
+		}
+		for _, suffix := range aggTypeSuffixes() {
+			typeOf = append(typeOf, n+suffix)
 		}
 		// A nearest-neighbor query field per vector column.
 		for _, c := range cat.Tables[tn].Columns {
@@ -246,6 +248,7 @@ type builder struct {
 	tinfos     map[string]*tableInfo
 	objTypes   map[string]*graphql.Object
 	connTypes  map[string]*graphql.Object
+	aggTypes   map[string]*graphql.Object // <t>_aggregate_result per select-able table
 	boolExps   map[string]*graphql.InputObject
 	orderBys   map[string]*graphql.InputObject
 	cmpExps    map[string]*graphql.InputObject
@@ -272,6 +275,7 @@ func buildRoleBuilder(opt Options, shared *buildShared, roleName string, access 
 		tinfos:    map[string]*tableInfo{},
 		objTypes:  map[string]*graphql.Object{},
 		connTypes: map[string]*graphql.Object{},
+		aggTypes:  map[string]*graphql.Object{},
 		boolExps:  map[string]*graphql.InputObject{},
 		orderBys:  map[string]*graphql.InputObject{},
 		cmpExps:   map[string]*graphql.InputObject{},
@@ -308,7 +312,7 @@ func buildRoleBuilder(opt Options, shared *buildShared, roleName string, access 
 		Name: "mutation_response",
 		Fields: graphql.Fields{
 			"affected_rows": &graphql.Field{
-				Type: graphql.NewNonNull(graphql.Int),
+				Type: graphql.NewNonNull(b.countScalar()),
 				Resolve: func(p graphql.ResolveParams) (any, error) {
 					m, _ := p.Source.(map[string]any)
 					return m["affected_rows"], nil
@@ -380,6 +384,7 @@ func buildRoleBuilder(opt Options, shared *buildShared, roleName string, access 
 		}
 		b.boolExps[tn] = be
 		b.orderBys[tn] = b.buildOrderBy(ti)
+		b.aggTypes[tn] = b.buildAggregateType(ti)
 	}
 
 	// Connection types (cursor pagination) for tables with a readable PK — the
@@ -525,6 +530,7 @@ func (b *builder) addRelationFields(ti *tableInfo, fields graphql.Fields) {
 			b.addObjectRelField(fields, rel)
 		} else {
 			b.addArrayRelField(fields, rel)
+			b.addArrayRelAggField(fields, rel)
 		}
 	}
 }
@@ -885,9 +891,8 @@ func (b *builder) addConnectionField(fields graphql.Fields, ti *tableInfo) {
 
 			// total_count is resolved lazily: this closure only runs the COUNT
 			// if the client selected the total_count field.
-			countFn := func() (int, error) {
-				n, err := b.runCount(p.Context, ti, id, where)
-				return int(n), err
+			countFn := func() (int64, error) {
+				return b.runCount(p.Context, ti, id, where)
 			}
 			return map[string]any{
 				"nodes": rows,
@@ -921,12 +926,12 @@ func (b *builder) buildConnectionType(ti *tableInfo) *graphql.Object {
 					Resolve:     func(p graphql.ResolveParams) (any, error) { return sourceKey(p, "page_info"), nil },
 				},
 				"total_count": &graphql.Field{
-					Type:        graphql.NewNonNull(graphql.Int),
+					Type:        graphql.NewNonNull(b.countScalar()),
 					Description: "Total rows matching the filter across all pages. Runs a COUNT only when selected — can be slow on very large tables.",
 					Resolve: func(p graphql.ResolveParams) (any, error) {
-						fn, ok := sourceKey(p, "count").(func() (int, error))
+						fn, ok := sourceKey(p, "count").(func() (int64, error))
 						if !ok {
-							return 0, nil
+							return int64(0), nil
 						}
 						return fn()
 					},
@@ -1014,7 +1019,7 @@ func (b *builder) addMutationFields(fields graphql.Fields, ti *tableInfo) {
 					if err != nil {
 						return nil, err
 					}
-					return map[string]any{"affected_rows": int(affected)}, nil
+					return map[string]any{"affected_rows": affected}, nil
 				},
 			}
 
@@ -1079,7 +1084,7 @@ func (b *builder) addMutationFields(fields graphql.Fields, ti *tableInfo) {
 					if err != nil {
 						return nil, err
 					}
-					return map[string]any{"affected_rows": int(n)}, nil
+					return map[string]any{"affected_rows": n}, nil
 				},
 			}
 
@@ -1142,7 +1147,7 @@ func (b *builder) addMutationFields(fields graphql.Fields, ti *tableInfo) {
 				if err != nil {
 					return nil, err
 				}
-				return map[string]any{"affected_rows": int(n)}, nil
+				return map[string]any{"affected_rows": n}, nil
 			},
 		}
 

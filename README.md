@@ -38,6 +38,11 @@ CLI can mint dev tokens (`-print-token`).
 - **Relationships from foreign keys.** `posts { author { name } }` and
   `users { posts(where: …) { … } }` are generated from FK metadata, and the
   target table's RBAC (column set + row filter) applies to nested data too.
+- **Aggregates, nested too.** `posts_aggregate(where)` computes count, sum,
+  avg, min/max, per-column and distinct counts (exact or TiDB's approximate
+  HyperLogLog) and standard deviation/variance in one query, and every array
+  relationship gets `<rel>_aggregate` (`users { posts_aggregate { count } }`),
+  batched into one `GROUP BY` per page of parents. Counts are 64-bit.
 - **Filter through relationships.** `where: {author: {name: {_eq: "Ada"}},
   comments: {}}` compiles to correlated `EXISTS` subqueries that apply the
   related table's row filter for the role — in connections, aggregates,
@@ -178,6 +183,7 @@ schema_gen:
       argument: Int        # GraphQL scalar of the argument
       applies_to: [Date, DateTime]   # column scalars that get it (default: [argument])
       sql: "YEAR({column}) = {value}"
+  count_type: BigInt       # scalar of count/total_count/affected_rows: BigInt (default, 64-bit) or Int
 
 roles:
   <role-name>:
@@ -270,10 +276,12 @@ In both modes:
 ```graphql
 # queries (collection reads are cursor-only)
 posts_connection(first: Int, after: String, where: posts_bool_exp): posts_connection!
-  # posts_connection { nodes: [posts!]!  page_info { has_next_page end_cursor }  total_count: Int! }
+  # posts_connection { nodes: [posts!]!  page_info { has_next_page end_cursor }  total_count: BigInt! }
 posts_by_pk(id: BigInt!): posts
 posts_aggregate(where: posts_bool_exp): posts_aggregate_result!
-  # { count: Int!  sum {..}  avg {..}  min {..}  max {..} }
+  # { count: BigInt!  sum {..}  avg {..}  min {..}  max {..}  count_columns {..}
+  #   count_distinct {..}  approx_count_distinct {..}  stddev {..}  stddev_pop {..}
+  #   stddev_samp {..}  variance {..}  var_pop {..}  var_samp {..} }
 posts_nearest_by_<vectorcol>(to: Vector!, metric: vector_metric, first: Int, where: posts_bool_exp): [posts_neighbor!]!
   # posts_neighbor { node: posts!  distance: Float! }   (only for VECTOR columns)
 
@@ -284,6 +292,11 @@ update_posts(where: posts_bool_exp!, _set: posts_set_input!): mutation_response!
 update_posts_by_pk(id: BigInt!, _set: posts_set_input!): posts
 delete_posts(where: posts_bool_exp!): mutation_response!
 delete_posts_by_pk(id: BigInt!): posts
+  # mutation_response { affected_rows: BigInt! }
+
+# on each row type, per array relationship (here users <- posts.author_id)
+users { posts(where, order_by, limit, offset): [posts!]!
+        posts_aggregate(where: posts_bool_exp): posts_aggregate_result! }
 ```
 
 `where` supports `_and/_or/_not`, per-column `_eq _neq _gt _gte _lt _lte
@@ -353,7 +366,9 @@ Batching is per-request, multi-round (so recursive/self-referential
 relationships like category trees or org charts resolve correctly at every
 depth), and applies whenever the join columns are readable by the role;
 otherwise it falls back to a per-row query (never a correctness or RBAC
-compromise).
+compromise). Nested aggregates (`users { posts_aggregate { count } }`) always
+batch into one `GROUP BY` query per wave of parents: the child's FK columns
+are only used as the grouping key there, never returned.
 
 ## Hot config reload (dev)
 
@@ -435,18 +450,96 @@ the role can read.
 
 ### Aggregates
 
-`<table>_aggregate(where)` computes count/sum/avg/min/max in one query, and
-only the aggregates you actually select are computed:
+`<table>_aggregate(where)` computes everything you select in **one** query,
+and only the aggregates you actually select are computed (`{ count }` never
+runs a `SUM`):
 
 ```graphql
 query { posts_aggregate(where: {published: {_eq: true}}) {
-  count
+  count                                   # COUNT(*)
   avg { views }  sum { views }  min { views }  max { published_on }
+  count_columns { rating }                # COUNT(rating): non-null values
+  count_distinct { author_id }            # COUNT(DISTINCT author_id)
+  approx_count_distinct { author_id }     # APPROX_COUNT_DISTINCT(author_id)
+  stddev { views }  variance { views }    # sample statistics
+  stddev_pop { views }  var_pop { views }  stddev_samp { views }  var_samp { views }
 } }
 ```
 
-`sum`/`avg` cover numeric columns; `min`/`max` cover every readable column.
-The role's row filter is always applied.
+The shape is function-first like the original `sum`/`avg`/`min`/`max`: each
+function is an object with one field per column it applies to.
+
+| Field | SQL | Columns | Result |
+|---|---|---|---|
+| `count` | `COUNT(*)` | — | `BigInt!` (see `count_type`) |
+| `sum` | `SUM(c)` | numeric | `Decimal` (exact string) |
+| `avg` | `AVG(c)` | numeric | `Float` |
+| `min` / `max` | `MIN(c)` / `MAX(c)` | every readable column | the column's scalar |
+| `count_columns` | `COUNT(c)` | every readable column | `BigInt!` |
+| `count_distinct` | `COUNT(DISTINCT c)` | readable, except JSON, VECTOR, BLOB/TEXT | `BigInt!` |
+| `approx_count_distinct` | `APPROX_COUNT_DISTINCT(c)` | same as `count_distinct` | `BigInt!` |
+| `stddev` / `stddev_samp` | `STDDEV_SAMP(c)` | numeric, except BIT | `Float` |
+| `stddev_pop` | `STDDEV_POP(c)` | numeric, except BIT | `Float` |
+| `variance` / `var_samp` | `VAR_SAMP(c)` | numeric, except BIT | `Float` |
+| `var_pop` | `VAR_POP(c)` | numeric, except BIT | `Float` |
+
+Notes:
+
+- **`stddev` and `variance` are the sample statistics** (as in Hasura and
+  PostgreSQL), unlike TiDB/MySQL's own `STDDEV()`/`VARIANCE()`, which are
+  the population ones. Pick `stddev_pop`/`var_pop` explicitly for those. A
+  sample statistic over a single row is `null`.
+- Over zero matching rows the counts are `0` and every other function `null`.
+- **`count_distinct` is exact but expensive** on very large tables (several
+  distinct aggregates in one query may not push down to TiKV/TiFlash);
+  `approx_count_distinct` uses TiDB's HyperLogLog and stays cheap. Distinct
+  counts are not offered on JSON, VECTOR or BLOB/TEXT columns.
+- **64-bit counts.** `count`, the connection's `total_count` and mutations'
+  `affected_rows` are `BigInt!`, so counts past 2,147,483,647 (GraphQL `Int`'s
+  limit) work. `BigInt` is a JSON number on the wire, so responses look exactly
+  as before; only the declared type changed from `Int!`. Clients generated
+  against the old schema that need `Int!` can set `schema_gen.count_type: Int`
+  (such a count above 2^31-1 then fails the field). The per-column counts are
+  always `BigInt!`. `sum` stays an exact `Decimal` string, so integer sums
+  can't overflow or lose precision either (even past the 64-bit range).
+  `avg` and the statistics are `Float` (a double); for an exact average of
+  DECIMAL money columns divide `sum` by `count` client-side.
+- Deliberately not offered: percentiles, `BIT_AND/OR/XOR`, and
+  `GROUP_CONCAT`/`JSON_ARRAYAGG` (silently truncated or unbounded output over
+  large tables).
+- Functions follow the role's **column permissions** (only readable columns
+  appear, and a function with no applicable column is left out) and the
+  role's **row filter** is always applied. There is no `GROUP BY` beyond the
+  relationship form below.
+
+#### Nested aggregates (array relationships)
+
+Every array relationship `<rel>` on a row type gets a sibling
+`<rel>_aggregate(where)` with the child table's full aggregate result:
+
+```graphql
+query { users_connection { nodes {
+  name
+  posts_aggregate { count  sum { views }  max { published_on } }
+  published: posts_aggregate(where: {published: {_eq: true}}) { count }
+  commented: posts_aggregate(where: {comments: {user_id: {_eq: 2}}}) { count }
+} } }
+```
+
+- One query per batch of parents, never one per parent: `SELECT author_id,
+  COUNT(*), SUM(views) … FROM posts WHERE author_id IN (…) AND <where> AND
+  <role filter> GROUP BY author_id` (composite foreign keys use
+  `(a, b) IN ((?, ?), …)`). Parents without matching rows get `count: 0` and
+  `null` sums.
+- The **child table's** row filter and column permissions apply, exactly as
+  for `<child>_aggregate`; `where` is the child's `bool_exp`, including its
+  filter surface and relationship filters.
+- `where` is the only argument: no `limit`/`offset`/`order_by` (an aggregate
+  is over all matching children).
+- It exists whenever the array relationship does (the role can select the
+  child table and read the parent's referenced columns). Object
+  relationships have no aggregate. The name is `<rel>_aggregate`, or gets a
+  `_by_<fk columns>` suffix if a column or relationship already uses it.
 
 ### Filter operators
 
@@ -743,8 +836,10 @@ private database directly to verify what actually happened.
   TiDB, arbitrary sorts aren't). Sort application-side, or add a covering index
   and query by it via `where`.
 - Connections require a table with a role-readable primary key.
-- No `GROUP BY`/grouped aggregates yet (aggregates are whole-filter), no
-  subscriptions, no views (base tables only).
+- No arbitrary `GROUP BY`/grouped aggregates yet (aggregates are whole-filter,
+  or per parent row via `<rel>_aggregate`), no aggregate predicates in
+  `where` (e.g. "authors with more than 5 posts"), no subscriptions, no views
+  (base tables only).
 - TiDB has no spatial/GIS types; use lat/lng columns + bounding-box filters, or
   `VECTOR` columns for similarity search.
 - Schema is introspected once at startup (or on hot reload) — restart after DDL
@@ -765,8 +860,8 @@ keyset cursor keys, which TiDB compares exactly against BIGINT PKs); the
 query-depth guard is memoized so a small fan-out fragment document can't cause
 exponential CPU; hidden columns can't be probed through `where`, `_by_pk`,
 cursors, or variables; the RBAC row filter is applied on every read path
-(connections, aggregates, relationships, vector search, and inside
-relationship filters, where each role filter is verified at startup to bind
+(connections, aggregates, nested relationship aggregates, relationships,
+vector search, and inside relationship filters, where each role filter is verified at startup to bind
 only to its own table); LIKE wildcards in literal string operators are
 escaped; aggregate and
 relationship selections are computed correctly even when the client wraps them

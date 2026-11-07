@@ -349,6 +349,8 @@ type relInfo struct {
 	targetCols []string // join columns on the target table
 	// filterable: offered in this table's <t>_bool_exp.
 	filterable bool
+	// aggName is the <rel>_aggregate field of an array relationship.
+	aggName string
 }
 
 // relations returns the role-visible relationships of a select-able table,
@@ -401,6 +403,17 @@ func (b *builder) relations(ti *tableInfo) []*relInfo {
 		taken[name] = true
 		ti.rels = append(ti.rels, &relInfo{name: name, fk: fk, outgoing: false, target: child,
 			localCols: fk.RefColumns, targetCols: fk.Columns})
+	}
+	// Array relationships also get <rel>_aggregate. Those names are assigned
+	// only after every relationship is named, so adding them never renames an
+	// existing relationship field; they are deconflicted against the columns,
+	// the relationships and each other.
+	for _, r := range ti.rels {
+		if r.outgoing {
+			continue
+		}
+		r.aggName = relFieldName(taken, r.name+"_aggregate", r.fk)
+		taken[r.aggName] = true
 	}
 	return ti.rels
 }

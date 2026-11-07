@@ -174,7 +174,19 @@ type SchemaGen struct {
 	// CustomOperators are developer-defined comparison operators added to the
 	// <Scalar>_comparison_exp types of the scalars they apply to.
 	CustomOperators []CustomOperator `yaml:"custom_operators"`
+	// CountType is the GraphQL scalar of row counts (<t>_aggregate.count,
+	// <t>_connection.total_count and mutation_response.affected_rows):
+	// "BigInt" (the default; 64-bit, so counts past 2^31-1 never overflow) or
+	// "Int" (GraphQL's 32-bit Int, for clients generated against an older
+	// schema; a count above 2147483647 then fails the field).
+	CountType string `yaml:"count_type"`
 }
+
+// Count scalar names accepted by schema_gen.count_type.
+const (
+	CountTypeBigInt = "BigInt"
+	CountTypeInt    = "Int"
+)
 
 // TableFilter narrows which tables of the schema are exposed.
 // Empty include list means "all tables". Exclude wins over include.
@@ -406,6 +418,9 @@ func (c *Config) applyDefaults() {
 	if c.SchemaGen.MaxPageSize == 0 {
 		c.SchemaGen.MaxPageSize = 200
 	}
+	if c.SchemaGen.CountType == "" {
+		c.SchemaGen.CountType = CountTypeBigInt
+	}
 }
 
 var validAlgorithms = map[string]bool{
@@ -444,6 +459,9 @@ func (c *Config) validate() error {
 	if c.SchemaGen.DefaultPageSize > c.SchemaGen.MaxPageSize {
 		return fmt.Errorf("schema_gen.default_page_size (%d) exceeds max_page_size (%d)",
 			c.SchemaGen.DefaultPageSize, c.SchemaGen.MaxPageSize)
+	}
+	if ct := c.SchemaGen.CountType; ct != CountTypeBigInt && ct != CountTypeInt {
+		return fmt.Errorf("schema_gen.count_type %q is not supported (use BigInt or Int)", ct)
 	}
 	if c.JWT.RoleLookup.Enabled() && c.JWT.RoleLookup.CacheSeconds < 0 {
 		return fmt.Errorf("jwt.role_lookup.cache_seconds must be >= 0")
