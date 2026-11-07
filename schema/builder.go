@@ -8,6 +8,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log/slog"
+	"sort"
 	"strings"
 	"time"
 
@@ -60,7 +61,13 @@ func newBuildShared(opt Options) (*buildShared, error) {
 	if err != nil {
 		return nil, err
 	}
-	renamed := names.avoidTypes(opt.Catalog, model, opt.Hooks.customTypeNames())
+	customTypes := opt.Hooks.customTypeNames()
+	for n := range model.jsonTypes {
+		if customTypes[n] {
+			return nil, fmt.Errorf("json_types.%s: a custom or object field registered in hooks/ already uses the type name %q", n, n)
+		}
+	}
+	renamed := names.avoidTypes(opt.Catalog, model, customTypes)
 	if opt.Logger != nil {
 		for _, s := range names.skipped {
 			opt.Logger.Warn("generated field left out: name collision", "field", s)
@@ -246,6 +253,18 @@ func reserveNames(cat *introspect.Catalog, m *catalogModel) (*nameReservation, e
 		types[s] = "(built-in scalar)"
 		types[s+"_comparison_exp"] = "(built-in)"
 	}
+	// Declared JSON shapes are fixed type names too (json_types).
+	jsonNames := make([]string, 0, len(m.jsonTypes))
+	for n := range m.jsonTypes {
+		jsonNames = append(jsonNames, n)
+	}
+	sort.Strings(jsonNames)
+	for _, n := range jsonNames {
+		if other, dup := types[n]; dup {
+			return nil, fmt.Errorf("json_types.%s: the type name is already used by %s", n, other)
+		}
+		types[n] = "json_types." + n
+	}
 
 	claim := func(ns map[string]string, name, owner, kind string) error {
 		if other, dup := ns[name]; dup {
@@ -429,6 +448,12 @@ type builder struct {
 	// name may replace ("query:<name>" / "mutation:<name>"): the unique-key
 	// fields, which are newer than any custom field that might use the name.
 	optionalFields map[string]bool
+	// objFields are the hook-provided object fields this role sees, per
+	// table (see resolveObjectFields).
+	objFields map[string][]ObjectField
+	// jsonObjs are the role's object types of declared JSON shapes, by
+	// json_types name (see jsontyped.go).
+	jsonObjs map[string]*graphql.Object
 }
 
 func buildRole(opt Options, shared *buildShared, roleName string, access *rbac.Access) (graphql.Schema, error) {
@@ -455,6 +480,7 @@ func buildRoleBuilder(opt Options, shared *buildShared, roleName string, access 
 
 		mutRespTypes:   map[string]*graphql.Object{},
 		optionalFields: map[string]bool{},
+		jsonObjs:       map[string]*graphql.Object{},
 	}
 
 	// page_info is the cursor-pagination metadata, shared by every connection.
@@ -550,6 +576,9 @@ func buildRoleBuilder(opt Options, shared *buildShared, roleName string, access 
 			return nil, graphql.Schema{}, err
 		}
 	}
+	if err := b.resolveObjectFields(); err != nil {
+		return nil, graphql.Schema{}, err
+	}
 
 	// Pass 2: types for select-able tables (mutation-only tables get none).
 	for _, tn := range opt.Catalog.TableOrder {
@@ -614,6 +643,9 @@ func buildRoleBuilder(opt Options, shared *buildShared, roleName string, access 
 	if err := b.addCustomFields(mutationFields, "mutation"); err != nil {
 		return nil, graphql.Schema{}, err
 	}
+	// Independent query root fields run concurrently (bounded per request;
+	// see parallel.go). Mutation root fields stay serial.
+	concurrentRootFields(queryFields)
 
 	schemaCfg := graphql.SchemaConfig{
 		Query: graphql.NewObject(graphql.ObjectConfig{Name: "Query", Fields: queryFields}),
@@ -666,6 +698,10 @@ func (b *builder) buildObjectType(ti *tableInfo) *graphql.Object {
 			fields := graphql.Fields{}
 			for _, col := range ti.access.Select.Columns {
 				col := col
+				if expr := ti.model.colJSONType[col.Name]; expr != "" {
+					fields[ti.colToField[col.Name]] = b.typedJSONColumn(ti, col, expr)
+					continue
+				}
 				sc := scalarFor(col)
 				var t graphql.Output = sc
 				// A `json NOT NULL` column can still hold the JSON literal
@@ -687,6 +723,7 @@ func (b *builder) buildObjectType(ti *tableInfo) *graphql.Object {
 				}
 			}
 			b.addRelationFields(ti, fields)
+			b.addObjectHookFields(ti, fields)
 			return fields
 		}),
 	})

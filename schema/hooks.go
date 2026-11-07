@@ -73,9 +73,10 @@ func (c CustomField) allows(role string) bool {
 // Construct it with NewHooks (gqlgate.Open does this from the YAML wiring plus
 // the Go-provided implementations).
 type Hooks struct {
-	before map[string][]MutationHookFunc // key: HookKey(table, op)
-	after  map[string][]MutationHookFunc
-	fields []CustomField
+	before    map[string][]MutationHookFunc // key: HookKey(table, op)
+	after     map[string][]MutationHookFunc
+	fields    []CustomField
+	objFields []ObjectField
 }
 
 // HookKey is the map key used for per-(table, op) hook lookup. Exported so the
@@ -88,6 +89,17 @@ func HookKey(table string, op MutationOp) string {
 // Any of the arguments may be nil/empty.
 func NewHooks(before, after map[string][]MutationHookFunc, fields []CustomField) *Hooks {
 	return &Hooks{before: before, after: after, fields: fields}
+}
+
+// SetObjectFields installs the computed fields hooks attach to table object
+// types (see ObjectField).
+func (h *Hooks) SetObjectFields(defs []ObjectField) { h.objFields = defs }
+
+func (h *Hooks) objectFields() []ObjectField {
+	if h == nil {
+		return nil
+	}
+	return h.objFields
 }
 
 // runBefore runs the before-hooks registered for (table, op). It looks up both
@@ -152,6 +164,14 @@ func (h *Hooks) customTypeNames() map[string]bool {
 		}
 		collectTypeNames(cf.Field.Type, names)
 		for _, a := range cf.Field.Args {
+			if a != nil {
+				collectTypeNames(a.Type, names)
+			}
+		}
+	}
+	for _, of := range h.objFields {
+		collectTypeNames(of.Type, names)
+		for _, a := range of.Args {
 			if a != nil {
 				collectTypeNames(a.Type, names)
 			}

@@ -24,6 +24,7 @@ const (
 	CodeDatabaseError       = "database_error"        // anything else the database reported
 	CodePermissionError     = "permission_error"      // a role's insert/update check failed
 	CodeResponseTooLarge    = "response_too_large"    // server.max_response_rows/bytes exceeded
+	CodeJSONShapeMismatch   = "json_shape_mismatch"   // stored JSON does not fit its declared json_type
 )
 
 // CodedError is an error with a machine-readable code. graphql-go copies

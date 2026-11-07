@@ -32,6 +32,9 @@ type tableModel struct {
 	colField      map[string]string // column -> GraphQL field name
 	colDoc        map[string]string // column -> config description
 	colDeprecated map[string]string // column -> deprecation reason
+	// colJSONType is the declared json_types shape of a JSON column (a type
+	// expression such as "Profile" or "[Address]"); absent = opaque JSON.
+	colJSONType map[string]string
 
 	roots map[string]rootSpec // root field kind -> name/description/deprecation
 	// listExplicit: root_fields.list names the list field, so its name is
@@ -86,6 +89,8 @@ type catalogModel struct {
 	related map[string]bool
 	// commentDocs: schema_gen.descriptions_from_comments.
 	commentDocs bool
+	// jsonTypes are the declared JSON shapes (json_types), by type name.
+	jsonTypes map[string]*config.JSONType
 }
 
 // defaultRootName is the generated name of a root field kind.
@@ -129,6 +134,7 @@ func buildModel(cat *introspect.Catalog, cfg *config.Config) (*catalogModel, err
 	if cfg != nil {
 		tcfg = cfg.Tables
 		m.commentDocs = cfg.SchemaGen.DescriptionsFromComments
+		m.jsonTypes = cfg.JSONTypes
 	}
 	for _, tn := range cat.TableOrder {
 		t := cat.Tables[tn]
@@ -139,6 +145,7 @@ func buildModel(cat *introspect.Catalog, cfg *config.Config) (*catalogModel, err
 			colField:      map[string]string{},
 			colDoc:        map[string]string{},
 			colDeprecated: map[string]string{},
+			colJSONType:   map[string]string{},
 			roots:         map[string]rootSpec{},
 			readKey:       t.PrimaryKey,
 		}
@@ -172,6 +179,15 @@ func buildModel(cat *introspect.Catalog, cfg *config.Config) (*catalogModel, err
 		}
 		if err := tm.applyConfig(tc); err != nil {
 			return nil, fmt.Errorf("tables.%s%w", tn, err)
+		}
+		for col, expr := range tm.colJSONType {
+			ref, err := config.ParseJSONTypeRef(expr)
+			if err == nil && m.jsonTypes[ref.Name] == nil {
+				err = fmt.Errorf("%q is not declared under json_types", ref.Name)
+			}
+			if err != nil {
+				return nil, fmt.Errorf("tables.%s.columns.%s.json_type: %w", tn, col, err)
+			}
 		}
 	}
 	// Pass 2: relationships.
@@ -207,6 +223,12 @@ func (tm *tableModel) applyConfig(tc *config.TableConfig) error {
 		}
 		tm.colDoc[col] = fc.Description
 		tm.colDeprecated[col] = fc.Deprecated
+		if fc.JSONType != "" {
+			if c := t.ColumnMap[col]; c.DataType != "json" {
+				return fmt.Errorf(".columns.%s: json_type needs a JSON column, but %q is %s", col, col, c.ColumnType)
+			}
+			tm.colJSONType[col] = fc.JSONType
+		}
 	}
 	for _, kind := range config.RootFieldKinds {
 		fc := tc.RootFields.ByKind(kind)

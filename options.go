@@ -25,6 +25,10 @@ type (
 	MutationOp = schema.MutationOp
 	// RoleResolver maps verified JWT claims to a role name.
 	RoleResolver = auth.RoleResolver
+	// ObjectField is a computed field attached to a table object type.
+	ObjectField = schema.ObjectField
+	// ObjectFieldParams is the input of an ObjectField resolver.
+	ObjectFieldParams = schema.ObjectFieldParams
 )
 
 const (
@@ -35,7 +39,8 @@ const (
 
 // options accumulates the functional options passed to Open.
 type options struct {
-	configPath string
+	configPath   string
+	objectFields []schema.ObjectField
 }
 
 // Option customizes a Gate at Open time.
@@ -48,13 +53,24 @@ func WithConfigPath(path string) Option {
 	return func(o *options) { o.configPath = path }
 }
 
+// WithObjectFields attaches computed fields to table object types for this
+// Gate, in addition to those registered by hooks/ files
+// (register.ObjectField). Useful when embedding gqlgate as a library.
+func WithObjectFields(defs ...ObjectField) Option {
+	return func(o *options) { o.objectFields = append(o.objectFields, defs...) }
+}
+
 // buildHooks resolves the YAML hook wiring against the compile-time registry
 // (the hooks/ directory; files there register themselves via gqlgate/register)
 // into the schema.Hooks the builder consumes. A hook name referenced in YAML
 // with no registered implementation, and malformed custom-field registrations,
 // are startup errors.
-func buildHooks(cfg *config.Config) (*schema.Hooks, error) {
+func buildHooks(cfg *config.Config, extraObjectFields ...schema.ObjectField) (*schema.Hooks, error) {
 	registeredHooks, registeredFields, _ := register.Registered()
+	objectFields := append(register.RegisteredObjectFields(), extraObjectFields...)
+	if err := schema.ValidateObjectFields(cfg, objectFields); err != nil {
+		return nil, err
+	}
 
 	before := map[string][]schema.MutationHookFunc{}
 	after := map[string][]schema.MutationHookFunc{}
@@ -92,7 +108,9 @@ func buildHooks(cfg *config.Config) (*schema.Hooks, error) {
 			return nil, err
 		}
 	}
-	return schema.NewHooks(before, after, registeredFields), nil
+	h := schema.NewHooks(before, after, registeredFields)
+	h.SetObjectFields(objectFields)
+	return h, nil
 }
 
 func validateCustomField(cfg *config.Config, name, operation string, roles []string) error {

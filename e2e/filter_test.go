@@ -485,6 +485,7 @@ func TestDemoConfigFilters(t *testing.T) {
 		c.Roles = demo.Roles
 		c.SchemaGen.CustomOperators = demo.SchemaGen.CustomOperators
 		c.Tables = demo.Tables
+		c.JSONTypes = demo.JSONTypes
 	}))
 
 	r := env.MustGQL(t, "", `{ posts_connection(where: {published_on: {_year_eq: 2026}, author: {name: {_eq: "Ada Lovelace"}}, title: {_istarts_with: "notes"}}) { nodes { id } } }`, nil)

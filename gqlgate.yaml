@@ -23,6 +23,7 @@ server:
   debug: true             # logs SQL, exposes DB errors — turn off in production
   hot_reload: true        # edit this file and save; no restart needed
   max_response_rows: 10000  # fail requests that would return more rows (0 = no limit)
+  max_parallel_root_fields: 4  # independent query root fields run concurrently (1 = serial)
   cors:
     enabled: true
     allowed_origins: ["*"]
@@ -37,6 +38,10 @@ jwt:
     role_column: role
     username_column: username
     password_column: password
+    # Roles a user may switch to per request with the X-Gqlgate-Role header
+    # (the role column above stays the default). In the seed, root (id 4,
+    # admin) may act as author to see what authors see.
+    allowed_roles_column: allowed_roles
   anonymous_role: anonymous
   leeway_seconds: 30
 
@@ -73,9 +78,22 @@ tables:
     relationships:
       stats: {type: object, target: post_stats, mapping: {id: post_id}}
       tags: {type: array, target: post_tags, mapping: {id: post_id}}
+  users:
+    columns:
+      metadata: {json_type: UserMetadata}   # typed instead of an opaque JSON value
+
+# Shapes for JSON columns: users { metadata { tier tags } }
+json_types:
+  UserMetadata:
+    description: "Profile data kept in users.metadata."
+    fields:
+      tier: String
+      tags: "[String]"
 
 # Custom logic lives in the hooks/ directory (compiled in on build; any Go
-# library allowed). Activate the sample: rename hooks/signup.go.sample to
+# library allowed). hooks/avatar.go.sample adds computed fields to the users
+# type (avatar_url, published_posts): rename it to .go and rebuild. To
+# activate the other sample, rename hooks/signup.go.sample to
 # hooks/signup.go, rebuild, and uncomment the wiring below (the sample
 # registers `validate_post`; its `signup` mutation mounts automatically):
 # hooks:

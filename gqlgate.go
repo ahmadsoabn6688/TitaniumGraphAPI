@@ -115,7 +115,7 @@ func Open(ctx context.Context, cfg *config.Config, opts ...Option) (*Gate, error
 // buildState builds one serving generation (hooks, catalog, per-role schemas,
 // verifier) from cfg using the existing DB pool. Shared by Open and Reload.
 func (g *Gate) buildState(ctx context.Context, cfg *config.Config) (*gateState, error) {
-	hooks, err := buildHooks(cfg)
+	hooks, err := buildHooks(cfg, g.opts.objectFields...)
 	if err != nil {
 		return nil, err
 	}
@@ -157,6 +157,14 @@ func (g *Gate) buildState(ctx context.Context, cfg *config.Config) (*gateState, 
 	verifier, err := auth.New(cfg.JWT, roleNames, resolver)
 	if err != nil {
 		return nil, err
+	}
+	// Roles a caller may switch to with the role header, from the identity
+	// database (a claim-based list is set up by auth.New itself).
+	if cfg.JWT.AllowedRolesFromDB() {
+		if err := validateAllowedRoles(ctx, g.db, cfg.JWT.RoleLookup); err != nil {
+			return nil, err
+		}
+		verifier.SetAllowedRoles(auth.NewDBAllowedRoles(g.db, cfg.JWT.RoleLookup))
 	}
 	return &gateState{
 		srv:     &server.State{Cfg: cfg, Schemas: schemas, Verifier: verifier},
@@ -373,6 +381,42 @@ func validateRoleLookup(ctx context.Context, db *sql.DB, rl config.RoleLookup) e
 		if !cols[col] {
 			return fmt.Errorf("jwt.role_lookup: table %s.%s has no column %q (configured as %s; set it to \"\" to skip this check if it does not apply)",
 				rl.Schema, rl.Table, col, key)
+		}
+	}
+	return nil
+}
+
+// validateAllowedRoles checks at startup that the configured allowed-roles
+// column, or the allowed-roles table and its columns, exist.
+func validateAllowedRoles(ctx context.Context, db *sql.DB, rl config.RoleLookup) error {
+	if rl.AllowedRolesColumn != "" {
+		cols, err := introspect.TableColumns(ctx, db, rl.Schema, rl.Table)
+		if err != nil {
+			return err
+		}
+		if len(cols) == 0 {
+			return fmt.Errorf("jwt.role_lookup: identity table %s.%s does not exist", rl.Schema, rl.Table)
+		}
+		// "does not exist" lets startup retry while a seeder is still
+		// creating the column (see isNotReady).
+		for key, col := range map[string]string{"id_column": rl.IDColumn, "allowed_roles_column": rl.AllowedRolesColumn} {
+			if !cols[col] {
+				return fmt.Errorf("jwt.role_lookup: column %s.%s.%s (configured as %s) does not exist", rl.Schema, rl.Table, col, key)
+			}
+		}
+		return nil
+	}
+	at := rl.AllowedRolesTable
+	cols, err := introspect.TableColumns(ctx, db, at.Schema, at.Table)
+	if err != nil {
+		return err
+	}
+	if len(cols) == 0 {
+		return fmt.Errorf("jwt.role_lookup.allowed_roles_table: table %s.%s does not exist", at.Schema, at.Table)
+	}
+	for key, col := range map[string]string{"id_column": at.IDColumn, "role_column": at.RoleColumn} {
+		if !cols[col] {
+			return fmt.Errorf("jwt.role_lookup.allowed_roles_table: column %s.%s.%s (configured as %s) does not exist", at.Schema, at.Table, col, key)
 		}
 	}
 	return nil

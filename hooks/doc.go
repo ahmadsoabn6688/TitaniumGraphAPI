@@ -10,10 +10,13 @@
 //     (return an error to roll it back).
 //   - register.CustomField(...) — extra root queries/mutations (e.g. signup),
 //     mounted automatically for their AllowedRoles.
+//   - register.ObjectField(...) — computed fields on generated table types
+//     (e.g. users.avatar_url), mounted for the roles that can read the
+//     columns they require; see avatar.go.sample.
 //   - register.RoleResolver(fn) — fully custom token→role mapping.
 //
 // Files here may import ANY third-party library — bcrypt, uuid, HTTP clients,
 // anything; the Docker build runs `go mod tidy` so new imports resolve
-// automatically. See signup.go.sample for a complete example (rename it to
-// signup.go to activate).
+// automatically. See signup.go.sample and avatar.go.sample for complete
+// examples (rename one to .go to activate).
 package hooks

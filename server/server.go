@@ -66,7 +66,7 @@ func New(static *config.Config, current func() *State, logger *slog.Logger) http
 	})
 
 	if static.Server.CORS.Enabled {
-		return corsMiddleware(static.Server.CORS, mux)
+		return corsMiddleware(static.Server.CORS, static.JWT.RoleHeader, mux)
 	}
 	return mux
 }
@@ -120,6 +120,8 @@ func (s *srv) execute(w http.ResponseWriter, r *http.Request) {
 	ctx = gqlschema.WithLoaders(ctx)
 	// Per-request response row budget (server.max_response_rows).
 	ctx = gqlschema.WithResponseLimit(ctx, st.Cfg.Server.MaxResponseRows)
+	// Per-request cap on concurrently running root fields of a query.
+	ctx = gqlschema.WithRootParallelism(ctx, st.Cfg.Server.MaxParallelRootFields)
 
 	start := time.Now()
 	result := graphql.Do(graphql.Params{
@@ -249,7 +251,14 @@ func wantsHTML(r *http.Request) bool {
 	return strings.Contains(r.Header.Get("Accept"), "text/html")
 }
 
-func corsMiddleware(cfg config.CORS, next http.Handler) http.Handler {
+// corsMiddleware answers CORS preflights; the role header (jwt.role_header,
+// fixed at startup like the rest of the routing) is an allowed request
+// header so browser clients can select a role.
+func corsMiddleware(cfg config.CORS, roleHeader string, next http.Handler) http.Handler {
+	allowHeaders := "Authorization, Content-Type"
+	if roleHeader != "" {
+		allowHeaders += ", " + roleHeader
+	}
 	allowed := map[string]bool{}
 	all := false
 	for _, o := range cfg.AllowedOrigins {
@@ -263,7 +272,7 @@ func corsMiddleware(cfg config.CORS, next http.Handler) http.Handler {
 		if origin != "" && (all || allowed[origin]) {
 			w.Header().Set("Access-Control-Allow-Origin", origin)
 			w.Header().Set("Vary", "Origin")
-			w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
+			w.Header().Set("Access-Control-Allow-Headers", allowHeaders)
 			w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
 		}
 		if r.Method == http.MethodOptions {

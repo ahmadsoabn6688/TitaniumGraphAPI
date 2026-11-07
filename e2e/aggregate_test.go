@@ -468,6 +468,7 @@ func TestDemoConfigAggregates(t *testing.T) {
 		c.Roles = demo.Roles
 		c.SchemaGen = demo.SchemaGen
 		c.Tables = demo.Tables
+		c.JSONTypes = demo.JSONTypes
 	}))
 
 	r := env.MustGQL(t, "", `{ users_connection { nodes {

@@ -131,6 +131,9 @@ type FieldConfig struct {
 	Description string `yaml:"description"`
 	// Deprecated, when set, marks the field @deprecated with this reason.
 	Deprecated string `yaml:"deprecated"`
+	// JSONType gives a JSON column a declared shape from json_types
+	// ("Profile", or "[Address]" for an array of objects). Columns only.
+	JSONType string `yaml:"json_type"`
 }
 
 // UnmarshalYAML accepts a bare name or the mapping form.
@@ -228,6 +231,9 @@ func (c *Config) validateTables() error {
 		for _, kind := range RootFieldKinds {
 			if fc := tc.RootFields.ByKind(kind); fc != nil && fc.Name != "" && !ValidGraphQLName(fc.Name) {
 				return fmt.Errorf("%s.root_fields.%s: %q is not a valid GraphQL name", where, kind, fc.Name)
+			}
+			if fc := tc.RootFields.ByKind(kind); fc != nil && fc.JSONType != "" {
+				return fmt.Errorf("%s.root_fields.%s: json_type applies to columns only", where, kind)
 			}
 		}
 		for col, fc := range tc.Columns {

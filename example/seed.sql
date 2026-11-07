@@ -15,6 +15,9 @@ CREATE TABLE users (
     is_active  TINYINT(1)    NOT NULL DEFAULT 1,
     balance    DECIMAL(10,2) NOT NULL DEFAULT 0.00,
     metadata   JSON          NULL,
+    -- roles the user may switch to with the X-Gqlgate-Role header
+    -- (jwt.role_lookup.allowed_roles_column): a JSON array or "a, b"
+    allowed_roles VARCHAR(200) NULL,
     created_at TIMESTAMP     NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -47,6 +50,9 @@ INSERT INTO users (id, username, password, role, name, email, is_active, balance
   (2, 'grace', '$2a$10$devhash.grace', 'author', 'Grace Hopper',  'grace@example.com', 1,  75.00, '{"tags": ["navy"], "tier": "silver"}'),
   (3, 'alan',  '$2a$10$devhash.alan',  'author', 'Alan Turing',   'alan@example.com',  0,   0.00, NULL),
   (4, 'root',  '$2a$10$devhash.root',  'admin',  'Root Admin',    'root@example.com',  1,   0.00, NULL);
+
+-- root may also act as an author (send X-Gqlgate-Role: author).
+UPDATE users SET allowed_roles = '["author"]' WHERE id = 4;
 
 INSERT INTO posts (id, author_id, title, body, published, views, rating, published_on) VALUES
   (1, 1, 'Notes on the Analytical Engine', 'First program ever written.',        1, 420, 4.9, '2026-01-15'),

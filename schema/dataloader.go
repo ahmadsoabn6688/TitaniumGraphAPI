@@ -46,6 +46,7 @@ type loaderSetKey struct{}
 type loaderSet struct {
 	mu      sync.Mutex
 	loaders map[string]*relLoader
+	fields  map[string]*fieldBatcher // object field batches (see objectfield.go)
 }
 
 // WithLoaders returns a context carrying a fresh per-request loader set. The
@@ -73,6 +74,22 @@ func (s *loaderSet) getOrCreate(key string, make func() *relLoader) *relLoader {
 	}
 	l := make()
 	s.loaders[key] = l
+	return l
+}
+
+// fieldBatch returns the object field batcher for key, creating it via make
+// on first use.
+func (s *loaderSet) fieldBatch(key string, make func() *fieldBatcher) *fieldBatcher {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.fields == nil {
+		s.fields = map[string]*fieldBatcher{}
+	}
+	if l, ok := s.fields[key]; ok {
+		return l
+	}
+	l := make()
+	s.fields[key] = l
 	return l
 }
 

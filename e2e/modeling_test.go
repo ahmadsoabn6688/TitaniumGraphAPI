@@ -444,6 +444,7 @@ func TestDemoConfigModeling(t *testing.T) {
 		c.Roles = demo.Roles
 		c.SchemaGen = demo.SchemaGen
 		c.Tables = demo.Tables
+		c.JSONTypes = demo.JSONTypes
 	}))
 	r := env.MustGQL(t, "", `{
 		posts_connection { nodes { id stats { commentCount } tags { tag } tags_aggregate { count } } }

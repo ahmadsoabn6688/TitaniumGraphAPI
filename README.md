@@ -73,6 +73,17 @@ CLI can mint dev tokens (`-print-token`).
   the user id and the role is read from your identity table on each request —
   change a row's `role` column and it applies instantly, no token re-issue.
   (Alternatively, read the role from a token claim with `role_claim`.)
+  A user with several roles picks one per request with the
+  **`X-Gqlgate-Role` header**, checked against their allowed roles (a claim,
+  a column or a user→role table).
+- **Typed JSON columns.** Declare a shape for a JSON column in YAML and it
+  becomes a real GraphQL object type (or a list of one) with selectable
+  sub-fields, instead of an opaque `JSON` value.
+- **Computed fields from Go.** A hook can attach a field to any table type
+  (`users { avatar_url }`), per role, with access to the parent row, the
+  caller's claims and the database — batched like relationships.
+- **Concurrent root fields.** The independent root fields of one query run
+  in parallel (bounded per request); mutations stay strictly serial.
 - **Safe by construction**: claim values and all client inputs are always
   bound as SQL parameters; identifiers come from `information_schema` and are
   backtick-quoted; algorithm-pinned JWT verification (no alg confusion);
@@ -161,6 +172,7 @@ server:
   max_query_depth: 15      # -1 disables
   max_response_rows: 10000 # rows one request may return (0 = unlimited, the default)
   max_response_bytes: 0    # size cap of the JSON response (0 = unlimited)
+  max_parallel_root_fields: 4  # query root fields run at once (default min(4, max_open_conns/2); 1 = serial)
   hot_reload: true         # watch config + scripts, rebuild in place (dev only)
   reload_interval_seconds: 2
   cors:
@@ -187,8 +199,13 @@ jwt:
     username_column: username  # your signup service's columns — verified to
     password_column: password  # exist at startup; set to "" to skip the check
     cache_seconds: 0       # >0 caches id->role; 0 = fresh lookup every request
+    # Optional: roles the user may switch to with the role header — ONE of:
+    allowed_roles_column: allowed_roles   # JSON array or "a, b" on the identity table
+    # allowed_roles_table: {table: user_roles, id_column: user_id, role_column: role}
   # (b) from a token claim:
   # role_claim: role       # dot path; Auth0-style URL keys work too
+  # allowed_roles_claim: app_metadata.roles  # claim listing the roles the caller may switch to
+  role_header: X-Gqlgate-Role  # request header picking one allowed role (this is the default)
 
 schema_gen:
   default_page_size: 25    # LIMIT when none given
@@ -215,11 +232,22 @@ tables:                    # optional per-table modeling (see "Modeling: views, 
     columns:               # keyed by SQL column name
       comment_count: commentCount            # shorthand: just the new name
       author_id: {description: "…", deprecated: "use post"}
+      details: {json_type: StatsDetails}     # a JSON column with a declared shape (see json_types)
     relationships:
       post: {type: object, target: posts, mapping: {post_id: id}}   # no FK needed
   posts:
     relationships:
       writer: {foreign_key: fk_posts_author, description: "The author"}  # names an FK relationship
+
+json_types:                # optional shapes for JSON columns (see "Typed JSON columns")
+  StatsDetails:
+    fields:
+      top_tags: "[String]"
+      last_reader: Reader
+  Reader:
+    fields:
+      name: String
+      visits: Int
 
 roles:
   <role-name>:
@@ -309,6 +337,46 @@ In both modes:
   rejected with 403.
 - All claims are available to filters/presets as `:jwt.<path>`
   (nested paths like `:jwt.app_metadata.tenant_id` work).
+
+### Role selection (allowed roles)
+
+A caller can hold several roles and pick one per request with a header
+(`jwt.role_header`, default `X-Gqlgate-Role`). The role from `role_claim` /
+`role_lookup` stays the **default** — used when the header is absent — and
+is always allowed; any other role must be in the caller's allowed roles,
+which come from exactly one of:
+
+```yaml
+jwt:
+  role_claim: role
+  allowed_roles_claim: roles            # (a) a claim: ["editor","admin"] or "editor, admin"
+  # role_lookup:
+  #   table: users
+  #   allowed_roles_column: allowed_roles            # (b) a column of the identity table: JSON array or "a, b"
+  #   allowed_roles_table: {table: user_roles}       # (c) one row per (user_id, role); id_column/role_column configurable
+```
+
+```http
+POST /graphql
+Authorization: Bearer <jwt: {"sub": 1, "role": "author", "roles": ["editor"], "exp": …}>
+X-Gqlgate-Role: editor
+
+{ "query": "{ _role posts_connection { nodes { id } } }" }   # served from the editor schema
+```
+
+- A requested role that is not allowed, or not configured under `roles:`,
+  is rejected with **403** — never silently served as the default role.
+  Without any allowed-roles source the header may only name the caller's own
+  role. An unauthenticated request can only ever be the `anonymous_role`.
+- The default role must itself be valid: a token whose default role is
+  unknown, or whose identity row is gone, is rejected even with a header.
+- The database sources bind the token's `role_lookup.id_claim` as a
+  parameter, are read only when the header asks for another role, honour
+  `role_lookup.cache_seconds`, and are checked to exist at startup. They
+  work with a `register.RoleResolver` hook too (it supplies the default).
+- With CORS enabled the header is an allowed request header. Changing
+  `role_header` needs a restart for CORS; requests pick it up on reload.
+- `{ _role }` reports the role a request was served as.
 
 ## Generated API, per table (role permitting)
 
@@ -570,21 +638,72 @@ tables:
   A column may not be renamed `_and`, `_or` or `_not` (the logical operators
   of `where`), just as a relationship may not be named so.
 
+### Typed JSON columns
+
+By default a JSON column is the opaque `JSON` scalar. Declare its shape under
+the top-level `json_types:` and point the column at it, and the column
+becomes a GraphQL object type (or a list of one) whose sub-fields clients
+select and introspection shows:
+
+```yaml
+json_types:
+  UserMetadata:
+    description: "Profile data kept in users.metadata."
+    fields:
+      tier: String                                 # shorthand: just the type
+      tags: "[String]"                             # a list
+      address: Address                             # another declared type (may nest, even recursively)
+      score: {type: Int, description: "Loyalty score", deprecated: "use tier"}
+      gift_wrap: {type: Boolean, key: "gift-wrap"} # JSON key that is not a GraphQL name
+  Address:
+    fields: {city: String, lines: "[String]"}
+tables:
+  users:
+    columns:
+      metadata: {json_type: UserMetadata}          # or "[Address]" for an array of objects
+```
+
+```graphql
+{ users_connection { nodes { id metadata { tier tags address { city } } } } }
+```
+
+- Field types: `String`, `Int` (32-bit), `Float`, `Boolean`, `JSON` (an
+  opaque sub-document), a declared type, or a list of any of these
+  (`"[Address]"`, `"[[Int]]"`). Every field is **nullable**: the database
+  does not enforce the shape, so `!` is rejected.
+- Stored data that does not fit never breaks the response: a missing key or
+  JSON `null` is `null`; a value of the wrong kind (a string where an `Int`
+  is declared, an array where an object is) is `null` with an error
+  carrying `extensions.code: json_shape_mismatch` and the path, while the
+  rest of the row and the response resolve normally.
+- Column RBAC is unchanged: a role that cannot read the column has neither
+  the field nor the declared types in its schema. Shapes are not per-role:
+  every role that reads the column sees all of its declared fields.
+- Only output changes. Inserts/`_set` keep taking a JSON value, `where`
+  keeps the JSON operators (`_contains`, `_has_key`, …), and `min`/`max`
+  aggregates of the column stay `JSON`. The column is still read whole and
+  decoded in Go (no per-field SQL projection).
+- `json_type` must point at a JSON column (checked at startup and on
+  reload); declared type names share the GraphQL type namespace and may not
+  collide with generated or hook-provided types. Without `json_type`
+  nothing changes.
+
 ## Layout
 
 ```
 gqlgate.yaml         the config you edit (mounted into the container)
-hooks/               YOUR compiled-in .go hooks/fields (+ signup.go.sample)
+hooks/               YOUR compiled-in .go hooks/fields (+ signup.go.sample, avatar.go.sample)
 docker-compose.yml   one-command build+seed+serve
 Dockerfile           builds the gateway with hooks/ (runs `go mod tidy`)
-register/            registry the hooks/ files use (MutationHook/CustomField/…)
+register/            registry the hooks/ files use (MutationHook/CustomField/ObjectField/…)
 config/              YAML loading + validation (env expansion, strict keys)
 introspect/          information_schema → tables, views, columns, PKs, FKs, comments
 rbac/                role resolution, row-filter compilation, claim lookup
-auth/                JWT verification middleware (alg-pinned) + DB role resolver
+auth/                JWT verification (alg-pinned), role header + allowed roles, DB role lookups
 schema/              per-role GraphQL schema, parameterized SQL, where/filter
                      surface (operators, relationship EXISTS), dataloader,
                      keyset pagination, aggregates, vector search, hooks,
+                     object fields, typed JSON, concurrent root fields,
                      writes (returning, checks), error codes, response limits
 server/              HTTP handler, GraphiQL (embedded), CORS, depth limit
 options.go           hook resolution (YAML names → hooks/ registry) + JWT signer
@@ -626,6 +745,40 @@ after the last one. So in such a request every relationship and
 `<rel>_aggregate` field resolves right away, one query per parent row, and
 the rows nested under `a` show the database as `a` left it (not after `b`). A
 request with a single mutation, and every query, keeps batching.
+
+## Concurrent root fields
+
+The independent root fields of one **query** run concurrently, each on its
+own pooled connection, so a dashboard-style request costs about its slowest
+root field instead of the sum of all of them:
+
+```graphql
+query Dashboard {
+  open: posts_aggregate(where: {published: {_eq: false}}) { count }
+  latest: posts_connection(first: 20) { nodes { id title author { name } } }
+  people: users_aggregate { count }
+}
+```
+
+```yaml
+server:
+  max_parallel_root_fields: 4   # per request; 1 = one after another
+```
+
+- The default is `min(4, database.max_open_conns / 2)` (at least 1), and the
+  value may not exceed `max_open_conns`, so one wide request cannot take the
+  whole pool. A request with a single root field runs exactly as before.
+- **Mutations always run serially**, in document order.
+- Everything below the root still resolves on one goroutine, so
+  relationship batching is unchanged — batches even merge across the root
+  fields of a request. The response row limit, error codes, timeouts and
+  cancellation apply as before.
+- Root fields read at their own TiDB snapshot, so two root fields of one
+  request are not guaranteed to see one consistent state (as two requests
+  never were). Put reads that must agree under a single root field.
+- Custom query fields from `hooks/` (`register.CustomField`) run
+  concurrently too: their resolvers must be safe to run in parallel with
+  others (they already had to be, across requests).
 
 ## Hot config reload (dev)
 
@@ -1251,8 +1404,59 @@ What hook files can do:
   `gqlgate.FromContext(p.Context)` reaches the shared DB pool (`gate.DB()`)
   and token signing (`gate.SignToken(claims)`); `rbac.IdentityFrom(p.Context)`
   gives the caller's role and claims.
+- **`register.ObjectField(def)`** — a computed field on a generated table
+  type (see below).
 - **`register.RoleResolver(fn)`** — fully custom token→role mapping (takes
-  precedence over `role_claim`/`role_lookup`).
+  precedence over `role_claim`/`role_lookup`; allowed roles for the role
+  header still apply).
+
+### Computed fields on table types (`register.ObjectField`)
+
+An object field attaches Go-computed data to a table's type, so it appears
+wherever the type does — connection nodes, `_by_pk`, relationships, unique
+lookups, mutation `returning`:
+
+```go
+register.ObjectField(register.ObjectFieldDef{
+    Table:    "users",
+    Name:     "avatar_url",
+    Requires: []string{"email"},          // parent columns the resolver reads
+    AllowedRoles: nil,                    // nil = every role (that can read Requires)
+    Type:     graphql.String,
+    Args:     graphql.FieldConfigArgument{"size": &graphql.ArgumentConfig{Type: graphql.Int, DefaultValue: 80}},
+    Resolve: func(ctx context.Context, p register.ObjectFieldParams) (any, error) {
+        // p.Row (the Requires columns only), p.Args, p.Role, p.Claims, p.DB
+        return avatarURL(p.Row["email"].(string), p.Args["size"].(int)), nil
+    },
+})
+```
+
+```graphql
+{ users_connection { nodes { name avatar_url(size: 120) } } }
+```
+
+- **Visibility per role**: the field exists only in the schemas of the roles
+  in `AllowedRoles` (all if empty) that can `select` the table **and read
+  every `Requires` column** — so it can never leak a column the role's
+  permissions hide. Elsewhere it is absent (`Cannot query field`).
+- **Batching**: set `ResolveBatch func(ctx, []ObjectFieldParams) ([]any,
+  error)` instead of `Resolve` to get every parent row of a wave in one call
+  (one result per row, in order) — the same N+1 protection relationships
+  have. Use it whenever the field queries the database or a service.
+- `p.DB` is the gateway's pool and is **not** subject to RBAC: the
+  resolver's own query decides what it reveals, so restrict it to what every
+  role seeing the field may know (use `p.Role` / `p.Claims` to decide).
+- Startup rejects a field whose name collides with a column, relationship
+  or `<rel>_aggregate` field, a `Requires` column the table lacks, an
+  unknown role, or a duplicate table+name; a field for a table the schema
+  does not expose is skipped with a warning. A panic in the resolver
+  becomes a field error.
+- Embedding hosts can pass fields per gate with
+  `gqlgate.WithObjectFields(...)` instead of the global registry.
+
+A runnable template with a per-row and a batched field is
+[`hooks/avatar.go.sample`](hooks/avatar.go.sample) — rename it to
+`hooks/avatar.go` and rebuild.
 
 ## Testing
 
@@ -1344,6 +1548,12 @@ private database directly to verify what actually happened.
 - `SELECT … FOR UPDATE` only blocks in pessimistic transactions (TiDB's
   default); in optimistic mode a concurrent write to the same rows makes the
   commit fail with `extensions.code: conflict` instead.
+- Typed JSON columns shape the output only: writes and `where` take plain
+  JSON, the whole document is read and decoded in Go, nested fields are not
+  per-role, and numbers are decoded as 64-bit floats (an `Int` field is
+  32-bit; keep larger integers as `Float` or `JSON`).
+- Concurrent root fields of one query are not snapshot-consistent with each
+  other.
 
 ## Hardening notes
 
@@ -1367,4 +1577,9 @@ failure), a delete's rows depend only on the delete permission even when
 `returning` reads them through the select permission, unique-key lookups
 exist only for columns the role may read and `_eq`-filter, expected database
 errors carry codes without leaking the database's message, and response
-row/byte limits bound alias and relationship fan-out.
+row/byte limits bound alias and relationship fan-out. A role header can only
+select a configured role from the caller's allowed list (403 otherwise, and
+never for unauthenticated requests); hook object fields exist only for roles
+that can read the columns they consume; mistyped stored JSON yields a coded
+field error, never a crash; and concurrent root fields are capped per request
+below the pool size.

@@ -1,0 +1,101 @@
+// Computed fields on generated table types, for the sample blog schema.
+//
+// Activate: rename this file to hooks/avatar.go and rebuild
+// (`docker compose up --build`). Then, as a role that can read users.email
+// (admin in the demo config):
+//
+//	{ users_connection { nodes { name avatar_url(size: 120) published_posts } } }
+//
+// avatar_url only exists for roles that can read email (it declares
+// Requires: email); a role whose select permission hides email does not see
+// the field at all. published_posts needs only id, so every role that can
+// read users.id gets it, including through relationships:
+//
+//	{ posts_connection { nodes { title author { name published_posts } } } }
+package hooks
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"strings"
+
+	"github.com/graphql-go/graphql"
+
+	"gqlgate/register"
+)
+
+func init() {
+	// A per-row field: pure computation over the parent row, no I/O, so
+	// Resolve (one call per row) is fine.
+	register.ObjectField(register.ObjectFieldDef{
+		Table:       "users",
+		Name:        "avatar_url",
+		Requires:    []string{"email"}, // the role must be able to read it
+		Type:        graphql.String,
+		Description: "Gravatar URL derived from the user's email.",
+		Args: graphql.FieldConfigArgument{
+			"size": &graphql.ArgumentConfig{Type: graphql.Int, DefaultValue: 80, Description: "Pixels (1-2048)."},
+		},
+		Resolve: func(ctx context.Context, p register.ObjectFieldParams) (any, error) {
+			email, _ := p.Row["email"].(string)
+			if email == "" {
+				return nil, nil
+			}
+			size, _ := p.Args["size"].(int)
+			if size < 1 || size > 2048 {
+				return nil, fmt.Errorf("size must be between 1 and 2048")
+			}
+			sum := sha256.Sum256([]byte(strings.ToLower(strings.TrimSpace(email))))
+			return fmt.Sprintf("https://www.gravatar.com/avatar/%s?s=%d&d=identicon", hex.EncodeToString(sum[:]), size), nil
+		},
+	})
+
+	// A batched field: it reads the database, so it uses ResolveBatch — one
+	// query per wave of users instead of one per row.
+	//
+	// p.DB is the gateway's own pool and is NOT subject to RBAC: the query
+	// itself must only reveal what every role seeing the field may know.
+	// Here that is the number of PUBLISHED posts, which anonymous callers
+	// can count anyway.
+	register.ObjectField(register.ObjectFieldDef{
+		Table:       "users",
+		Name:        "published_posts",
+		Requires:    []string{"id"},
+		Type:        graphql.NewNonNull(graphql.Int),
+		Description: "Number of published posts by this user.",
+		ResolveBatch: func(ctx context.Context, ps []register.ObjectFieldParams) ([]any, error) {
+			marks := make([]string, len(ps))
+			args := make([]any, len(ps))
+			for i, p := range ps {
+				marks[i], args[i] = "?", p.Row["id"]
+			}
+			rows, err := ps[0].DB.QueryContext(ctx,
+				"SELECT author_id, COUNT(*) FROM posts WHERE published = 1 AND author_id IN ("+
+					strings.Join(marks, ", ")+") GROUP BY author_id", args...)
+			if err != nil {
+				return nil, err
+			}
+			defer rows.Close()
+			counts := map[int64]int{}
+			for rows.Next() {
+				var id int64
+				var n int
+				if err := rows.Scan(&id, &n); err != nil {
+					return nil, err
+				}
+				counts[id] = n
+			}
+			if err := rows.Err(); err != nil {
+				return nil, err
+			}
+			out := make([]any, len(ps)) // one result per row, in order
+			for i, p := range ps {
+				id, _ := p.Row["id"].(int64)
+				out[i] = counts[id]
+			}
+			return out, nil
+		},
+	})
+}

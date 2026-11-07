@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
@@ -28,6 +29,9 @@ type Verifier struct {
 	parser   *jwt.Parser
 	roles    map[string]bool
 	resolver RoleResolver // nil = role comes from the RoleClaim
+	// allowed lists the roles a caller may select with the role header
+	// (nil = only its own default role).
+	allowed AllowedRolesFunc
 }
 
 // New builds a Verifier. roleNames is the set of roles defined in the config;
@@ -37,6 +41,12 @@ func New(cfg config.JWT, roleNames []string, resolver RoleResolver) (*Verifier, 
 	v := &Verifier{cfg: cfg, roles: map[string]bool{}, resolver: resolver}
 	for _, r := range roleNames {
 		v.roles[r] = true
+	}
+	if cfg.RoleHeader == "" {
+		v.cfg.RoleHeader = config.DefaultRoleHeader
+	}
+	if cfg.AllowedRolesClaim != "" {
+		v.allowed = ClaimAllowedRoles(cfg.AllowedRolesClaim)
 	}
 
 	if strings.HasPrefix(cfg.Algorithm, "HS") {
@@ -105,12 +115,27 @@ func loadPublicKey(path string) (any, error) {
 	}
 }
 
+// SetAllowedRoles installs the source of the roles a caller may select with
+// the role header (e.g. a database lookup). Call it before serving.
+func (v *Verifier) SetAllowedRoles(fn AllowedRolesFunc) { v.allowed = fn }
+
 // Identify authenticates one request and returns the caller's identity.
+//
+// The role is the caller's default role (the anonymous role, the role
+// resolver's or the role claim's) unless the request names another one in
+// the role header. A requested role must be configured and in the caller's
+// allowed roles (the default role is always allowed); anything else is
+// rejected with 403 rather than silently served as the default role.
+// Anonymous requests can only ever be the anonymous role.
 func (v *Verifier) Identify(r *http.Request) (*rbac.Identity, int, error) {
+	requested := strings.TrimSpace(r.Header.Get(v.cfg.RoleHeader))
 	header := r.Header.Get("Authorization")
 	if header == "" {
 		if v.cfg.AnonymousRole == "" {
 			return nil, http.StatusUnauthorized, fmt.Errorf("missing Authorization header")
+		}
+		if requested != "" && requested != v.cfg.AnonymousRole {
+			return nil, http.StatusForbidden, fmt.Errorf("role %q is not allowed for unauthenticated requests", requested)
 		}
 		return &rbac.Identity{Role: v.cfg.AnonymousRole, Claims: map[string]any{}}, 0, nil
 	}
@@ -128,29 +153,64 @@ func (v *Verifier) Identify(r *http.Request) (*rbac.Identity, int, error) {
 		return nil, http.StatusUnauthorized, fmt.Errorf("invalid token: %w", err)
 	}
 
+	role, err := v.defaultRole(r, claims)
+	if err != nil {
+		return nil, http.StatusForbidden, err
+	}
+	if requested != "" && requested != role {
+		if err := v.checkRequested(r, claims, requested); err != nil {
+			return nil, http.StatusForbidden, err
+		}
+		role = requested
+	}
+	return &rbac.Identity{Role: role, Claims: claims}, 0, nil
+}
+
+// defaultRole resolves the role a verified caller gets without the role
+// header: from the role resolver when one is set, else from the role claim.
+func (v *Verifier) defaultRole(r *http.Request, claims jwt.MapClaims) (string, error) {
 	if v.resolver != nil {
 		role, err := v.resolver(r.Context(), claims)
 		if err != nil {
-			return nil, http.StatusForbidden, err
+			return "", err
 		}
 		if !v.roles[role] {
-			return nil, http.StatusForbidden, fmt.Errorf("role %q (from the identity table) is not configured", role)
+			return "", fmt.Errorf("role %q (from the identity table) is not configured", role)
 		}
-		return &rbac.Identity{Role: role, Claims: claims}, 0, nil
+		return role, nil
 	}
 
 	roleValue, ok := rbac.LookupClaim(claims, v.cfg.RoleClaim)
 	if !ok {
-		return nil, http.StatusForbidden, fmt.Errorf("token has no %q claim", v.cfg.RoleClaim)
+		return "", fmt.Errorf("token has no %q claim", v.cfg.RoleClaim)
 	}
 	role, ok := roleValue.(string)
 	if !ok {
-		return nil, http.StatusForbidden, fmt.Errorf("token claim %q is not a string", v.cfg.RoleClaim)
+		return "", fmt.Errorf("token claim %q is not a string", v.cfg.RoleClaim)
 	}
 	if !v.roles[role] {
-		return nil, http.StatusForbidden, fmt.Errorf("role %q is not configured", role)
+		return "", fmt.Errorf("role %q is not configured", role)
 	}
-	return &rbac.Identity{Role: role, Claims: claims}, 0, nil
+	return role, nil
+}
+
+// checkRequested verifies that a caller may act as the role it requested
+// with the role header.
+func (v *Verifier) checkRequested(r *http.Request, claims jwt.MapClaims, requested string) error {
+	if v.allowed == nil {
+		return fmt.Errorf("role %q is not allowed: no allowed roles are configured, so %s may only name the caller's own role", requested, v.cfg.RoleHeader)
+	}
+	allowed, err := v.allowed(r.Context(), claims)
+	if err != nil {
+		return err
+	}
+	if !slices.Contains(allowed, requested) {
+		return fmt.Errorf("role %q is not among the caller's allowed roles", requested)
+	}
+	if !v.roles[requested] {
+		return fmt.Errorf("role %q is not configured", requested)
+	}
+	return nil
 }
 
 // Middleware authenticates the request and stores the identity in the context.

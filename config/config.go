@@ -33,6 +33,10 @@ type Config struct {
 	// keys, declared relationships, custom GraphQL names, descriptions and
 	// deprecations (see TableConfig). Keyed by SQL table name.
 	Tables map[string]*TableConfig `yaml:"tables"`
+	// JSONTypes declares named object shapes for JSON columns. A column opts
+	// in with tables.<t>.columns.<c>.json_type; without that, a JSON column
+	// stays the opaque JSON scalar. Keyed by GraphQL type name.
+	JSONTypes map[string]*JSONType `yaml:"json_types"`
 }
 
 // HooksConfig wires custom logic to the API. Hook names referenced here are
@@ -120,6 +124,12 @@ type Server struct {
 	// one is replaced by a response_too_large error. 0 (the default) =
 	// unlimited.
 	MaxResponseBytes int `yaml:"max_response_bytes"`
+	// MaxParallelRootFields caps how many root fields of one query
+	// operation run at the same time (each on its own pooled connection).
+	// 0 (the default) picks min(4, database.max_open_conns/2), at least 1;
+	// 1 runs them one after another. Mutations always run serially. It may
+	// not exceed database.max_open_conns.
+	MaxParallelRootFields int `yaml:"max_parallel_root_fields"`
 }
 
 // CORS configures cross-origin access (useful when GraphiQL or a SPA runs on
@@ -151,6 +161,31 @@ type JWT struct {
 	// AnonymousRole is assumed when no Authorization header is present.
 	// If empty, unauthenticated requests are rejected with 401.
 	AnonymousRole string `yaml:"anonymous_role"`
+	// AllowedRolesClaim is a dot path to the claim listing the roles the
+	// caller may switch to with the role header (a JSON array of role names,
+	// or one comma-separated string). The role from role_claim / role_lookup
+	// stays the default and is always allowed. Alternatively the list comes
+	// from the database (role_lookup.allowed_roles_column / _table).
+	AllowedRolesClaim string `yaml:"allowed_roles_claim"`
+	// RoleHeader is the request header a client sends to act as one of its
+	// allowed roles for that request. Default "X-Gqlgate-Role". A requested
+	// role outside the allowed list is rejected with 403; without an
+	// allowed-roles source only the caller's own role may be requested.
+	RoleHeader string `yaml:"role_header"`
+}
+
+// DefaultRoleHeader is the default jwt.role_header.
+const DefaultRoleHeader = "X-Gqlgate-Role"
+
+// AllowedRolesFromDB reports whether the allowed roles come from the
+// identity database (role_lookup.allowed_roles_column or _table).
+func (j JWT) AllowedRolesFromDB() bool {
+	return j.RoleLookup.AllowedRolesColumn != "" || j.RoleLookup.AllowedRolesTable != nil
+}
+
+// AllowedRolesConfigured reports whether any allowed-roles source is set.
+func (j JWT) AllowedRolesConfigured() bool {
+	return j.AllowedRolesClaim != "" || j.AllowedRolesFromDB()
 }
 
 // RoleLookup describes the identity table your signup service maintains.
@@ -176,8 +211,28 @@ type RoleLookup struct {
 	UsernameColumn *string `yaml:"username_column"`
 	PasswordColumn *string `yaml:"password_column"`
 	// CacheSeconds caches id->role lookups. 0 (default) queries on every
-	// request, so role changes and deletions take effect immediately.
+	// request, so role changes and deletions take effect immediately. It
+	// applies to the allowed-roles lookup too.
 	CacheSeconds int `yaml:"cache_seconds"`
+	// AllowedRolesColumn is a column of the identity table listing the
+	// roles the user may switch to with the role header: a JSON array of
+	// role names or a comma-separated string. Optional.
+	AllowedRolesColumn string `yaml:"allowed_roles_column"`
+	// AllowedRolesTable lists the allowed roles one row per (user, role)
+	// instead. Optional; at most one allowed-roles source may be set.
+	AllowedRolesTable *AllowedRolesTable `yaml:"allowed_roles_table"`
+}
+
+// AllowedRolesTable is a (user id, role) table holding the roles each user
+// may switch to with the role header.
+type AllowedRolesTable struct {
+	Table string `yaml:"table"`
+	// Schema defaults to the identity table's schema.
+	Schema string `yaml:"schema"`
+	// IDColumn is matched against the role_lookup id claim. Default "user_id".
+	IDColumn string `yaml:"id_column"`
+	// RoleColumn holds one role name per row. Default "role".
+	RoleColumn string `yaml:"role_column"`
 }
 
 // Enabled reports whether DB role resolution is configured.
@@ -418,6 +473,19 @@ func (c *Config) applyDefaults() {
 	if c.JWT.RoleClaim == "" {
 		c.JWT.RoleClaim = "role"
 	}
+	if c.JWT.RoleHeader == "" {
+		c.JWT.RoleHeader = DefaultRoleHeader
+	}
+	if c.Server.MaxParallelRootFields == 0 {
+		n := c.Database.MaxOpenConns / 2
+		if n > 4 {
+			n = 4
+		}
+		if n < 1 {
+			n = 1
+		}
+		c.Server.MaxParallelRootFields = n
+	}
 	if c.JWT.RoleLookup.Enabled() {
 		rl := &c.JWT.RoleLookup
 		if rl.Schema == "" {
@@ -439,6 +507,17 @@ func (c *Config) applyDefaults() {
 		if rl.PasswordColumn == nil {
 			s := "password"
 			rl.PasswordColumn = &s
+		}
+		if at := rl.AllowedRolesTable; at != nil {
+			if at.Schema == "" {
+				at.Schema = rl.Schema
+			}
+			if at.IDColumn == "" {
+				at.IDColumn = "user_id"
+			}
+			if at.RoleColumn == "" {
+				at.RoleColumn = "role"
+			}
 		}
 	}
 	if c.SchemaGen.DefaultPageSize == 0 {
@@ -502,13 +581,55 @@ func (c *Config) validate() error {
 	if c.Server.MaxResponseBytes < 0 {
 		return fmt.Errorf("server.max_response_bytes must be >= 0 (0 = unlimited)")
 	}
+	if n := c.Server.MaxParallelRootFields; n < 0 {
+		return fmt.Errorf("server.max_parallel_root_fields must be >= 0 (0 = default, 1 = serial)")
+	} else if n > c.Database.MaxOpenConns {
+		return fmt.Errorf("server.max_parallel_root_fields (%d) exceeds database.max_open_conns (%d): one request could take every pooled connection", n, c.Database.MaxOpenConns)
+	}
+	if err := c.validateRoleSelection(); err != nil {
+		return err
+	}
 	if err := c.validateChecks(); err != nil {
 		return err
 	}
 	if err := c.validateTables(); err != nil {
 		return err
 	}
+	if err := c.validateJSONTypes(); err != nil {
+		return err
+	}
 	return c.validateFilterSurface()
+}
+
+// headerNamePattern is an HTTP header field name (an RFC 9110 token).
+var headerNamePattern = regexp.MustCompile("^[A-Za-z0-9!#$%&'*+.^_`|~-]+$")
+
+// validateRoleSelection checks the allowed-roles source and the role header.
+func (c *Config) validateRoleSelection() error {
+	j := c.JWT
+	if !headerNamePattern.MatchString(j.RoleHeader) {
+		return fmt.Errorf("jwt.role_header %q is not a valid HTTP header name", j.RoleHeader)
+	}
+	if strings.EqualFold(j.RoleHeader, "Authorization") || strings.EqualFold(j.RoleHeader, "Content-Type") {
+		return fmt.Errorf("jwt.role_header cannot be %s", j.RoleHeader)
+	}
+	rl := j.RoleLookup
+	sources := 0
+	for _, set := range []bool{j.AllowedRolesClaim != "", rl.AllowedRolesColumn != "", rl.AllowedRolesTable != nil} {
+		if set {
+			sources++
+		}
+	}
+	if sources > 1 {
+		return fmt.Errorf("jwt: set at most one of allowed_roles_claim, role_lookup.allowed_roles_column and role_lookup.allowed_roles_table")
+	}
+	if j.AllowedRolesFromDB() && !rl.Enabled() {
+		return fmt.Errorf("jwt.role_lookup.allowed_roles_column / allowed_roles_table need jwt.role_lookup.table (the user id is matched through it)")
+	}
+	if at := rl.AllowedRolesTable; at != nil && at.Table == "" {
+		return fmt.Errorf("jwt.role_lookup.allowed_roles_table.table is required")
+	}
+	return nil
 }
 
 // validateChecks rejects write checks where they have no meaning: a check
