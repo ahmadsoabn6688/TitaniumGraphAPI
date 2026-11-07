@@ -27,8 +27,8 @@
 //	    })
 //	}
 //
-// Registered names are referenced from the YAML hooks: section exactly like
-// script hooks; registered custom fields are mounted automatically.
+// Registered names are referenced from the YAML hooks: section; registered
+// custom fields and object fields are mounted automatically.
 package register
 
 import (
@@ -49,12 +49,17 @@ type (
 	CustomFieldDef = schema.CustomField
 	// RoleResolverFunc maps verified JWT claims to a role name.
 	RoleResolverFunc = auth.RoleResolver
+	// ObjectFieldDef is a computed field on a generated table object type.
+	ObjectFieldDef = schema.ObjectField
+	// ObjectFieldParams is what an object field resolver receives per row.
+	ObjectFieldParams = schema.ObjectFieldParams
 )
 
 var (
 	mu           sync.Mutex
 	hooks        = map[string]MutationHookFunc{}
 	fields       []CustomFieldDef
+	objFields    []ObjectFieldDef
 	roleResolver RoleResolverFunc
 )
 
@@ -78,8 +83,27 @@ func CustomField(cf CustomFieldDef) {
 	fields = append(fields, cf)
 }
 
-// RoleResolver registers a custom role resolver. Only one may be registered;
-// an explicit gqlgate.WithRoleResolver option takes precedence over it.
+// ObjectField attaches a computed field to a generated table object type,
+// e.g. users.avatar_url. It is mounted for every role in AllowedRoles (all
+// roles if empty) that can read the table and every column in Requires; its
+// resolver receives those parent columns, the field's arguments, the
+// caller's role and claims and the DB pool. Prefer ResolveBatch for fields
+// that query the database or a service (one call per wave of rows instead
+// of one per row). Registering the same table+name twice fails at startup.
+func ObjectField(def ObjectFieldDef) {
+	mu.Lock()
+	defer mu.Unlock()
+	objFields = append(objFields, def)
+}
+
+// RegisteredObjectFields returns a snapshot of the registered object fields.
+func RegisteredObjectFields() []ObjectFieldDef {
+	mu.Lock()
+	defer mu.Unlock()
+	return append([]ObjectFieldDef{}, objFields...)
+}
+
+// RoleResolver registers a custom role resolver. Only one may be registered.
 func RoleResolver(fn RoleResolverFunc) {
 	mu.Lock()
 	defer mu.Unlock()
@@ -108,5 +132,6 @@ func Reset() {
 	defer mu.Unlock()
 	hooks = map[string]MutationHookFunc{}
 	fields = nil
+	objFields = nil
 	roleResolver = nil
 }

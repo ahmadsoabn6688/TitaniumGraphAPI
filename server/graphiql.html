@@ -14,6 +14,7 @@
   <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
   <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
   <script crossorigin src="https://unpkg.com/graphiql@3/graphiql.min.js"></script>
+  <script crossorigin src="https://unpkg.com/graphql-ws@5.16.0/umd/graphql-ws.min.js"></script>
   <script>
     const url = window.location.pathname;
     const root = ReactDOM.createRoot(document.getElementById('graphiql'));
@@ -27,21 +28,39 @@
     let lastAuth = '';
     let debounce;
 
-    // Returns the Authorization value ('' when absent), or null while the
-    // headers text is not valid JSON (the user is mid-edit).
-    function authFrom(headersText) {
+    // Subscriptions run over WebSocket (graphql-transport-ws) on the same
+    // path. Browsers cannot set headers on a WebSocket, so the Headers tab
+    // travels in the connection_init payload instead; a socket opens lazily
+    // with the first subscription and closes after the last one.
+    const wsUrl = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + url;
+    let wsHeaders = {};
+    let wsClient = null;
+
+    // Returns the parsed headers, or null while the headers text is not
+    // valid JSON (the user is mid-edit).
+    function headersFrom(headersText) {
       try {
         const headers = JSON.parse(headersText || '{}');
-        const key = Object.keys(headers).find(k => k.toLowerCase() === 'authorization');
-        return key ? String(headers[key]).trim() : '';
+        return headers && typeof headers === 'object' ? headers : null;
       } catch {
         return null;
       }
     }
 
+    // Returns the Authorization value ('' when absent), or null while the
+    // headers text is not valid JSON.
+    function authFrom(headersText) {
+      const headers = headersFrom(headersText);
+      if (headers === null) return null;
+      const key = Object.keys(headers).find(k => k.toLowerCase() === 'authorization');
+      return key ? String(headers[key]).trim() : '';
+    }
+
     function onEditHeaders(text) {
       clearTimeout(debounce);
       debounce = setTimeout(() => {
+        const headers = headersFrom(text);
+        if (headers !== null) wsHeaders = headers;
         const auth = authFrom(text);
         if (auth === null || auth === lastAuth) return;
         lastAuth = auth;
@@ -50,8 +69,12 @@
     }
 
     function render(headers) {
+      if (wsClient) wsClient.dispose();
+      wsClient = window.graphqlWs
+        ? graphqlWs.createClient({ url: wsUrl, connectionParams: () => wsHeaders })
+        : null;
       root.render(React.createElement(GraphiQL, {
-        fetcher: GraphiQL.createFetcher({ url, headers }),
+        fetcher: GraphiQL.createFetcher(wsClient ? { url, headers, wsClient } : { url, headers }),
         onEditHeaders,
         defaultEditorToolsVisibility: 'headers',
         // Empty (valid JSON) so Docs/introspection and anonymous-role queries

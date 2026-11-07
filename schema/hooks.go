@@ -73,9 +73,10 @@ func (c CustomField) allows(role string) bool {
 // Construct it with NewHooks (gqlgate.Open does this from the YAML wiring plus
 // the Go-provided implementations).
 type Hooks struct {
-	before map[string][]MutationHookFunc // key: HookKey(table, op)
-	after  map[string][]MutationHookFunc
-	fields []CustomField
+	before    map[string][]MutationHookFunc // key: HookKey(table, op)
+	after     map[string][]MutationHookFunc
+	fields    []CustomField
+	objFields []ObjectField
 }
 
 // HookKey is the map key used for per-(table, op) hook lookup. Exported so the
@@ -88,6 +89,17 @@ func HookKey(table string, op MutationOp) string {
 // Any of the arguments may be nil/empty.
 func NewHooks(before, after map[string][]MutationHookFunc, fields []CustomField) *Hooks {
 	return &Hooks{before: before, after: after, fields: fields}
+}
+
+// SetObjectFields installs the computed fields hooks attach to table object
+// types (see ObjectField).
+func (h *Hooks) SetObjectFields(defs []ObjectField) { h.objFields = defs }
+
+func (h *Hooks) objectFields() []ObjectField {
+	if h == nil {
+		return nil
+	}
+	return h.objFields
 }
 
 // runBefore runs the before-hooks registered for (table, op). It looks up both
@@ -136,4 +148,97 @@ func (h *Hooks) customFieldsFor(role, operation string) []CustomField {
 		}
 	}
 	return out
+}
+
+// customTypeNames returns the names of every named type the custom fields
+// use (their result and argument types, and the types those reach), so
+// generated type names can stay clear of them.
+func (h *Hooks) customTypeNames() map[string]bool {
+	names := map[string]bool{}
+	if h == nil {
+		return names
+	}
+	for _, cf := range h.fields {
+		if cf.Field == nil {
+			continue
+		}
+		collectTypeNames(cf.Field.Type, names)
+		for _, a := range cf.Field.Args {
+			if a != nil {
+				collectTypeNames(a.Type, names)
+			}
+		}
+	}
+	for _, of := range h.objFields {
+		collectTypeNames(of.Type, names)
+		for _, a := range of.Args {
+			if a != nil {
+				collectTypeNames(a.Type, names)
+			}
+		}
+	}
+	return names
+}
+
+// collectTypeNames adds t's named type and every named type reachable from
+// it (fields, arguments, interfaces, union members) to seen.
+func collectTypeNames(t graphql.Type, seen map[string]bool) {
+	switch x := t.(type) {
+	case nil:
+		return
+	case *graphql.List:
+		if x != nil {
+			collectTypeNames(x.OfType, seen)
+		}
+		return
+	case *graphql.NonNull:
+		if x != nil {
+			collectTypeNames(x.OfType, seen)
+		}
+		return
+	case *graphql.Object:
+		if x == nil || seen[x.Name()] {
+			return
+		}
+		seen[x.Name()] = true
+		for _, i := range x.Interfaces() {
+			collectTypeNames(i, seen)
+		}
+		collectFieldTypes(x.Fields(), seen)
+	case *graphql.Interface:
+		if x == nil || seen[x.Name()] {
+			return
+		}
+		seen[x.Name()] = true
+		collectFieldTypes(x.Fields(), seen)
+	case *graphql.Union:
+		if x == nil || seen[x.Name()] {
+			return
+		}
+		seen[x.Name()] = true
+		for _, o := range x.Types() {
+			collectTypeNames(o, seen)
+		}
+	case *graphql.InputObject:
+		if x == nil || seen[x.Name()] {
+			return
+		}
+		seen[x.Name()] = true
+		for _, f := range x.Fields() {
+			collectTypeNames(f.Type, seen)
+		}
+	default:
+		if n := t.Name(); n != "" {
+			seen[n] = true
+		}
+	}
+}
+
+func collectFieldTypes(fields graphql.FieldDefinitionMap, seen map[string]bool) {
+	for _, f := range fields {
+		collectTypeNames(f.Type, seen)
+		for _, a := range f.Args {
+			collectTypeNames(a.Type, seen)
+		}
+	}
 }

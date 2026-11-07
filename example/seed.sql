@@ -15,6 +15,9 @@ CREATE TABLE users (
     is_active  TINYINT(1)    NOT NULL DEFAULT 1,
     balance    DECIMAL(10,2) NOT NULL DEFAULT 0.00,
     metadata   JSON          NULL,
+    -- roles the user may switch to with the X-Gqlgate-Role header
+    -- (jwt.role_lookup.allowed_roles_column): a JSON array or "a, b"
+    allowed_roles VARCHAR(200) NULL,
     created_at TIMESTAMP     NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -47,6 +50,9 @@ INSERT INTO users (id, username, password, role, name, email, is_active, balance
   (2, 'grace', '$2a$10$devhash.grace', 'author', 'Grace Hopper',  'grace@example.com', 1,  75.00, '{"tags": ["navy"], "tier": "silver"}'),
   (3, 'alan',  '$2a$10$devhash.alan',  'author', 'Alan Turing',   'alan@example.com',  0,   0.00, NULL),
   (4, 'root',  '$2a$10$devhash.root',  'admin',  'Root Admin',    'root@example.com',  1,   0.00, NULL);
+
+-- root may also act as an author (send X-Gqlgate-Role: author).
+UPDATE users SET allowed_roles = '["author"]' WHERE id = 4;
 
 INSERT INTO posts (id, author_id, title, body, published, views, rating, published_on) VALUES
   (1, 1, 'Notes on the Analytical Engine', 'First program ever written.',        1, 420, 4.9, '2026-01-15'),
@@ -82,3 +88,20 @@ CREATE TABLE audit_log (
     row_count  INT         NOT NULL,
     created_at TIMESTAMP   NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+
+-- A view. Views are read-only in the API and only exposed to roles that name
+-- them; gqlgate.yaml (tables.post_stats) declares its key and relationships.
+CREATE VIEW post_stats AS
+    SELECT p.id AS post_id, p.author_id, COUNT(c.id) AS comment_count, MAX(c.created_at) AS last_comment_at
+    FROM posts p LEFT JOIN comments c ON c.post_id = p.id
+    GROUP BY p.id, p.author_id;
+
+-- No primary key and no foreign key: gqlgate.yaml declares a logical key and
+-- the posts.tags relationship. The COMMENTs become GraphQL descriptions
+-- (schema_gen.descriptions_from_comments).
+CREATE TABLE post_tags (
+    post_id BIGINT      NOT NULL COMMENT 'The tagged post',
+    tag     VARCHAR(30) NOT NULL COMMENT 'Lower-case tag'
+) COMMENT 'Free-form tags on posts';
+INSERT INTO post_tags (post_id, tag) VALUES
+    (1, 'history'), (1, 'math'), (3, 'compilers'), (4, 'math');

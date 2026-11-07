@@ -31,6 +31,10 @@ func TestCheckNameCollisions(t *testing.T) {
 		{"reserved type order_by", []string{"order_by"}, "collides"},
 		{"reserved mutation_response", []string{"mutation_response"}, "collides"},
 		{"bool_exp clash", []string{"users", "users_bool_exp"}, "collides"},
+		// A table named <t>_approx must not collide with <t>'s aggregate
+		// types (approx_count_distinct's type once ended in count_distinct's).
+		{"approx suffix table", []string{"events", "events_approx"}, ""},
+		{"stats suffix tables", []string{"events", "events_stddev", "events_var", "events_count"}, ""},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -45,5 +49,31 @@ func TestCheckNameCollisions(t *testing.T) {
 				t.Errorf("got %v, want error containing %q", err, tc.wantErr)
 			}
 		})
+	}
+}
+
+// TestAggTypeSuffixesUnambiguous: no per-table type suffix may be a proper
+// suffix of another, or tables <t> and <t>_<x> would generate the same type
+// name (the collision check would then reject a valid schema).
+func TestAggTypeSuffixesUnambiguous(t *testing.T) {
+	types, err := reservedNames(cat("t"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var suffixes []string
+	for name, owner := range types {
+		if owner == "table t" && name != "t" {
+			suffixes = append(suffixes, strings.TrimPrefix(name, "t"))
+		}
+	}
+	if len(suffixes) < len(aggFuncs) {
+		t.Fatalf("suffixes = %v", suffixes)
+	}
+	for _, a := range suffixes {
+		for _, b := range suffixes {
+			if a != b && strings.HasSuffix(a, b) {
+				t.Errorf("type suffix %q ends with %q: tables x and x%s would collide", a, b, strings.TrimSuffix(a, b))
+			}
+		}
 	}
 }

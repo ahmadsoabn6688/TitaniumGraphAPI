@@ -22,6 +22,17 @@ server:
   graphiql: true          # dev IDE on GET /graphql — turn off in production
   debug: true             # logs SQL, exposes DB errors — turn off in production
   hot_reload: true        # edit this file and save; no restart needed
+  max_response_rows: 10000  # fail requests that would return more rows (0 = no limit)
+  max_parallel_root_fields: 4  # independent query root fields run concurrently (1 = serial)
+  # Live queries over WebSocket (graphql-transport-ws) on the same path; a
+  # role subscribes to a table with select.subscribe: true (see roles below).
+  # In GraphiQL, as an author:
+  #   subscription { posts_connection(where: {published: {_eq: false}}) { nodes { id title } } }
+  subscriptions:
+    poll_interval_ms: 1000      # re-run every second, push only on change
+    max_subscriptions_per_connection: 20
+    max_connections_per_identity: 10  # sockets per user (anonymous: per client address)
+    reauth_interval_seconds: 10 # re-check the token and users.role this often
   cors:
     enabled: true
     allowed_origins: ["*"]
@@ -36,17 +47,103 @@ jwt:
     role_column: role
     username_column: username
     password_column: password
+    # Roles a user may switch to per request with the X-Gqlgate-Role header
+    # (the role column above stays the default). In the seed, root (id 4,
+    # admin) may act as author to see what authors see.
+    allowed_roles_column: allowed_roles
   anonymous_role: anonymous
   leeway_seconds: 30
 
 schema_gen:
   default_page_size: 25
   max_page_size: 200
+  # Extra comparison operators for `where` ({column} is the quoted column,
+  # each {value} a bound parameter), e.g. posts(where: {published_on: {_year_eq: 2026}}).
+  custom_operators:
+    - name: _year_eq
+      argument: Int
+      applies_to: [Date, DateTime]
+      sql: "YEAR({column}) = {value}"
+  # Row counts (posts_aggregate.count, total_count, affected_rows) as 64-bit
+  # BigInt. Without this line they stay Int! (the backward-compatible default).
+  count_type: BigInt
+  # TiDB table/column COMMENTs become the GraphQL descriptions (opt-in: they
+  # are visible to every role that can read the table).
+  descriptions_from_comments: true
+
+# Per-table modeling: logical keys for views / keyless tables, relationships
+# without foreign keys, GraphQL names, descriptions and deprecations.
+tables:
+  post_stats:             # a view (see example/seed.sql)
+    primary_key: [post_id]  # not enforced: gives post_stats_connection / _by_pk
+    description: "Comment statistics per post."
+    columns:
+      comment_count: commentCount
+    relationships:
+      post: {type: object, target: posts, mapping: {post_id: id}}
+  post_tags:              # a table without a primary key
+    primary_key: [post_id, tag]
+  posts:
+    relationships:
+      stats: {type: object, target: post_stats, mapping: {id: post_id}}
+      tags: {type: array, target: post_tags, mapping: {id: post_id}}
+    subscriptions:
+      root_fields:
+        aggregate: 5000   # posts_aggregate live counts poll every 5s
+  users:
+    columns:
+      metadata: {json_type: UserMetadata}   # typed instead of an opaque JSON value
+
+# Shapes for JSON columns: users { metadata { tier tags } }
+json_types:
+  UserMetadata:
+    description: "Profile data kept in users.metadata."
+    fields:
+      tier: String
+      tags: "[String]"
+
+# Parameterized read-only SQL as root query fields (arguments are always
+# bound, never spliced in). Try, as admin:
+#   { author_activity(args: {since: "2026-02-01"}) { name posts views view_rank author { email } } }
+# and as an author (the `author` argument is preset from the token):
+#   { comment_inbox_connection(first: 2) { nodes { post_title body commenter { name } } page_info { end_cursor } } }
+native_queries:
+  author_activity:
+    description: "Publishing activity per author, ranked by views."
+    sql: |
+      SELECT u.id AS author_id, u.name, COUNT(p.id) AS posts,
+             SUM(p.views) AS views,
+             RANK() OVER (ORDER BY SUM(p.views) DESC) AS view_rank
+      FROM users u JOIN posts p ON p.author_id = u.id
+      WHERE p.published = 1 AND (:since IS NULL OR p.published_on >= :since)
+      GROUP BY u.id, u.name
+    arguments:
+      since: {type: Date, description: "Only posts published on or after this day"}
+    columns:
+      posts: BigInt!
+    key: [author_id]
+    relationships:
+      author: {type: object, target: users, mapping: {author_id: id}}
+  comment_inbox:
+    description: "Comments on one author's posts."
+    sql: |
+      SELECT c.id AS comment_id, c.post_id, p.title AS post_title, c.user_id, c.body, c.created_at
+      FROM comments c JOIN posts p ON p.id = c.post_id
+      WHERE p.author_id = :author
+    arguments:
+      author: BigInt!
+    key: [comment_id]
+    relationships:
+      post: {type: object, target: posts, mapping: {post_id: id}}
+      commenter: {type: object, target: users, mapping: {user_id: id}}
 
 # Custom logic lives in the hooks/ directory (compiled in on build; any Go
-# library allowed). Activate the sample: rename hooks/signup.go.sample to
+# library allowed). hooks/avatar.go.sample adds computed fields to the users
+# type (avatar_url, published_posts): rename it to .go and rebuild. To
+# activate the other sample, rename hooks/signup.go.sample to
 # hooks/signup.go, rebuild, and uncomment the wiring below (the sample
-# registers `validate_post`; its `signup` mutation mounts automatically):
+# registers `validate_post`; its `signup_author` mutation mounts
+# automatically next to the `signup`/`signin` that hooks/auth.go provides):
 # hooks:
 #   tables:
 #     posts:
@@ -60,6 +157,8 @@ roles:
         insert: true
         update: true
         delete: true
+      post_stats:         # views are never covered by "*"
+        select: true
       users:
         select:
           allow: true
@@ -67,6 +166,9 @@ roles:
         insert: true
         update: true
         delete: true
+    native_queries:       # granted by name only
+      author_activity: true
+      comment_inbox: true
 
   author:
     tables:
@@ -75,7 +177,9 @@ roles:
           allow: true
           columns: [id, name, is_active, created_at]
       posts:
-        select: true
+        select:
+          allow: true
+          subscribe: true   # live queries: posts_connection / _by_pk / _aggregate
         insert:
           allow: true
           columns: [title, body, published, published_on]
@@ -95,9 +199,23 @@ roles:
           columns: [post_id, body]
           presets:
             user_id: ":jwt.sub"
+          # every inserted comment must be on a post the author can see
+          check: "post_id IN (SELECT id FROM posts WHERE published = 1 OR author_id = :jwt.sub)"
         delete:
           allow: true
           filter: "user_id = :jwt.sub OR post_id IN (SELECT id FROM posts WHERE author_id = :jwt.sub)"
+      post_stats:
+        select:
+          allow: true
+          filter: "author_id = :jwt.sub"
+      post_tags:
+        select: true
+    native_queries:
+      author_activity: true
+      comment_inbox:
+        allow: true
+        presets:
+          author: ":jwt.sub"   # always the caller's own inbox; not a client argument
 
   anonymous:
     tables:
@@ -106,6 +224,15 @@ roles:
           allow: true
           columns: [id, author_id, title, body, published_on, created_at]
           filter: "published = 1"
+          # Public clients get an index-friendly filter surface: no
+          # regex / LIKE scans, and body is readable but not filterable.
+          filterable_columns:
+            id: all
+            author_id: all
+            title: [_eq, _in, _starts_with, _istarts_with, _icontains]
+            published_on: all
+            created_at: all
+          subscribe: true   # a live public feed; published = 1 applies on every poll
       users:
         select:
           allow: true
@@ -114,3 +241,18 @@ roles:
         select: true
       documents:
         select: true
+      post_tags:
+        select:
+          allow: true
+          # tags of drafts would reveal that the draft exists
+          filter: "post_id IN (SELECT id FROM posts WHERE published = 1)"
+      post_stats:
+        select:
+          allow: true
+          columns: [post_id, comment_count]
+          filter: "post_id IN (SELECT id FROM posts WHERE published = 1)"
+    native_queries:
+      author_activity:
+        allow: true
+        columns: [author_id, name, posts, view_rank]   # no raw view counts for the public
+        filter: "view_rank <= 3"

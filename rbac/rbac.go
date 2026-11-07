@@ -63,9 +63,48 @@ type OpAccess struct {
 	Columns   []*introspect.Column
 	ColumnSet map[string]bool
 	// Filter is the compiled row-level condition, nil when unrestricted.
+	// It is never set for insert (an insert filter becomes the Check).
 	Filter *Filter
+	// Check is the compiled write check (insert/update): every row the
+	// write produces must satisfy it, or the mutation is rolled back. nil =
+	// no check.
+	Check *Filter
+	// CheckFromFilter is true when an insert Check came from the rule's
+	// `filter` key (accepted for backward compatibility) rather than `check`.
+	CheckFromFilter bool
 	// Presets are server-forced column values for insert/update.
 	Presets []Preset
+
+	// Explicit is true when the rule came from a named table entry rather
+	// than the "*" wildcard (names that don't fit a table are errors for
+	// explicit rules and are skipped for wildcard ones).
+	Explicit bool
+	// FilterColumns restricts the columns usable in `where` (select only):
+	// nil = every readable column; otherwise column -> operator allow-list,
+	// where a nil list means every operator.
+	FilterColumns map[string][]string
+	// FilterOperators is the table-wide operator allow-list (nil = all,
+	// empty non-nil = none).
+	FilterOperators []string
+	// FilterRelationships lists the relationship fields usable in `where`
+	// (nil = every relationship the role can follow).
+	FilterRelationships []string
+	// Subscribe: the role may subscribe to the read root fields (select
+	// only; live queries re-run with this same permission).
+	Subscribe bool
+}
+
+// Filterable reports whether a readable column may appear in `where` at all
+// (operator allow-lists are applied by the schema builder).
+func (o *OpAccess) Filterable(col string) bool {
+	if !o.ColumnSet[col] {
+		return false
+	}
+	if o.FilterColumns == nil {
+		return true
+	}
+	_, ok := o.FilterColumns[col]
+	return ok
 }
 
 // Preset forces a column to a value on insert/update, overriding client input.
@@ -111,11 +150,21 @@ func Resolve(roleName string, role *config.Role, cat *introspect.Catalog) (*Acce
 	for _, tableName := range cat.TableOrder {
 		table := cat.Tables[tableName]
 		perm, explicit := role.Tables[tableName], true
-		if perm == nil {
+		if perm == nil && !table.IsView {
+			// The "*" wildcard covers base tables only: a view is exposed
+			// to a role only when the role names it.
 			perm, explicit = wildcard, false
 		}
 		if perm == nil {
 			continue
+		}
+		if table.IsView {
+			for i, p := range []*config.OpPerm{perm.Insert, perm.Update, perm.Delete} {
+				if p != nil && p.Allow {
+					op := []string{"insert", "update", "delete"}[i]
+					return nil, fmt.Errorf("role %q grants %s on %q, which is a view (views are read-only; grant select only)", roleName, op, tableName)
+				}
+			}
 		}
 		ta := &TableAccess{}
 		var err error
@@ -146,7 +195,7 @@ func resolveOp(roleName string, table *introspect.Table, op string, perm *config
 	if perm == nil || !perm.Allow {
 		return nil, nil
 	}
-	oa := &OpAccess{ColumnSet: map[string]bool{}}
+	oa := &OpAccess{ColumnSet: map[string]bool{}, Explicit: explicit}
 
 	if len(perm.Columns) == 0 {
 		oa.Columns = table.Columns
@@ -174,12 +223,41 @@ func resolveOp(roleName string, table *introspect.Table, op string, perm *config
 		oa.ColumnSet[c.Name] = true
 	}
 
+	if op == "select" {
+		if err := resolveFilterSurface(roleName, table, perm, oa, explicit); err != nil {
+			return nil, err
+		}
+		oa.Subscribe = perm.Subscribe
+	} else if perm.Subscribe {
+		return nil, fmt.Errorf("role %q, table %q: subscribe applies to select only, not %s", roleName, table.Name, op)
+	}
+
 	if perm.Filter != "" {
 		f, err := CompileFilter(perm.Filter)
 		if err != nil {
 			return nil, fmt.Errorf("role %q, table %q, %s filter: %w", roleName, table.Name, op, err)
 		}
-		oa.Filter = f
+		if op == "insert" {
+			// An insert has no existing rows to filter. Earlier versions
+			// accepted insert.filter and ignored it; it is enforced as the
+			// insert check instead, which is what it was meant to say.
+			oa.Check, oa.CheckFromFilter = f, true
+		} else {
+			oa.Filter = f
+		}
+	}
+	if perm.Check != "" {
+		if op != "insert" && op != "update" {
+			return nil, fmt.Errorf("role %q, table %q: check applies to insert and update only, not %s", roleName, table.Name, op)
+		}
+		if oa.Check != nil {
+			return nil, fmt.Errorf("role %q, table %q: insert has both filter and check; keep only check", roleName, table.Name)
+		}
+		f, err := CompileFilter(perm.Check)
+		if err != nil {
+			return nil, fmt.Errorf("role %q, table %q, %s check: %w", roleName, table.Name, op, err)
+		}
+		oa.Check = f
 	}
 
 	for col, val := range perm.Presets {
@@ -210,6 +288,50 @@ func resolveOp(roleName string, table *introspect.Table, op string, perm *config
 		}
 	}
 	return oa, nil
+}
+
+// resolveFilterSurface copies the select-only filter-surface settings onto oa,
+// checking that every filterable column exists and is readable. Wildcard rules
+// skip columns a particular table lacks.
+func resolveFilterSurface(roleName string, table *introspect.Table, perm *config.OpPerm, oa *OpAccess, explicit bool) error {
+	if fc := perm.FilterableColumns; fc != nil {
+		oa.FilterColumns = map[string][]string{}
+		for _, c := range fc.Names {
+			if !oa.ColumnSet[c] {
+				if !explicit {
+					continue
+				}
+				if !table.HasColumn(c) {
+					return fmt.Errorf("role %q, table %q, select.filterable_columns: column %q does not exist", roleName, table.Name, c)
+				}
+				return fmt.Errorf("role %q, table %q, select.filterable_columns: column %q is not readable by the role (add it to select.columns)", roleName, table.Name, c)
+			}
+			oa.FilterColumns[c] = fc.Ops[c] // nil = every operator
+		}
+	}
+	// An explicit empty list means "no operators", like filterable_columns:
+	// [] and filter_relationships: [] — never "all" (that would fail open).
+	if perm.FilterOperators != nil {
+		oa.FilterOperators = append([]string{}, (*perm.FilterOperators)...)
+	}
+	if perm.FilterRelationships != nil {
+		oa.FilterRelationships = append([]string{}, (*perm.FilterRelationships)...)
+	}
+	return nil
+}
+
+// ValidationSQL renders the filter with every claim reference replaced by
+// NULL, for a startup dry run that checks the SQL parses and that each
+// identifier resolves against the filter's own table.
+func (f *Filter) ValidationSQL() string {
+	var sb strings.Builder
+	for i, seg := range f.segments {
+		sb.WriteString(seg)
+		if i < len(f.paths) {
+			sb.WriteString("NULL")
+		}
+	}
+	return sb.String()
 }
 
 var (
@@ -319,4 +441,78 @@ func LookupClaim(claims map[string]any, path string) (any, bool) {
 		}
 	}
 	return nil, false
+}
+
+// NativeAccess is one role's access to one native query.
+type NativeAccess struct {
+	// Select carries the readable result columns, the row filter and the
+	// filter surface, exactly as for a table.
+	Select *OpAccess
+	// Presets force argument values (by argument name); the client cannot
+	// set or override a preset argument.
+	Presets map[string]ArgPreset
+}
+
+// ArgPreset forces one native query argument to a claim value or a literal.
+type ArgPreset struct {
+	Arg       string
+	ClaimPath string // set when the value comes from a JWT claim
+	Literal   string // used when ClaimPath is empty
+}
+
+// Value resolves the preset for the given claims. A missing claim is an
+// error (never "no preset"); only scalar claims can be bound. A JSON-null
+// claim resolves to nil, which the native query layer rejects (a preset never
+// binds NULL).
+func (p ArgPreset) Value(claims map[string]any) (any, error) {
+	if p.ClaimPath == "" {
+		return p.Literal, nil
+	}
+	v, ok := LookupClaim(claims, p.ClaimPath)
+	if !ok {
+		return nil, fmt.Errorf("argument preset %q needs JWT claim %q, which is missing from the token", p.Arg, p.ClaimPath)
+	}
+	switch v.(type) {
+	case string, float64, bool, nil:
+		return v, nil
+	default:
+		return nil, fmt.Errorf("JWT claim %q is not a scalar and cannot be used as an argument preset", p.ClaimPath)
+	}
+}
+
+// ResolveNative resolves one role's grant on a native query whose result
+// columns are described by table (a synthetic table named after the query)
+// and whose declared arguments are args. A nil or disallowed perm grants
+// nothing (nil, nil). Column, filter-surface and preset names are checked
+// like an explicit table rule: an unknown name is an error.
+func ResolveNative(roleName string, perm *config.OpPerm, table *introspect.Table, args map[string]bool) (*NativeAccess, error) {
+	if perm == nil || !perm.Allow {
+		return nil, nil
+	}
+	p := *perm
+	p.Presets = nil // argument presets, resolved below (not column presets)
+	if p.Check != "" {
+		return nil, fmt.Errorf("role %q, native query %q: check applies to table writes only", roleName, table.Name)
+	}
+	sel, err := resolveOp(roleName, table, "select", &p, true)
+	if err != nil {
+		return nil, err
+	}
+	na := &NativeAccess{Select: sel, Presets: map[string]ArgPreset{}}
+	for a, val := range perm.Presets {
+		if !args[a] {
+			return nil, fmt.Errorf("role %q, native query %q: preset %q is not a declared argument", roleName, table.Name, a)
+		}
+		ap := ArgPreset{Arg: a}
+		if path, ok := strings.CutPrefix(val, ":jwt."); ok {
+			if !claimPathPattern.MatchString(path) {
+				return nil, fmt.Errorf("role %q, native query %q: preset %q has an invalid claim path", roleName, table.Name, val)
+			}
+			ap.ClaimPath = path
+		} else {
+			ap.Literal = val
+		}
+		na.Presets[a] = ap
+	}
+	return na, nil
 }

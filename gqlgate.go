@@ -55,6 +55,7 @@ type Gate struct {
 	staticCfg  *config.Config // routing (path/cors/addr) fixed at Open
 	configPath string         // for hot reload; "" disables it
 	handler    http.Handler
+	server     *server.Server // owns the WebSocket (subscription) connections
 
 	state    atomic.Pointer[gateState]
 	reloadMu sync.Mutex // serializes reloads
@@ -108,23 +109,29 @@ func Open(ctx context.Context, cfg *config.Config, opts ...Option) (*Gate, error
 	// Wrap the handler so every request context carries the Gate; custom
 	// field resolvers reach it (and its DB) via gqlgate.FromContext. The
 	// server reads live cfg/schemas/verifier through currentServerState.
-	g.handler = g.injectContext(server.New(cfg, g.currentServerState, logger))
+	g.server = server.NewServer(cfg, g.currentServerState, logger)
+	g.handler = g.injectContext(g.server)
 	return g, nil
 }
 
 // buildState builds one serving generation (hooks, catalog, per-role schemas,
 // verifier) from cfg using the existing DB pool. Shared by Open and Reload.
 func (g *Gate) buildState(ctx context.Context, cfg *config.Config) (*gateState, error) {
-	hooks, err := buildHooks(cfg)
+	hooks, err := buildHooks(cfg, g.opts.objectFields...)
 	if err != nil {
 		return nil, err
 	}
-	catalog, err := introspect.Load(ctx, g.db, cfg.Database.Schema,
-		cfg.SchemaGen.Tables.Include, cfg.SchemaGen.Tables.Exclude)
+	// Views are exposed only when the config names them (a role rule, a
+	// tables: entry, a relationship target or the include list).
+	catalog, err := introspect.LoadWith(ctx, g.db, cfg.Database.Schema, introspect.Options{
+		Include: cfg.SchemaGen.Tables.Include,
+		Exclude: cfg.SchemaGen.Tables.Exclude,
+		Views:   cfg.NamedTables(),
+	})
 	if err != nil {
 		return nil, err
 	}
-	schemas, err := schema.BuildAll(schema.Options{
+	built, err := schema.Build(schema.Options{
 		DB:      g.db,
 		Catalog: catalog,
 		Config:  cfg,
@@ -153,8 +160,19 @@ func (g *Gate) buildState(ctx context.Context, cfg *config.Config) (*gateState, 
 	if err != nil {
 		return nil, err
 	}
+	// Roles a caller may switch to with the role header, from the identity
+	// database (a claim-based list is set up by auth.New itself).
+	if cfg.JWT.AllowedRolesFromDB() {
+		if err := validateAllowedRoles(ctx, g.db, cfg.JWT.RoleLookup); err != nil {
+			return nil, err
+		}
+		verifier.SetAllowedRoles(auth.NewDBAllowedRoles(g.db, cfg.JWT.RoleLookup))
+	}
 	return &gateState{
-		srv:     &server.State{Cfg: cfg, Schemas: schemas, Verifier: verifier},
+		srv: &server.State{
+			Cfg: cfg, Schemas: built.Schemas, Verifier: verifier,
+			PollIntervals: built.PollIntervals,
+		},
 		catalog: catalog,
 	}, nil
 }
@@ -194,6 +212,12 @@ func (g *Gate) Reload(ctx context.Context) error {
 func reloadCompatible(old, next *config.Config) error {
 	if old.Database.DSN() != next.Database.DSN() {
 		return fmt.Errorf("reload rejected: database connection/schema changed — restart required")
+	}
+	// The pool is sized once in Open. Accepting a new size without applying it
+	// would also let server.max_parallel_root_fields be validated against a
+	// pool larger than the one actually in use.
+	if old.Database.MaxOpenConns != next.Database.MaxOpenConns || old.Database.MaxIdleConns != next.Database.MaxIdleConns {
+		return fmt.Errorf("reload rejected: database.max_open_conns/max_idle_conns changed — restart required")
 	}
 	if old.Server.Host != next.Server.Host || old.Server.Port != next.Server.Port || old.Server.Path != next.Server.Path {
 		return fmt.Errorf("reload rejected: server host/port/path changed — restart required")
@@ -240,8 +264,14 @@ func (g *Gate) Addr() string {
 	return net.JoinHostPort(g.staticCfg.Server.Host, fmt.Sprintf("%d", g.staticCfg.Server.Port))
 }
 
-// Close releases the database pool.
-func (g *Gate) Close() error { return g.db.Close() }
+// Close closes the open WebSocket (subscription) connections, waiting up to
+// 5 seconds for them to finish, then releases the database pool.
+func (g *Gate) Close() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_ = g.server.Shutdown(ctx)
+	return g.db.Close()
+}
 
 // ListenAndServe serves until ctx is cancelled, then shuts down gracefully.
 // When server.hot_reload is on and a config path is known, it also watches the
@@ -252,6 +282,13 @@ func (g *Gate) ListenAndServe(ctx context.Context) error {
 		Handler:           g.handler,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
+	// http.Server.Shutdown does not wait for hijacked (WebSocket)
+	// connections; close them (code 1001) when it starts.
+	httpServer.RegisterOnShutdown(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = g.server.Shutdown(ctx)
+	})
 
 	if g.staticCfg.Server.HotReload && g.configPath != "" {
 		go g.watchConfig(ctx)
@@ -368,6 +405,42 @@ func validateRoleLookup(ctx context.Context, db *sql.DB, rl config.RoleLookup) e
 		if !cols[col] {
 			return fmt.Errorf("jwt.role_lookup: table %s.%s has no column %q (configured as %s; set it to \"\" to skip this check if it does not apply)",
 				rl.Schema, rl.Table, col, key)
+		}
+	}
+	return nil
+}
+
+// validateAllowedRoles checks at startup that the configured allowed-roles
+// column, or the allowed-roles table and its columns, exist.
+func validateAllowedRoles(ctx context.Context, db *sql.DB, rl config.RoleLookup) error {
+	if rl.AllowedRolesColumn != "" {
+		cols, err := introspect.TableColumns(ctx, db, rl.Schema, rl.Table)
+		if err != nil {
+			return err
+		}
+		if len(cols) == 0 {
+			return fmt.Errorf("jwt.role_lookup: identity table %s.%s does not exist", rl.Schema, rl.Table)
+		}
+		// "does not exist" lets startup retry while a seeder is still
+		// creating the column (see isNotReady).
+		for key, col := range map[string]string{"id_column": rl.IDColumn, "allowed_roles_column": rl.AllowedRolesColumn} {
+			if !cols[col] {
+				return fmt.Errorf("jwt.role_lookup: column %s.%s.%s (configured as %s) does not exist", rl.Schema, rl.Table, col, key)
+			}
+		}
+		return nil
+	}
+	at := rl.AllowedRolesTable
+	cols, err := introspect.TableColumns(ctx, db, at.Schema, at.Table)
+	if err != nil {
+		return err
+	}
+	if len(cols) == 0 {
+		return fmt.Errorf("jwt.role_lookup.allowed_roles_table: table %s.%s does not exist", at.Schema, at.Table)
+	}
+	for key, col := range map[string]string{"id_column": at.IDColumn, "role_column": at.RoleColumn} {
+		if !cols[col] {
+			return fmt.Errorf("jwt.role_lookup.allowed_roles_table: column %s.%s.%s (configured as %s) does not exist", at.Schema, at.Table, col, key)
 		}
 	}
 	return nil

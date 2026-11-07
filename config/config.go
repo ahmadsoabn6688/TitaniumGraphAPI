@@ -5,6 +5,10 @@
 //   - server:   HTTP listener + GraphiQL toggle (dev)
 //   - jwt:      how to *verify* tokens (issuance/signup is out of scope)
 //   - roles:    RBAC rules per role -> table -> operation
+//
+// plus the optional tables: section that shapes individual tables and views
+// (logical keys, declared relationships, GraphQL names, docs), json_types:
+// for typed JSON columns and native_queries: for parameterized SQL queries.
 package config
 
 import (
@@ -26,6 +30,18 @@ type Config struct {
 	SchemaGen SchemaGen        `yaml:"schema_gen"`
 	Roles     map[string]*Role `yaml:"roles"`
 	Hooks     HooksConfig      `yaml:"hooks"`
+	// Tables shapes individual tables and views in the API: logical primary
+	// keys, declared relationships, custom GraphQL names, descriptions and
+	// deprecations (see TableConfig). Keyed by SQL table name.
+	Tables map[string]*TableConfig `yaml:"tables"`
+	// JSONTypes declares named object shapes for JSON columns. A column opts
+	// in with tables.<t>.columns.<c>.json_type; without that, a JSON column
+	// stays the opaque JSON scalar. Keyed by GraphQL type name.
+	JSONTypes map[string]*JSONType `yaml:"json_types"`
+	// NativeQueries are read-only parameterized SQL statements exposed as
+	// root query fields (see NativeQuery). Keyed by query name, which is
+	// also the default root field name.
+	NativeQueries map[string]*NativeQuery `yaml:"native_queries"`
 }
 
 // HooksConfig wires custom logic to the API. Hook names referenced here are
@@ -103,6 +119,25 @@ type Server struct {
 	// HotReload is on. Default 2. (Polling is used rather than filesystem
 	// events because it is reliable across Docker bind mounts.)
 	ReloadIntervalSeconds int `yaml:"reload_interval_seconds"`
+	// MaxResponseRows caps the number of rows one request may read for its
+	// response (every page, relationship batch, vector search and mutation
+	// `returning` counts). A request that goes over fails with the error
+	// code response_too_large instead of returning a huge result. 0 (the
+	// default) = unlimited.
+	MaxResponseRows int `yaml:"max_response_rows"`
+	// MaxResponseBytes caps the size of the encoded JSON response; a larger
+	// one is replaced by a response_too_large error. 0 (the default) =
+	// unlimited.
+	MaxResponseBytes int `yaml:"max_response_bytes"`
+	// MaxParallelRootFields caps how many root fields of one query
+	// operation run at the same time (each on its own pooled connection).
+	// 0 (the default) picks min(4, database.max_open_conns/2), at least 1;
+	// 1 runs them one after another. Mutations always run serially. Above 1
+	// it must be less than database.max_open_conns.
+	MaxParallelRootFields int `yaml:"max_parallel_root_fields"`
+	// Subscriptions configures live queries over WebSocket (see
+	// Subscriptions).
+	Subscriptions Subscriptions `yaml:"subscriptions"`
 }
 
 // CORS configures cross-origin access (useful when GraphiQL or a SPA runs on
@@ -134,6 +169,31 @@ type JWT struct {
 	// AnonymousRole is assumed when no Authorization header is present.
 	// If empty, unauthenticated requests are rejected with 401.
 	AnonymousRole string `yaml:"anonymous_role"`
+	// AllowedRolesClaim is a dot path to the claim listing the roles the
+	// caller may switch to with the role header (a JSON array of role names,
+	// or one comma-separated string). The role from role_claim / role_lookup
+	// stays the default and is always allowed. Alternatively the list comes
+	// from the database (role_lookup.allowed_roles_column / _table).
+	AllowedRolesClaim string `yaml:"allowed_roles_claim"`
+	// RoleHeader is the request header a client sends to act as one of its
+	// allowed roles for that request. Default "X-Gqlgate-Role". A requested
+	// role outside the allowed list is rejected with 403; without an
+	// allowed-roles source only the caller's own role may be requested.
+	RoleHeader string `yaml:"role_header"`
+}
+
+// DefaultRoleHeader is the default jwt.role_header.
+const DefaultRoleHeader = "X-Gqlgate-Role"
+
+// AllowedRolesFromDB reports whether the allowed roles come from the
+// identity database (role_lookup.allowed_roles_column or _table).
+func (j JWT) AllowedRolesFromDB() bool {
+	return j.RoleLookup.AllowedRolesColumn != "" || j.RoleLookup.AllowedRolesTable != nil
+}
+
+// AllowedRolesConfigured reports whether any allowed-roles source is set.
+func (j JWT) AllowedRolesConfigured() bool {
+	return j.AllowedRolesClaim != "" || j.AllowedRolesFromDB()
 }
 
 // RoleLookup describes the identity table your signup service maintains.
@@ -159,8 +219,28 @@ type RoleLookup struct {
 	UsernameColumn *string `yaml:"username_column"`
 	PasswordColumn *string `yaml:"password_column"`
 	// CacheSeconds caches id->role lookups. 0 (default) queries on every
-	// request, so role changes and deletions take effect immediately.
+	// request, so role changes and deletions take effect immediately. It
+	// applies to the allowed-roles lookup too.
 	CacheSeconds int `yaml:"cache_seconds"`
+	// AllowedRolesColumn is a column of the identity table listing the
+	// roles the user may switch to with the role header: a JSON array of
+	// role names or a comma-separated string. Optional.
+	AllowedRolesColumn string `yaml:"allowed_roles_column"`
+	// AllowedRolesTable lists the allowed roles one row per (user, role)
+	// instead. Optional; at most one allowed-roles source may be set.
+	AllowedRolesTable *AllowedRolesTable `yaml:"allowed_roles_table"`
+}
+
+// AllowedRolesTable is a (user id, role) table holding the roles each user
+// may switch to with the role header.
+type AllowedRolesTable struct {
+	Table string `yaml:"table"`
+	// Schema defaults to the identity table's schema.
+	Schema string `yaml:"schema"`
+	// IDColumn is matched against the role_lookup id claim. Default "user_id".
+	IDColumn string `yaml:"id_column"`
+	// RoleColumn holds one role name per row. Default "role".
+	RoleColumn string `yaml:"role_column"`
 }
 
 // Enabled reports whether DB role resolution is configured.
@@ -171,7 +251,42 @@ type SchemaGen struct {
 	Tables          TableFilter `yaml:"tables"`
 	DefaultPageSize int         `yaml:"default_page_size"`
 	MaxPageSize     int         `yaml:"max_page_size"`
+	// CustomOperators are developer-defined comparison operators added to the
+	// <Scalar>_comparison_exp types of the scalars they apply to.
+	CustomOperators []CustomOperator `yaml:"custom_operators"`
+	// CountType is the GraphQL scalar of row counts (<t>_aggregate.count,
+	// <t>_connection.total_count and mutation_response.affected_rows):
+	// "Int" (the default, unchanged from earlier versions: GraphQL's 32-bit
+	// Int, so a count above 2147483647 fails the field) or "BigInt" (64-bit,
+	// recommended for new deployments and large tables; it changes the
+	// declared type of those fields, which matters to generated clients).
+	CountType string `yaml:"count_type"`
+	// DescriptionsFromComments uses the TiDB table and column COMMENTs as
+	// the GraphQL descriptions of the generated object types and column
+	// fields (a description under tables: still wins). Off by default:
+	// comments written for DBAs become visible in every role's schema.
+	DescriptionsFromComments bool `yaml:"descriptions_from_comments"`
+	// MutationResponse is the result type of the bulk mutations
+	// (insert_<t>, update_<t>, delete_<t>): "per_table" (the default) gives
+	// each table its own <t>_mutation_response with affected_rows and
+	// returning, all implementing the mutation_response interface;
+	// "shared" keeps the single mutation_response OBJECT with affected_rows
+	// only (no returning) that earlier versions generated, for clients whose
+	// generated types or caches depend on that typename.
+	MutationResponse string `yaml:"mutation_response"`
 }
+
+// Values accepted by schema_gen.mutation_response.
+const (
+	MutationResponsePerTable = "per_table"
+	MutationResponseShared   = "shared"
+)
+
+// Count scalar names accepted by schema_gen.count_type.
+const (
+	CountTypeBigInt = "BigInt"
+	CountTypeInt    = "Int"
+)
 
 // TableFilter narrows which tables of the schema are exposed.
 // Empty include list means "all tables". Exclude wins over include.
@@ -180,9 +295,17 @@ type TableFilter struct {
 	Exclude []string `yaml:"exclude"`
 }
 
-// Role maps table names (or "*" as fallback for any table) to permissions.
+// Role maps table names (or "*" as fallback for any table) to permissions,
+// and grants native queries by name.
 type Role struct {
 	Tables map[string]*TablePerm `yaml:"tables"`
+	// NativeQueries grants native queries to the role, keyed by query name
+	// (there is no wildcard). The permission takes the select shape: allow,
+	// columns (readable result columns), filter (a row filter over the
+	// result columns, :jwt.<claim> bound as parameters), the filter surface
+	// keys, and presets — server-forced ARGUMENT values (":jwt.<claim>" or a
+	// literal) that the client cannot set or override.
+	NativeQueries map[string]*OpPerm `yaml:"native_queries"`
 }
 
 // TablePerm holds per-operation permissions for one table.
@@ -204,13 +327,47 @@ type TablePerm struct {
 //	  allow: true
 //	  columns: ["id", "title"]        # for select: readable; insert/update: writable
 //	  filter: "author_id = :jwt.sub"  # row-level filter, claims bound as params
+//	  check: "status IN ('draft', 'review')"  # insert/update: every written row must satisfy it
 //	  presets:                        # insert/update: server-forced column values
 //	    author_id: ":jwt.sub"
+//
+// select additionally shapes the role's `where` surface (all optional; the
+// default is every readable column, every operator, every relationship):
+//
+//	select:
+//	  allow: true
+//	  filterable_columns:             # columns usable in where (+ per-column operators)
+//	    id: all
+//	    title: [_eq, _ilike, _starts_with]
+//	  filter_operators: [_eq, _in, _is_null, _ilike]  # table-wide operator allow-list
+//	  filter_relationships: [author]  # relationships usable in where ([] = none)
+//	  subscribe: true                 # live queries over WebSocket (default false)
 type OpPerm struct {
 	Allow   bool              `yaml:"allow"`
 	Columns []string          `yaml:"columns"`
 	Filter  string            `yaml:"filter"`
 	Presets map[string]string `yaml:"presets"`
+	// Subscribe lets the role subscribe to the table's read root fields
+	// (live queries over WebSocket, re-polled with this same permission).
+	// select (and native query grants) only; default false.
+	Subscribe bool `yaml:"subscribe"`
+	// Check is a row condition (same SQL + :jwt.<claim> syntax as Filter)
+	// that every row an insert writes, or an update leaves behind, must
+	// satisfy; otherwise the whole mutation is rolled back. insert/update
+	// only.
+	Check string `yaml:"check"`
+
+	// FilterableColumns restricts which readable columns appear in the
+	// role's <table>_bool_exp, optionally with per-column operator lists.
+	// nil = every readable column. select only.
+	FilterableColumns *FilterableColumns `yaml:"filterable_columns"`
+	// FilterOperators is a table-wide operator allow-list, intersected with
+	// any per-column list. nil = every operator; [] = none (no column
+	// filtering, and so no relationship filters either). select only.
+	FilterOperators *[]string `yaml:"filter_operators"`
+	// FilterRelationships lists the relationship fields usable in where.
+	// nil = every relationship the role can follow; [] = none. select only.
+	FilterRelationships *[]string `yaml:"filter_relationships"`
 }
 
 // UnmarshalYAML accepts either a bool or a mapping for an operation permission.
@@ -351,6 +508,19 @@ func (c *Config) applyDefaults() {
 	if c.JWT.RoleClaim == "" {
 		c.JWT.RoleClaim = "role"
 	}
+	if c.JWT.RoleHeader == "" {
+		c.JWT.RoleHeader = DefaultRoleHeader
+	}
+	if c.Server.MaxParallelRootFields == 0 {
+		n := c.Database.MaxOpenConns / 2
+		if n > 4 {
+			n = 4
+		}
+		if n < 1 {
+			n = 1
+		}
+		c.Server.MaxParallelRootFields = n
+	}
 	if c.JWT.RoleLookup.Enabled() {
 		rl := &c.JWT.RoleLookup
 		if rl.Schema == "" {
@@ -373,12 +543,31 @@ func (c *Config) applyDefaults() {
 			s := "password"
 			rl.PasswordColumn = &s
 		}
+		if at := rl.AllowedRolesTable; at != nil {
+			if at.Schema == "" {
+				at.Schema = rl.Schema
+			}
+			if at.IDColumn == "" {
+				at.IDColumn = "user_id"
+			}
+			if at.RoleColumn == "" {
+				at.RoleColumn = "role"
+			}
+		}
 	}
+	c.Server.Subscriptions.applyDefaults(c.Database.MaxOpenConns)
 	if c.SchemaGen.DefaultPageSize == 0 {
 		c.SchemaGen.DefaultPageSize = 25
 	}
 	if c.SchemaGen.MaxPageSize == 0 {
 		c.SchemaGen.MaxPageSize = 200
+	}
+	if c.SchemaGen.CountType == "" {
+		// Int keeps existing configs' schemas unchanged; BigInt is opt-in.
+		c.SchemaGen.CountType = CountTypeInt
+	}
+	if c.SchemaGen.MutationResponse == "" {
+		c.SchemaGen.MutationResponse = MutationResponsePerTable
 	}
 }
 
@@ -419,8 +608,102 @@ func (c *Config) validate() error {
 		return fmt.Errorf("schema_gen.default_page_size (%d) exceeds max_page_size (%d)",
 			c.SchemaGen.DefaultPageSize, c.SchemaGen.MaxPageSize)
 	}
+	if ct := c.SchemaGen.CountType; ct != CountTypeBigInt && ct != CountTypeInt {
+		return fmt.Errorf("schema_gen.count_type %q is not supported (use BigInt or Int)", ct)
+	}
+	if mr := c.SchemaGen.MutationResponse; mr != MutationResponsePerTable && mr != MutationResponseShared {
+		return fmt.Errorf("schema_gen.mutation_response %q is not supported (use per_table or shared)", mr)
+	}
 	if c.JWT.RoleLookup.Enabled() && c.JWT.RoleLookup.CacheSeconds < 0 {
 		return fmt.Errorf("jwt.role_lookup.cache_seconds must be >= 0")
+	}
+	if c.Server.MaxResponseRows < 0 {
+		return fmt.Errorf("server.max_response_rows must be >= 0 (0 = unlimited)")
+	}
+	if c.Server.MaxResponseBytes < 0 {
+		return fmt.Errorf("server.max_response_bytes must be >= 0 (0 = unlimited)")
+	}
+	if n := c.Server.MaxParallelRootFields; n < 0 {
+		return fmt.Errorf("server.max_parallel_root_fields must be >= 0 (0 = default, 1 = serial)")
+	} else if n > 1 && n >= c.Database.MaxOpenConns {
+		// At least one pooled connection must stay free for role lookups and
+		// other requests while one wide query runs all its root fields.
+		return fmt.Errorf("server.max_parallel_root_fields (%d) must be less than database.max_open_conns (%d): one request could take every pooled connection", n, c.Database.MaxOpenConns)
+	}
+	if err := c.validateRoleSelection(); err != nil {
+		return err
+	}
+	if err := c.validateChecks(); err != nil {
+		return err
+	}
+	if err := c.validateTables(); err != nil {
+		return err
+	}
+	if err := c.validateJSONTypes(); err != nil {
+		return err
+	}
+	if err := c.validateNativeQueries(); err != nil {
+		return err
+	}
+	if err := c.validateSubscriptions(); err != nil {
+		return err
+	}
+	return c.validateFilterSurface()
+}
+
+// headerNamePattern is an HTTP header field name (an RFC 9110 token).
+var headerNamePattern = regexp.MustCompile("^[A-Za-z0-9!#$%&'*+.^_`|~-]+$")
+
+// validateRoleSelection checks the allowed-roles source and the role header.
+func (c *Config) validateRoleSelection() error {
+	j := c.JWT
+	if !headerNamePattern.MatchString(j.RoleHeader) {
+		return fmt.Errorf("jwt.role_header %q is not a valid HTTP header name", j.RoleHeader)
+	}
+	if strings.EqualFold(j.RoleHeader, "Authorization") || strings.EqualFold(j.RoleHeader, "Content-Type") {
+		return fmt.Errorf("jwt.role_header cannot be %s", j.RoleHeader)
+	}
+	rl := j.RoleLookup
+	sources := 0
+	for _, set := range []bool{j.AllowedRolesClaim != "", rl.AllowedRolesColumn != "", rl.AllowedRolesTable != nil} {
+		if set {
+			sources++
+		}
+	}
+	if sources > 1 {
+		return fmt.Errorf("jwt: set at most one of allowed_roles_claim, role_lookup.allowed_roles_column and role_lookup.allowed_roles_table")
+	}
+	if j.AllowedRolesFromDB() && !rl.Enabled() {
+		return fmt.Errorf("jwt.role_lookup.allowed_roles_column / allowed_roles_table need jwt.role_lookup.table (the user id is matched through it)")
+	}
+	if at := rl.AllowedRolesTable; at != nil && at.Table == "" {
+		return fmt.Errorf("jwt.role_lookup.allowed_roles_table.table is required")
+	}
+	return nil
+}
+
+// validateChecks rejects write checks where they have no meaning: a check
+// constrains the rows a write produces, so only insert and update take one.
+// An insert rule may not carry both filter (accepted as the check for
+// backward compatibility) and check.
+func (c *Config) validateChecks() error {
+	for roleName, role := range c.Roles {
+		if role == nil {
+			continue
+		}
+		for tableName, tp := range role.Tables {
+			if tp == nil {
+				continue
+			}
+			for opName, perm := range map[string]*OpPerm{"select": tp.Select, "delete": tp.Delete} {
+				if perm != nil && perm.Check != "" {
+					return fmt.Errorf("role %q, table %q: check applies to insert and update only, not %s (use filter to restrict which rows %s sees)", roleName, tableName, opName, opName)
+				}
+			}
+			if ins := tp.Insert; ins != nil && ins.Filter != "" && ins.Check != "" {
+				return fmt.Errorf("role %q, table %q: insert has both filter and check; an insert filter is enforced as the check, so keep only check", roleName, tableName)
+			}
+		}
 	}
 	return nil
 }

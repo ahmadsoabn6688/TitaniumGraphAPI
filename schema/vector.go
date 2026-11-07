@@ -64,7 +64,7 @@ func (b *builder) addVectorFields(fields graphql.Fields, ti *tableInfo) {
 
 	for _, col := range cols {
 		col := col
-		fields[ti.typeName+"_nearest_by_"+ti.colToField[col.Name]] = &graphql.Field{
+		fields[ti.model.fieldBase+"_nearest_by_"+ti.colToField[col.Name]] = &graphql.Field{
 			Type:        graphql.NewNonNull(graphql.NewList(graphql.NewNonNull(neighbor))),
 			Description: fmt.Sprintf("Rows of %s ordered by vector distance of %s to `to` (nearest first).", tn, col.Name),
 			Args: graphql.FieldConfigArgument{
@@ -130,7 +130,7 @@ func (b *builder) runNearest(ctx context.Context, ti *tableInfo, id *rbac.Identi
 	var userCond *condition
 	var err error
 	if where != nil {
-		if userCond, err = b.whereSQL(ti, where); err != nil {
+		if userCond, err = b.whereSQL(ti, where, id); err != nil {
 			return nil, err
 		}
 	}
@@ -163,6 +163,9 @@ func (b *builder) runNearest(ctx context.Context, ti *tableInfo, id *rbac.Identi
 	scanCols := append(append([]*introspect.Column{}, sel.Columns...), nil) // last slot = distance
 	out := []map[string]any{}
 	for rows.Next() {
+		if err := countRows(ctx, 1); err != nil {
+			return nil, err
+		}
 		vals := make([]any, len(scanCols))
 		ptrs := make([]any, len(scanCols))
 		for i := range vals {

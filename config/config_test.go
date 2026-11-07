@@ -182,3 +182,25 @@ func TestDSNForcedParams(t *testing.T) {
 		}
 	}
 }
+
+func TestCountType(t *testing.T) {
+	cfg, err := Parse([]byte(minimalYAML))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The default keeps the schema of configs written before count_type
+	// existed: Int!.
+	if cfg.SchemaGen.CountType != CountTypeInt {
+		t.Errorf("count_type default = %q, want Int", cfg.SchemaGen.CountType)
+	}
+	cfg, err = Parse([]byte(minimalYAML + "schema_gen:\n  count_type: BigInt\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.SchemaGen.CountType != CountTypeBigInt {
+		t.Errorf("count_type = %q, want BigInt", cfg.SchemaGen.CountType)
+	}
+	if _, err := Parse([]byte(minimalYAML + "schema_gen:\n  count_type: Long\n")); err == nil || !strings.Contains(err.Error(), "count_type") {
+		t.Errorf("unknown count_type must be rejected, got %v", err)
+	}
+}
