@@ -7,7 +7,8 @@
 //   - roles:    RBAC rules per role -> table -> operation
 //
 // plus the optional tables: section that shapes individual tables and views
-// (logical keys, declared relationships, GraphQL names, docs).
+// (logical keys, declared relationships, GraphQL names, docs), json_types:
+// for typed JSON columns and native_queries: for parameterized SQL queries.
 package config
 
 import (
@@ -37,6 +38,10 @@ type Config struct {
 	// in with tables.<t>.columns.<c>.json_type; without that, a JSON column
 	// stays the opaque JSON scalar. Keyed by GraphQL type name.
 	JSONTypes map[string]*JSONType `yaml:"json_types"`
+	// NativeQueries are read-only parameterized SQL statements exposed as
+	// root query fields (see NativeQuery). Keyed by query name, which is
+	// also the default root field name.
+	NativeQueries map[string]*NativeQuery `yaml:"native_queries"`
 }
 
 // HooksConfig wires custom logic to the API. Hook names referenced here are
@@ -273,9 +278,17 @@ type TableFilter struct {
 	Exclude []string `yaml:"exclude"`
 }
 
-// Role maps table names (or "*" as fallback for any table) to permissions.
+// Role maps table names (or "*" as fallback for any table) to permissions,
+// and grants native queries by name.
 type Role struct {
 	Tables map[string]*TablePerm `yaml:"tables"`
+	// NativeQueries grants native queries to the role, keyed by query name
+	// (there is no wildcard). The permission takes the select shape: allow,
+	// columns (readable result columns), filter (a row filter over the
+	// result columns, :jwt.<claim> bound as parameters), the filter surface
+	// keys, and presets — server-forced ARGUMENT values (":jwt.<claim>" or a
+	// literal) that the client cannot set or override.
+	NativeQueries map[string]*OpPerm `yaml:"native_queries"`
 }
 
 // TablePerm holds per-operation permissions for one table.
@@ -598,6 +611,9 @@ func (c *Config) validate() error {
 		return err
 	}
 	if err := c.validateJSONTypes(); err != nil {
+		return err
+	}
+	if err := c.validateNativeQueries(); err != nil {
 		return err
 	}
 	return c.validateFilterSurface()

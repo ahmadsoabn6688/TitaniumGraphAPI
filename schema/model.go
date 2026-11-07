@@ -50,6 +50,9 @@ type tableModel struct {
 
 	declared []*declaredRel // relationships by column mapping, by name
 	fkNames  []*fkRelName   // names for foreign-key relationships
+	// native: the model of a native query's result (table is synthetic,
+	// named after the query; see native.go).
+	native bool
 }
 
 // rootSpec is the configured shape of one root field.
@@ -91,6 +94,10 @@ type catalogModel struct {
 	commentDocs bool
 	// jsonTypes are the declared JSON shapes (json_types), by type name.
 	jsonTypes map[string]*config.JSONType
+	// natives are the native queries (native_queries), by name, in
+	// nativeOrder; see native.go.
+	natives     map[string]*nativeModel
+	nativeOrder []string
 }
 
 // defaultRootName is the generated name of a root field kind.
@@ -341,14 +348,20 @@ func colSetKey(cols []string) string {
 
 // applyRelationships validates and records the relationships of one table.
 func (m *catalogModel) applyRelationships(tn string, tc *config.TableConfig) error {
-	tm := m.tables[tn]
+	return m.applyRelationshipsOf(m.tables[tn], tc.Relationships, "tables."+tn)
+}
+
+// applyRelationshipsOf validates and records the relationships declared for
+// tm (a table, view or native query) under the config path prefix.
+func (m *catalogModel) applyRelationshipsOf(tm *tableModel, rels map[string]*config.RelationshipConfig, prefix string) error {
 	t := tm.table
+	tn := t.Name
 	fieldOwner := map[string]string{}
 	for col, f := range tm.colField {
 		fieldOwner[f] = col
 	}
-	rnames := make([]string, 0, len(tc.Relationships))
-	for rn := range tc.Relationships {
+	rnames := make([]string, 0, len(rels))
+	for rn := range rels {
 		rnames = append(rnames, rn)
 	}
 	sort.Strings(rnames)
@@ -358,8 +371,8 @@ func (m *catalogModel) applyRelationships(tn string, tc *config.TableConfig) err
 	}
 	named := map[fkSide]string{}
 	for _, rn := range rnames {
-		rc := tc.Relationships[rn]
-		where := "tables." + tn + ".relationships." + rn
+		rc := rels[rn]
+		where := prefix + ".relationships." + rn
 		if col, taken := fieldOwner[rn]; taken {
 			return fmt.Errorf("%s: the name is already the field of column %q", where, col)
 		}
@@ -446,7 +459,9 @@ func (m *catalogModel) applyRelationships(tn string, tc *config.TableConfig) err
 			}
 		}
 		tm.declared = append(tm.declared, dr)
-		m.related[tn] = true
+		if !tm.native {
+			m.related[tn] = true // (a native query is never a relationship target)
+		}
 		m.related[rc.Target] = true
 	}
 	return nil

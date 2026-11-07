@@ -246,39 +246,55 @@ func (c *Config) validateTables() error {
 				return fmt.Errorf("%s.columns.%s: %q is not a usable column field name (it is a logical operator of the where filter)", where, col, fc.Name)
 			}
 		}
-		for rn, rc := range tc.Relationships {
-			rw := where + ".relationships." + rn
-			if !ValidGraphQLName(rn) || rn == "_and" || rn == "_or" || rn == "_not" {
-				return fmt.Errorf("%s: %q is not a usable relationship field name", rw, rn)
+		if err := validateRelationships(where, tc.Relationships, true); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validateRelationships checks the relationship entries under where (a
+// tables.<t> or native_queries.<q> path). allowFK: entries may name a
+// foreign-key relationship instead of declaring one.
+func validateRelationships(where string, rels map[string]*RelationshipConfig, allowFK bool) error {
+	for rn, rc := range rels {
+		rw := where + ".relationships." + rn
+		if !ValidGraphQLName(rn) || rn == "_and" || rn == "_or" || rn == "_not" {
+			return fmt.Errorf("%s: %q is not a usable relationship field name", rw, rn)
+		}
+		if rc == nil {
+			return fmt.Errorf("%s: empty relationship", rw)
+		}
+		if rc.Type != "" && rc.Type != RelObject && rc.Type != RelArray {
+			return fmt.Errorf("%s.type %q must be object or array", rw, rc.Type)
+		}
+		if rc.ForeignKey != "" {
+			if !allowFK {
+				return fmt.Errorf("%s: foreign_key does not apply here (a native query has no foreign keys); declare target, mapping and type", rw)
 			}
-			if rc == nil {
-				return fmt.Errorf("%s: empty relationship", rw)
+			if rc.Target != "" || len(rc.Mapping) > 0 {
+				return fmt.Errorf("%s: foreign_key names an existing foreign-key relationship; it cannot also have target or mapping", rw)
 			}
-			if rc.Type != "" && rc.Type != RelObject && rc.Type != RelArray {
-				return fmt.Errorf("%s.type %q must be object or array", rw, rc.Type)
+			continue
+		}
+		if rc.Target == "" || len(rc.Mapping) == 0 {
+			if !allowFK {
+				return fmt.Errorf("%s: a declared relationship needs target and mapping", rw)
 			}
-			if rc.ForeignKey != "" {
-				if rc.Target != "" || len(rc.Mapping) > 0 {
-					return fmt.Errorf("%s: foreign_key names an existing foreign-key relationship; it cannot also have target or mapping", rw)
-				}
-				continue
+			return fmt.Errorf("%s: a declared relationship needs target and mapping (or foreign_key to name a foreign-key relationship)", rw)
+		}
+		if rc.Type == "" {
+			return fmt.Errorf("%s: type is required (object or array)", rw)
+		}
+		targets := map[string]bool{}
+		for l, t := range rc.Mapping {
+			if l == "" || t == "" {
+				return fmt.Errorf("%s.mapping: empty column name", rw)
 			}
-			if rc.Target == "" || len(rc.Mapping) == 0 {
-				return fmt.Errorf("%s: a declared relationship needs target and mapping (or foreign_key to name a foreign-key relationship)", rw)
+			if targets[t] {
+				return fmt.Errorf("%s.mapping: target column %q is mapped twice", rw, t)
 			}
-			if rc.Type == "" {
-				return fmt.Errorf("%s: type is required (object or array)", rw)
-			}
-			targets := map[string]bool{}
-			for l, t := range rc.Mapping {
-				if l == "" || t == "" {
-					return fmt.Errorf("%s.mapping: empty column name", rw)
-				}
-				if targets[t] {
-					return fmt.Errorf("%s.mapping: target column %q is mapped twice", rw, t)
-				}
-				targets[t] = true
-			}
+			targets[t] = true
 		}
 	}
 	return nil
@@ -286,7 +302,8 @@ func (c *Config) validateTables() error {
 
 // NamedTables returns every table name the config refers to explicitly: the
 // schema_gen.tables include list, the role rules (not "*"), the tables:
-// entries and their relationship targets. Views are introspected only when
+// entries and their relationship targets, and the relationship targets of
+// native queries. Views are introspected only when
 // named here, so a config that never mentions a view sees the same catalog
 // (and the same GraphQL names) as before views were supported.
 func (c *Config) NamedTables() []string {
@@ -310,6 +327,16 @@ func (c *Config) NamedTables() []string {
 			continue
 		}
 		for _, rc := range tc.Relationships {
+			if rc != nil && rc.Target != "" {
+				set[rc.Target] = true
+			}
+		}
+	}
+	for _, nq := range c.NativeQueries {
+		if nq == nil {
+			continue
+		}
+		for _, rc := range nq.Relationships {
 			if rc != nil && rc.Target != "" {
 				set[rc.Target] = true
 			}

@@ -760,6 +760,7 @@ func TestDemoConfigRuntime(t *testing.T) {
 			c.SchemaGen = demo.SchemaGen
 			c.Tables = demo.Tables
 			c.JSONTypes = demo.JSONTypes
+			c.NativeQueries = demo.NativeQueries
 			c.Server.MaxParallelRootFields = demo.Server.MaxParallelRootFields
 			c.JWT = demo.JWT
 			// The identity table lives in the private test database, never

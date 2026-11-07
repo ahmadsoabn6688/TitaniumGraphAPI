@@ -46,6 +46,12 @@ CLI can mint dev tokens (`-print-token`).
 - **Views and keyless tables.** Views are exposed read-only to the roles that
   name them; a view or a table without a primary key can declare a logical
   key for cursors and `_by_pk`, and otherwise gets a bounded `<t>_list`.
+- **Native queries.** A parameterized, read-only SQL statement in YAML
+  (`SELECT … WHERE month = :month`, CTEs and window functions welcome)
+  becomes a root query field with typed arguments, the generated `where`,
+  per-role columns, row filters and **argument presets** from JWT claims,
+  a cursor connection when it declares a key, and relationships into your
+  tables.
 - **Your names, your docs.** Rename types, root fields, columns and
   relationships, take descriptions from TiDB `COMMENT`s or the YAML, and mark
   fields `@deprecated` — all from the `tables:` section.
@@ -249,6 +255,22 @@ json_types:                # optional shapes for JSON columns (see "Typed JSON c
       name: String
       visits: Int
 
+native_queries:            # optional parameterized SQL root fields (see "Native queries")
+  author_post_stats:
+    sql: |
+      SELECT p.id AS post_id, p.author_id, p.title, COUNT(c.id) AS comment_count
+      FROM posts p LEFT JOIN comments c ON c.post_id = p.id
+      WHERE p.author_id = :author AND (:min_views IS NULL OR p.views >= :min_views)
+      GROUP BY p.id, p.author_id, p.title
+    arguments:             # every :name in the sql; "Type!" = required
+      author: BigInt!
+      min_views: {type: Int, description: "View floor"}   # optional: NULL when omitted
+    columns:               # optional, per result column: type (shorthand) or {type, name, description, deprecated}
+      comment_count: BigInt!
+    key: [post_id]         # optional: adds author_post_stats_connection (keyset cursor)
+    relationships:
+      author: {type: object, target: users, mapping: {author_id: id}}
+
 roles:
   <role-name>:
     tables:
@@ -267,6 +289,12 @@ roles:
         #     title: [_eq, _ilike, _starts_with]
         #   filter_operators: [_eq, _in, _is_null, _ilike, _starts_with]  # table-wide allow-list; [] = none
         #   filter_relationships: [author]  # default: every relationship; [] = none
+    native_queries:        # grants by name (no "*"); same shape as select
+      author_post_stats:
+        allow: true
+        columns: [post_id, title, comment_count]  # readable result columns; empty = all
+        filter: "comment_count > 0"               # row filter over the result columns
+        presets: {author: ":jwt.sub"}             # ARGUMENT presets: hidden from and not overridable by the client
 ```
 
 ### RBAC semantics
@@ -282,6 +310,7 @@ roles:
 | `select.filterable_columns` | Which readable columns appear in `<table>_bool_exp` (default: all of them). A list (`[id, title]`) or a map of column → `all` / operator list. Non-filterable columns stay selectable. |
 | `select.filter_operators` | Table-wide operator allow-list, intersected with any per-column list (default: every operator, custom ones included; `[]` = none, i.e. no column filters on the table, and so no relationship filters either). |
 | `select.filter_relationships` | Relationship fields usable in `where` (default: every relationship the role can follow whose local join columns are filterable with `_eq`; `[]` = none). Navigation in the selection set is unaffected. |
+| `native_queries.<q>` | Grants a native query to the role (explicit only; no wildcard). `columns`, `filter` and the filter-surface keys work as for `select`, over the query's result columns; `presets` force **argument** values. See [Native queries](#native-queries). |
 
 Notes worth knowing:
 
@@ -405,6 +434,9 @@ posts_nearest_by_<vectorcol>(to: Vector!, metric: vector_metric, first: Int, whe
 users_by_email(email: String!): users          # one per UNIQUE index (see "Lookups by unique key")
 event_log_list(limit: Int, where: event_log_bool_exp): [event_log!]!
   # only for a table/view the role has no readable key for (no cursor possible)
+author_post_stats(args: author_post_stats_arguments, where: author_post_stats_bool_exp, limit: Int): [author_post_stats!]!
+author_post_stats_connection(args: …, where: …, first: Int, after: String): author_post_stats_connection!
+  # one pair per native query the role is granted (the connection needs `key`)
 
 # mutations
 insert_posts(objects: [posts_insert_input!]!): posts_mutation_response!
@@ -702,6 +734,179 @@ tables:
   collide with generated or hook-provided types. Without `json_type`
   nothing changes.
 
+## Native queries
+
+A **native query** is a read-only SQL statement with named parameters,
+declared in YAML and served as a root query field — for reports, CTEs,
+window functions and joins the generated per-table API cannot express. The
+generated machinery still applies on top of it: typed arguments, `where`
+(including relationship filters), per-role columns and row filters, argument
+presets from JWT claims, response limits, and a keyset cursor connection
+when it declares a key.
+
+```yaml
+native_queries:
+  author_post_stats:
+    description: "Per-post statistics of one author."
+    sql: |
+      SELECT p.id AS post_id, p.author_id, p.title, p.views, p.published,
+             COUNT(c.id) AS comment_count
+      FROM posts p LEFT JOIN comments c ON c.post_id = p.id
+      WHERE p.author_id = :author AND (:min_views IS NULL OR p.views >= :min_views)
+      GROUP BY p.id, p.author_id, p.title, p.views, p.published
+    arguments:
+      author: BigInt!                                     # shorthand: just the type
+      min_views: {type: Int, description: "View floor"}   # optional: NULL when omitted
+    columns:
+      published: Boolean!                                 # TINYINT(1) arrives as Int: declare Boolean
+      comment_count: {type: BigInt!, name: commentCount}
+    key: [post_id]                                        # adds author_post_stats_connection
+    relationships:
+      author:   {type: object, target: users,    mapping: {author_id: id}}
+      comments: {type: array,  target: comments, mapping: {post_id: post_id}}
+    # type_name: AuthorPostStat                           # default: the query name
+    # root_fields: {list: authorStats, connection: {name: authorStatsPage, deprecated: "..."}}
+
+roles:
+  admin:
+    native_queries:
+      author_post_stats: true
+  author:
+    native_queries:
+      author_post_stats:
+        allow: true
+        columns: [post_id, author_id, title, views, comment_count]   # hides published
+        presets: {author: ":jwt.sub"}           # the caller's own posts, always
+        filterable_columns: [views, title]
+```
+
+```graphql
+# admin: every argument is the client's
+{ author_post_stats(args: {author: 1, min_views: 100}, where: {commentCount: {_gt: 0}}, limit: 20) {
+    post_id title commentCount author { name } comments(limit: 3) { body } comments_aggregate { count } } }
+
+# author: `author` is preset from the token, so args holds min_views only (and is optional)
+{ author_post_stats_connection(first: 10, after: $cursor) {
+    nodes { post_id title } page_info { has_next_page end_cursor } total_count } }
+```
+
+Each request runs the statement as a derived table, with every `:name`
+replaced by a bound `?` (never by text):
+
+```sql
+SELECT `post_id`, `title`, … FROM (<sql with ? per :name>) AS `__gqlgate_nq`
+WHERE <where> AND (<role filter>) [AND `post_id` > ? ORDER BY `post_id`] LIMIT ?
+```
+
+**Generated fields** (for each role granted the query):
+
+- `<name>(args, where, limit): [<T>!]!` — up to `limit` rows (default
+  `default_page_size`, clamped to `max_page_size`) in no particular order.
+  `root_fields.list` renames it.
+- `<name>_connection(args, where, first, after): <T>_connection!` — only
+  with `key:`, and only for roles that can read every key column: keyset
+  pages in key order, `page_info`, and `total_count` (a `COUNT` only when
+  selected). The cursor is bound to the query, its argument values (presets
+  included, so one user's cursor never applies to another's rows) and the
+  filter. `root_fields.connection` renames it.
+- Types: `<T>`, `<T>_bool_exp`, `<T>_arguments`, `<T>_connection`, where
+  `<T>` is `type_name` or the query name. Like every generated name they are
+  checked for collisions at startup.
+- Not generated: `_aggregate`, `_by_pk`, `order_by`/`offset` (collection
+  reads stay cursor-only) and mutations. Count inside the statement, or use
+  the connection's `total_count`.
+
+**The statement.** It must be one `SELECT` (or `WITH … SELECT`); a trailing
+`;` is dropped. Anything else is rejected when the config is loaded (startup
+fails, or the hot reload is rejected): statement separators, literal `?`
+placeholders, `:=` assignments, `:jwt.…` references (preset an argument
+instead), executable `/*! … */` comments, and the keywords of writes,
+locking reads and DDL (`INSERT`, `UPDATE`, `DELETE`, `REPLACE`, `INTO`,
+`LOCK`, `FOR SHARE`, `CREATE`, `DROP`, `ALTER`, `GRANT`, `REVOKE`, `CALL`,
+`LOAD`, `RENAME`; qualified names such as `t.update` and the string
+functions `INSERT(…)` / `REPLACE(…)` are fine). Since it only ever runs as a
+derived table, nothing but a query expression could execute anyway. Quoted
+strings, quoted identifiers and comments are skipped when looking for
+parameters.
+
+**Arguments.** Every `:name` must be declared under `arguments` and every
+argument used; a name may appear several times (one bound value per use).
+Types: `String`, `Int`, `BigInt`, `Float`, `Boolean`, `Decimal`, `Date`,
+`DateTime`, with `!` for required. An omitted optional argument is `NULL`,
+so write `(:x IS NULL OR col = :x)` for an optional condition. The client
+passes them as `args: {…}` (`<T>_arguments`), which is non-null when the
+role must pass a required argument and absent when the role passes none.
+
+**Result columns** are read from the database when the API is built (at
+startup and on every hot reload) by running the statement with `LIMIT 0`
+and sample argument values (`0`, `''`, `2000-01-01`, …). So a statement that
+does not run — a typo, a dropped column, two result columns with the same
+name — refuses to boot with `native_queries.<name>.sql: the statement does
+not run against the database: …`, or rejects the reload while the previous
+schema keeps serving. Then:
+
+- Every column is **nullable**: TiDB does not report reliable nullability
+  for a derived table. `columns: {c: "Type!"}` makes one non-null (a `NULL`
+  in it is then a field error).
+- The scalar follows the column type as for tables, except that the wire
+  protocol carries no display width, so `TINYINT(1)` arrives as `Int`:
+  declare `Boolean`. A type the driver cannot name must be declared.
+  `columns:` also renames (`name`), documents and deprecates columns.
+- Character columns keep their collation (read from the database), so string
+  operators and string joins behave as on the base column.
+- Give expressions an alias (`COUNT(*) AS n`); result names that are not
+  GraphQL names are sanitized like column names.
+
+**Roles.** A role gets a native query only by naming it under
+`roles.<role>.native_queries` (there is no `"*"`). The grant takes the
+`select` shape over the result columns:
+
+- `columns` — readable result columns (default all); hidden ones are absent
+  from the type and from `where`, as for tables.
+- `filter` — a row filter over the result columns (`:jwt.<path>` bound as
+  parameters), ANDed to every read, including `total_count`. It is dry-run
+  against the statement at build time, so a filter naming a column the
+  statement does not return fails startup or the reload.
+- `filterable_columns`, `filter_operators`, `filter_relationships` — the
+  `where` surface, as for tables.
+- `presets` — **argument** values forced by the server: `":jwt.<path>"` or a
+  literal, coerced to the argument's type. A preset argument is removed from
+  the role's `<T>_arguments`, so the client cannot set or override it (also
+  not through variables). A missing claim is an error, never "no preset"; a
+  non-scalar claim cannot be bound. Use a preset when the value must sit
+  *inside* the statement (before a `GROUP BY`, in a CTE); a row filter only
+  sees the result.
+- `check` does not apply (native queries are read-only).
+
+**Relationships** go from result rows to tables and views (`type`, `target`,
+`mapping`, validated exactly like [declared relationships](#declared-relationships)):
+batched by the dataloader, array relationships with `where`/`order_by`/
+`limit`/`offset` and `<rel>_aggregate`, usable in `where`, and the target's
+column permissions and row filter apply for the role. A role sees one only
+if it can select the target and read the local join columns (a relationship
+filter also needs them filterable with `_eq`). `foreign_key:` does not
+apply, and relationships *to* a native query are not supported (they would
+need its argument values).
+
+Caveats:
+
+- **The statement runs as the gateway's database user.** Table permissions
+  do not apply *inside* it: whatever it selects is visible to every role
+  granted the query, limited only by that grant's `columns`, `filter` and
+  `presets`. Grant it like access to its result, and select only what those
+  roles may see.
+- **Performance.** TiDB can often push `where`, the row filter and the cursor
+  into the derived table, but not through `GROUP BY`, window functions or a
+  `LIMIT` inside the statement: then every request (and every page) runs the
+  whole statement before filtering. The connection's `ORDER BY key` is a sort
+  over the result, not an index range scan. Keep such statements selective
+  through their arguments, and `max_page_size` modest.
+- `key` is not enforced: duplicate keys make pages skip or repeat rows, and
+  rows with a `NULL` key are left out of the connection and `total_count`.
+  JSON, VECTOR, TEXT/BLOB, BIT, ENUM and SET columns cannot be key columns.
+- An `ORDER BY` inside the statement is not guaranteed to survive the
+  wrapping; the list is unordered and the connection is in key order.
+
 ## Layout
 
 ```
@@ -711,14 +916,16 @@ docker-compose.yml   one-command build+seed+serve
 Dockerfile           builds the gateway with hooks/ (runs `go mod tidy`)
 register/            registry the hooks/ files use (MutationHook/CustomField/ObjectField/…)
 config/              YAML loading + validation (env expansion, strict keys)
-introspect/          information_schema → tables, views, columns, PKs, FKs, comments
+introspect/          information_schema → tables, views, columns, PKs, FKs, comments;
+                     result columns of native queries
 rbac/                role resolution, row-filter compilation, claim lookup
 auth/                JWT verification (alg-pinned), role header + allowed roles, DB role lookups
 schema/              per-role GraphQL schema, parameterized SQL, where/filter
                      surface (operators, relationship EXISTS), dataloader,
                      keyset pagination, aggregates, vector search, hooks,
                      object fields, typed JSON, concurrent root fields,
-                     writes (returning, checks), error codes, response limits
+                     writes (returning, checks), error codes, response limits,
+                     native queries
 server/              HTTP handler, GraphiQL (embedded), CORS, depth limit
 options.go           hook resolution (YAML names → hooks/ registry) + JWT signer
 cmd/gqlgate/         CLI: serve (with startup retry) + -print-token
@@ -806,7 +1013,8 @@ roles, RBAC, hook wiring and the per-role schemas **in place** when it changes
 tweak a filter, save, and the next request sees it (poll interval
 `reload_interval_seconds`, default 2s). The `tables:` section reloads the
 same way (the schema is re-introspected, so a view named for the first time
-appears). Changing which `hooks/` files exist
+appears), and so does `native_queries:` (each statement is re-checked against
+the database; one that no longer runs rejects the reload). Changing which `hooks/` files exist
 still needs a rebuild (they're compiled in).
 
 ```yaml
@@ -1573,6 +1781,10 @@ private database directly to verify what actually happened.
   32-bit; keep larger integers as `Float` or `JSON`).
 - Concurrent root fields of one query are not snapshot-consistent with each
   other.
+- Native queries are read-only, have no `_aggregate`/`_by_pk`, cannot be
+  relationship targets, and their result columns are nullable unless
+  declared (`TINYINT(1)` reads as `Int` unless declared `Boolean`). An
+  aggregating statement is evaluated in full on every request and page.
 
 ## Hardening notes
 
@@ -1590,7 +1802,10 @@ escaped; aggregate and
 relationship selections are computed correctly even when the client wraps them
 in fragments; vector search skips NULL-vector rows; DB errors are masked from
 clients unless `server.debug` is on; and identifier/name collisions are
-rejected at startup rather than silently dropping an operation. Writes are
+rejected at startup rather than silently dropping an operation. Native
+query arguments are bound per use (a `:name` is never spliced into the SQL),
+the statement must be a single `SELECT`/`WITH` and only ever runs as a
+derived table, and preset arguments cannot be set by the client. Writes are
 checked inside their transaction (`insert/update.check`, NULL counts as a
 failure), a delete's rows depend only on the delete permission even when
 `returning` reads them through the select permission, unique-key lookups

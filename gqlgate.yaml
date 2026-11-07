@@ -90,6 +90,41 @@ json_types:
       tier: String
       tags: "[String]"
 
+# Parameterized read-only SQL as root query fields (arguments are always
+# bound, never spliced in). Try, as admin:
+#   { author_activity(args: {since: "2026-02-01"}) { name posts views view_rank author { email } } }
+# and as an author (the `author` argument is preset from the token):
+#   { comment_inbox_connection(first: 2) { nodes { post_title body commenter { name } } page_info { end_cursor } } }
+native_queries:
+  author_activity:
+    description: "Publishing activity per author, ranked by views."
+    sql: |
+      SELECT u.id AS author_id, u.name, COUNT(p.id) AS posts,
+             SUM(p.views) AS views,
+             RANK() OVER (ORDER BY SUM(p.views) DESC) AS view_rank
+      FROM users u JOIN posts p ON p.author_id = u.id
+      WHERE p.published = 1 AND (:since IS NULL OR p.published_on >= :since)
+      GROUP BY u.id, u.name
+    arguments:
+      since: {type: Date, description: "Only posts published on or after this day"}
+    columns:
+      posts: BigInt!
+    key: [author_id]
+    relationships:
+      author: {type: object, target: users, mapping: {author_id: id}}
+  comment_inbox:
+    description: "Comments on one author's posts."
+    sql: |
+      SELECT c.id AS comment_id, c.post_id, p.title AS post_title, c.user_id, c.body, c.created_at
+      FROM comments c JOIN posts p ON p.id = c.post_id
+      WHERE p.author_id = :author
+    arguments:
+      author: BigInt!
+    key: [comment_id]
+    relationships:
+      post: {type: object, target: posts, mapping: {post_id: id}}
+      commenter: {type: object, target: users, mapping: {user_id: id}}
+
 # Custom logic lives in the hooks/ directory (compiled in on build; any Go
 # library allowed). hooks/avatar.go.sample adds computed fields to the users
 # type (avatar_url, published_posts): rename it to .go and rebuild. To
@@ -118,6 +153,9 @@ roles:
         insert: true
         update: true
         delete: true
+    native_queries:       # granted by name only
+      author_activity: true
+      comment_inbox: true
 
   author:
     tables:
@@ -157,6 +195,12 @@ roles:
           filter: "author_id = :jwt.sub"
       post_tags:
         select: true
+    native_queries:
+      author_activity: true
+      comment_inbox:
+        allow: true
+        presets:
+          author: ":jwt.sub"   # always the caller's own inbox; not a client argument
 
   anonymous:
     tables:
@@ -188,3 +232,8 @@ roles:
           allow: true
           columns: [post_id, comment_count]
           filter: "post_id IN (SELECT id FROM posts WHERE published = 1)"
+    native_queries:
+      author_activity:
+        allow: true
+        columns: [author_id, name, posts, view_rank]   # no raw view counts for the public
+        filter: "view_rank <= 3"

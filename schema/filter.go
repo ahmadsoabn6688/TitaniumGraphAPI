@@ -449,6 +449,9 @@ func (b *builder) relations(ti *tableInfo) []*relInfo {
 			}
 		}
 		key := "\x00cfg:" + ti.table.Name + "." + d.name
+		if ti.native { // a native query may share a table's name
+			key = "\x00native:" + ti.table.Name + "." + d.name
+		}
 		r := &relInfo{name: d.name, key: key, aggKey: key, outgoing: d.object, target: target,
 			localCols: d.localCols, targetCols: d.targetCols, unenforced: d.unenforced,
 			description: desc, deprecated: d.deprecated}

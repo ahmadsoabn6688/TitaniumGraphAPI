@@ -57,6 +57,9 @@ func newBuildShared(opt Options) (*buildShared, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := buildNatives(context.Background(), opt, model); err != nil {
+		return nil, err
+	}
 	names, err := reserveNames(opt.Catalog, model)
 	if err != nil {
 		return nil, err
@@ -65,6 +68,14 @@ func newBuildShared(opt Options) (*buildShared, error) {
 	for n := range model.jsonTypes {
 		if customTypes[n] {
 			return nil, fmt.Errorf("json_types.%s: a custom or object field registered in hooks/ already uses the type name %q", n, n)
+		}
+	}
+	for _, n := range model.nativeOrder {
+		nm := model.natives[n]
+		for _, tn := range []string{nm.tm.typeName, nm.tm.typeName + "_bool_exp", nm.argsType, nm.connType} {
+			if tn != "" && customTypes[tn] {
+				return nil, fmt.Errorf("native_queries.%s: a custom or object field registered in hooks/ already uses the type name %q", n, tn)
+			}
 		}
 	}
 	renamed := names.avoidTypes(opt.Catalog, model, customTypes)
@@ -323,6 +334,11 @@ func reserveNames(cat *introspect.Catalog, m *catalogModel) (*nameReservation, e
 		}
 	}
 
+	// Native queries' root fields and types are fixed names too.
+	if err := reserveNativeNames(m, queryFields, types); err != nil {
+		return nil, err
+	}
+
 	r := &nameReservation{
 		types:   types,
 		mutResp: map[string]string{},
@@ -406,6 +422,9 @@ type tableInfo struct {
 	// against this table alone, so it may be embedded in relationship
 	// subqueries (see validateRoleFilter).
 	selectFilterOK bool
+	// native: the view of a native query's result (see native.go); its
+	// table is synthetic and it is not in tinfos.
+	native bool
 }
 
 // buildShared is state shared by every role's build within one BuildAll.
@@ -458,6 +477,8 @@ type builder struct {
 	// addObjectHookFields); thunks cannot return errors, so the build checks
 	// it after NewSchema has resolved them.
 	fieldErr error
+	// natives are the role's views of the native queries it is granted.
+	natives map[string]*nativeInfo
 }
 
 func buildRole(opt Options, shared *buildShared, roleName string, access *rbac.Access) (graphql.Schema, error) {
@@ -580,6 +601,9 @@ func buildRoleBuilder(opt Options, shared *buildShared, roleName string, access 
 			return nil, graphql.Schema{}, err
 		}
 	}
+	if err := b.resolveNatives(); err != nil {
+		return nil, graphql.Schema{}, err
+	}
 	if err := b.resolveObjectFields(); err != nil {
 		return nil, graphql.Schema{}, err
 	}
@@ -610,6 +634,9 @@ func buildRoleBuilder(opt Options, shared *buildShared, roleName string, access 
 		}
 		b.connTypes[tn] = b.buildConnectionType(ti)
 	}
+	if err := b.buildNativeTypes(); err != nil {
+		return nil, graphql.Schema{}, err
+	}
 
 	// Pass 3: root fields.
 	queryFields := graphql.Fields{
@@ -636,6 +663,7 @@ func buildRoleBuilder(opt Options, shared *buildShared, roleName string, access 
 		}
 		b.addMutationFields(mutationFields, ti)
 	}
+	b.addNativeFields(queryFields)
 	b.applyRootDocs(queryFields, mutationFields)
 
 	// Developer-provided custom fields (e.g. a signup mutation) visible to
@@ -730,7 +758,9 @@ func (b *builder) buildObjectType(ti *tableInfo) *graphql.Object {
 				}
 			}
 			b.addRelationFields(ti, fields)
-			b.addObjectHookFields(ti, fields)
+			if !ti.native { // hook object fields attach to tables only
+				b.addObjectHookFields(ti, fields)
+			}
 			return fields
 		}),
 	})
@@ -1425,13 +1455,20 @@ func (b *builder) addConnectionField(fields graphql.Fields, ti *tableInfo) {
 // total_count, all read from the map the connection resolver returns.
 func (b *builder) buildConnectionType(ti *tableInfo) *graphql.Object {
 	tn := ti.table.Name
+	return b.newConnectionType(ti.typeName+"_connection", tn, func() *graphql.Object { return b.objTypes[tn] })
+}
+
+// newConnectionType builds a connection object named name over the rows of
+// what (for its description), whose node type node returns (resolved
+// lazily, inside the fields thunk).
+func (b *builder) newConnectionType(name, what string, node func() *graphql.Object) *graphql.Object {
 	return graphql.NewObject(graphql.ObjectConfig{
-		Name:        ti.typeName + "_connection",
-		Description: fmt.Sprintf("A page of %s rows with cursor-pagination metadata.", tn),
+		Name:        name,
+		Description: fmt.Sprintf("A page of %s rows with cursor-pagination metadata.", what),
 		Fields: (graphql.FieldsThunk)(func() graphql.Fields {
 			return graphql.Fields{
 				"nodes": &graphql.Field{
-					Type:        graphql.NewNonNull(graphql.NewList(graphql.NewNonNull(b.objTypes[tn]))),
+					Type:        graphql.NewNonNull(graphql.NewList(graphql.NewNonNull(node()))),
 					Description: "The rows in this page.",
 					Resolve:     func(p graphql.ResolveParams) (any, error) { return sourceKey(p, "nodes"), nil },
 				},

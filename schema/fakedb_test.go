@@ -6,6 +6,7 @@ import (
 	"database/sql/driver"
 	"errors"
 	"io"
+	"strings"
 	"sync"
 )
 
@@ -23,12 +24,26 @@ func newFakeDB(answer fakeAnswer) (*sql.DB, *fakeLog) {
 type fakeLog struct {
 	mu      sync.Mutex
 	queries []string
+	args    [][]any // the bound arguments of each query
 }
 
-func (l *fakeLog) add(q string) {
+func (l *fakeLog) add(q string, args []any) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.queries = append(l.queries, q)
+	l.args = append(l.args, args)
+}
+
+// last returns the newest query containing substr and its arguments.
+func (l *fakeLog) last(substr string) (string, []any) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for i := len(l.queries) - 1; i >= 0; i-- {
+		if strings.Contains(l.queries[i], substr) {
+			return l.queries[i], l.args[i]
+		}
+	}
+	return "", nil
 }
 
 func (l *fakeLog) all() []string {
@@ -57,12 +72,16 @@ func (c *fakeConn) Prepare(q string) (driver.Stmt, error) { return &fakeStmt{c: 
 func (c *fakeConn) Close() error                          { return nil }
 func (c *fakeConn) Begin() (driver.Tx, error)             { return nil, errors.New("fakeConn: no transactions") }
 
-func (c *fakeConn) QueryContext(_ context.Context, q string, _ []driver.NamedValue) (driver.Rows, error) {
-	return c.c.query(q)
+func (c *fakeConn) QueryContext(_ context.Context, q string, named []driver.NamedValue) (driver.Rows, error) {
+	args := make([]any, len(named))
+	for i, n := range named {
+		args[i] = n.Value
+	}
+	return c.c.query(q, args)
 }
 
-func (c *fakeConnector) query(q string) (driver.Rows, error) {
-	c.log.add(q)
+func (c *fakeConnector) query(q string, args []any) (driver.Rows, error) {
+	c.log.add(q, args)
 	cols, rows, err := c.answer(q)
 	if err != nil {
 		return nil, err
@@ -80,7 +99,13 @@ func (s *fakeStmt) NumInput() int { return -1 }
 func (s *fakeStmt) Exec([]driver.Value) (driver.Result, error) {
 	return nil, errors.New("fakeStmt: no exec")
 }
-func (s *fakeStmt) Query([]driver.Value) (driver.Rows, error) { return s.c.query(s.q) }
+func (s *fakeStmt) Query(vals []driver.Value) (driver.Rows, error) {
+	args := make([]any, len(vals))
+	for i, v := range vals {
+		args[i] = v
+	}
+	return s.c.query(s.q, args)
+}
 
 type fakeRows struct {
 	cols []string

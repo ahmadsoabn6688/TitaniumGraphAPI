@@ -436,3 +436,75 @@ func LookupClaim(claims map[string]any, path string) (any, bool) {
 	}
 	return nil, false
 }
+
+// NativeAccess is one role's access to one native query.
+type NativeAccess struct {
+	// Select carries the readable result columns, the row filter and the
+	// filter surface, exactly as for a table.
+	Select *OpAccess
+	// Presets force argument values (by argument name); the client cannot
+	// set or override a preset argument.
+	Presets map[string]ArgPreset
+}
+
+// ArgPreset forces one native query argument to a claim value or a literal.
+type ArgPreset struct {
+	Arg       string
+	ClaimPath string // set when the value comes from a JWT claim
+	Literal   string // used when ClaimPath is empty
+}
+
+// Value resolves the preset for the given claims. A missing claim is an
+// error (never "no preset"); only scalar claims can be bound.
+func (p ArgPreset) Value(claims map[string]any) (any, error) {
+	if p.ClaimPath == "" {
+		return p.Literal, nil
+	}
+	v, ok := LookupClaim(claims, p.ClaimPath)
+	if !ok {
+		return nil, fmt.Errorf("argument preset %q needs JWT claim %q, which is missing from the token", p.Arg, p.ClaimPath)
+	}
+	switch v.(type) {
+	case string, float64, bool, nil:
+		return v, nil
+	default:
+		return nil, fmt.Errorf("JWT claim %q is not a scalar and cannot be used as an argument preset", p.ClaimPath)
+	}
+}
+
+// ResolveNative resolves one role's grant on a native query whose result
+// columns are described by table (a synthetic table named after the query)
+// and whose declared arguments are args. A nil or disallowed perm grants
+// nothing (nil, nil). Column, filter-surface and preset names are checked
+// like an explicit table rule: an unknown name is an error.
+func ResolveNative(roleName string, perm *config.OpPerm, table *introspect.Table, args map[string]bool) (*NativeAccess, error) {
+	if perm == nil || !perm.Allow {
+		return nil, nil
+	}
+	p := *perm
+	p.Presets = nil // argument presets, resolved below (not column presets)
+	if p.Check != "" {
+		return nil, fmt.Errorf("role %q, native query %q: check applies to table writes only", roleName, table.Name)
+	}
+	sel, err := resolveOp(roleName, table, "select", &p, true)
+	if err != nil {
+		return nil, err
+	}
+	na := &NativeAccess{Select: sel, Presets: map[string]ArgPreset{}}
+	for a, val := range perm.Presets {
+		if !args[a] {
+			return nil, fmt.Errorf("role %q, native query %q: preset %q is not a declared argument", roleName, table.Name, a)
+		}
+		ap := ArgPreset{Arg: a}
+		if path, ok := strings.CutPrefix(val, ":jwt."); ok {
+			if !claimPathPattern.MatchString(path) {
+				return nil, fmt.Errorf("role %q, native query %q: preset %q has an invalid claim path", roleName, table.Name, val)
+			}
+			ap.ClaimPath = path
+		} else {
+			ap.Literal = val
+		}
+		na.Presets[a] = ap
+	}
+	return na, nil
+}

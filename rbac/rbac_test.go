@@ -203,3 +203,53 @@ func TestViewsNeedExplicitGrant(t *testing.T) {
 		t.Errorf("insert: false on a view: %v", err)
 	}
 }
+
+func TestResolveNative(t *testing.T) {
+	table := &introspect.Table{Name: "stats", IsView: true, ColumnMap: map[string]*introspect.Column{}}
+	for i, n := range []string{"post_id", "author_id", "views"} {
+		c := &introspect.Column{Name: n, DataType: "bigint", ColumnType: "bigint", Ordinal: i, Nullable: true}
+		table.Columns = append(table.Columns, c)
+		table.ColumnMap[n] = c
+	}
+	args := map[string]bool{"author": true, "min": true}
+
+	na, err := ResolveNative("r", nil, table, args)
+	if na != nil || err != nil {
+		t.Errorf("nil perm = %v, %v", na, err)
+	}
+	na, err = ResolveNative("r", &config.OpPerm{Allow: true, Columns: []string{"views", "post_id"},
+		Filter: "author_id = :jwt.sub", Presets: map[string]string{"author": ":jwt.sub", "min": "10"}}, table, args)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(na.Select.Columns) != 2 || na.Select.Columns[0].Name != "post_id" || na.Select.Filter == nil {
+		t.Errorf("select = %+v", na.Select)
+	}
+	v, err := na.Presets["author"].Value(map[string]any{"sub": float64(3)})
+	if err != nil || v != float64(3) {
+		t.Errorf("author preset = %v, %v", v, err)
+	}
+	if v, _ := na.Presets["min"].Value(nil); v != "10" {
+		t.Errorf("literal preset = %v", v)
+	}
+	if _, err := na.Presets["author"].Value(map[string]any{}); err == nil || !strings.Contains(err.Error(), "missing") {
+		t.Errorf("missing claim: %v", err)
+	}
+	if _, err := na.Presets["author"].Value(map[string]any{"sub": []any{1}}); err == nil {
+		t.Error("array claim accepted as a preset")
+	}
+
+	for _, c := range []struct {
+		perm *config.OpPerm
+		want string
+	}{
+		{&config.OpPerm{Allow: true, Columns: []string{"nope"}}, `column "nope" does not exist`},
+		{&config.OpPerm{Allow: true, Presets: map[string]string{"x": "1"}}, "not a declared argument"},
+		{&config.OpPerm{Allow: true, Presets: map[string]string{"author": ":jwt.a b"}}, "invalid claim path"},
+		{&config.OpPerm{Allow: true, Check: "x = 1"}, "check applies"},
+	} {
+		if _, err := ResolveNative("r", c.perm, table, args); err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%+v: err = %v, want %q", c.perm, err, c.want)
+		}
+	}
+}

@@ -84,3 +84,28 @@ func TestCheckHasColumns(t *testing.T) {
 		t.Error("table without columns: want an error")
 	}
 }
+
+func TestColumnFromDriverType(t *testing.T) {
+	cases := []struct {
+		db                string
+		prec, scale       int64
+		hasDec            bool
+		dataType, colType string
+		charset           string
+	}{
+		{"BIGINT", 0, 0, false, "bigint", "bigint", ""},
+		{"UNSIGNED INT", 0, 0, false, "int", "int unsigned", ""},
+		{"DECIMAL", 10, 2, true, "decimal", "decimal(10,2)", ""},
+		{"VARCHAR", 0, 0, false, "varchar", "varchar", "?"},
+		{"TEXT", 0, 0, false, "text", "text", "?"},
+		{"JSON", 0, 0, false, "json", "json", ""},
+		{"NULL", 0, 0, false, "varchar", "varchar", ""},
+		{"", 0, 0, false, "", "", ""},
+	}
+	for _, c := range cases {
+		col := ColumnFromDriverType("x", c.db, c.prec, c.scale, c.hasDec)
+		if col.DataType != c.dataType || col.ColumnType != c.colType || col.Charset != c.charset || !col.Nullable {
+			t.Errorf("%q -> %+v", c.db, col)
+		}
+	}
+}

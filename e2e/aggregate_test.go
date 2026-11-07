@@ -469,6 +469,7 @@ func TestDemoConfigAggregates(t *testing.T) {
 		c.SchemaGen = demo.SchemaGen
 		c.Tables = demo.Tables
 		c.JSONTypes = demo.JSONTypes
+		c.NativeQueries = demo.NativeQueries
 	}))
 
 	r := env.MustGQL(t, "", `{ users_connection { nodes {
