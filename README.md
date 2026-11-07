@@ -294,6 +294,7 @@ server/              HTTP handler, GraphiQL (embedded), CORS, depth limit
 options.go           hook resolution (YAML names → hooks/ registry) + JWT signer
 cmd/gqlgate/         CLI: serve (with startup retry) + -print-token
 example/             seed schema + seeding tool
+e2e/                 end-to-end suite: in-process gateway vs. a live TiDB
 ```
 
 ## Relationship batching (dataloader)
@@ -493,6 +494,59 @@ What hook files can do:
   gives the caller's role and claims.
 - **`register.RoleResolver(fn)`** — fully custom token→role mapping (takes
   precedence over `role_claim`/`role_lookup`).
+
+## Testing
+
+Unit tests need no database:
+
+```sh
+go test ./...
+```
+
+The **end-to-end suite** (`e2e/`) runs the real gateway in-process
+(`gqlgate.Open` behind an `httptest` server) against a live TiDB and drives it
+with GraphQL-over-HTTP requests as different roles. It is opt-in: set
+`GQLGATE_E2E_DSN` to a go-sql-driver DSN for the TiDB server (no database
+name needed); without it every e2e test skips, so `go test ./...` stays
+database-free. Against the compose demo TiDB, from Docker:
+
+```sh
+docker compose up -d tidb
+docker run --rm --network tidb-net -v "$PWD:/src" -w /src   -e GQLGATE_E2E_DSN="root@tcp(tidb:4000)/" golang:1.25 go test -count=1 ./e2e/...
+```
+
+(or, with Go installed locally, `GQLGATE_E2E_DSN='root@tcp(127.0.0.1:4000)/'
+go test -count=1 ./e2e/...`). Unset any `GQLGATE_DB_*` variables first; the
+harness refuses to run if they would redirect the gateway.
+
+Isolation: each test gets its own database named
+`gqlgate_e2e_<unix>_<rand>_<test>`, loaded from `e2e/testdata/blog.sql` (the
+demo blog schema: FKs, JSON, `VECTOR`, UNIQUE email) and dropped on cleanup,
+so tests can run in parallel and can never touch `appdb` or any other
+database. Fixture SQL may not contain `USE` or `CREATE/DROP/ALTER DATABASE`.
+Leftover `gqlgate_e2e_*` databases from killed runs are swept after 6 hours.
+
+Writing a test:
+
+```go
+func TestPostsVisibility(t *testing.T) {
+    t.Parallel()
+    env := e2e.New(t)                       // fresh DB + gateway; skips without GQLGATE_E2E_DSN
+    author := env.Token(t, "author", 2)     // HS256 token {role: author, sub: 2}
+    r := env.MustGQL(t, author, `{ posts_aggregate { count } }`, nil)
+    _ = r.Int(t, "posts_aggregate.count")
+    env.GQL(t, "", `{ posts_connection { nodes { published } } }`, nil). // "" = anonymous
+        MustFail(t, "published")            // hidden column: negative RBAC case
+}
+```
+
+The default config mirrors the demo `gqlgate.yaml` roles (admin, author,
+anonymous) with the role taken from the token's `role` claim. Options adjust
+it: `WithRolesYAML`, `WithExtraYAML` (e.g. a `hooks:` block),
+`WithConfigTemplate`, `WithFixtures`, `WithSQL`, `WithConfig`,
+`WithGateOptions`, `WithDebug`. `env.Reload(t, rolesYAML)` rewrites the
+config file and hot-reloads; `env.DB`/`env.Exec`/`env.QueryInt` reach the
+private database directly to verify what actually happened.
 
 ## Limitations (deliberate, v1)
 
