@@ -121,13 +121,14 @@ func filterSurfaceTable() *introspect.Table {
 func TestResolveFilterSurface(t *testing.T) {
 	tbl := filterSurfaceTable()
 	rels := []string{"author"}
+	ops := []string{"_eq", "_in"}
 	perm := &config.OpPerm{
 		Allow:   true,
 		Columns: []string{"id", "title"},
 		FilterableColumns: &config.FilterableColumns{
 			Names: []string{"title"}, Ops: map[string][]string{"title": {"_eq"}},
 		},
-		FilterOperators:     []string{"_eq", "_in"},
+		FilterOperators:     &ops,
 		FilterRelationships: &rels,
 	}
 	oa, err := resolveOp("r", tbl, "select", perm, true)
@@ -145,6 +146,16 @@ func TestResolveFilterSurface(t *testing.T) {
 	oa, _ = resolveOp("r", tbl, "select", &config.OpPerm{Allow: true, Columns: []string{"id"}}, true)
 	if oa.FilterColumns != nil || !oa.Filterable("id") || oa.Filterable("title") {
 		t.Errorf("default surface wrong: %+v", oa)
+	}
+	if oa.FilterOperators != nil {
+		t.Errorf("absent filter_operators must stay nil (= all), got %v", oa.FilterOperators)
+	}
+
+	// filter_operators: [] means no operators, not all of them.
+	none := []string{}
+	oa, _ = resolveOp("r", tbl, "select", &config.OpPerm{Allow: true, FilterOperators: &none}, true)
+	if oa.FilterOperators == nil || len(oa.FilterOperators) != 0 {
+		t.Errorf("filter_operators: [] must resolve to an empty, non-nil list, got %v", oa.FilterOperators)
 	}
 
 	// A filterable column must be readable; explicit rules fail, wildcard rules skip.

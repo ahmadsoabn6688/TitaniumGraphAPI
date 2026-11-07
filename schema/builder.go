@@ -61,6 +61,7 @@ func newBuildShared(opt Options) (*buildShared, error) {
 		reservedTypes: reserved,
 		filterChecks:  map[string]error{},
 		timeout:       time.Duration(opt.Config.Database.QueryTimeoutSeconds) * time.Second,
+		ciCollations:  true, // without a database, assume the default (new) framework
 	}
 	if shared.timeout <= 0 {
 		shared.timeout = 30 * time.Second
@@ -72,8 +73,30 @@ func newBuildShared(opt Options) (*buildShared, error) {
 		if err := validateCustomOps(opt.DB, shared.customOps, shared.customOrder, shared.timeout); err != nil {
 			return nil, err
 		}
+		if shared.ciCollations, err = probeCICollations(opt.DB, shared.timeout); err != nil {
+			return nil, err
+		}
 	}
 	return shared, nil
+}
+
+// ciProbeSQL asks the cluster whether a *_ci collation really ignores case.
+// TiDB clusters bootstrapped with new_collations_enabled_on_first_bootstrap =
+// false (e.g. upgraded from before v4.0) compare every collation as binary.
+// The behavioural check needs no privileges, unlike reading mysql.tidb.
+const ciProbeSQL = "SELECT _utf8mb4'A' COLLATE utf8mb4_general_ci LIKE _utf8mb4'a'"
+
+// probeCICollations reports whether *_ci collations are case-insensitive on
+// this cluster, which decides how the case-insensitive string operators are
+// rendered (see stringCond).
+func probeCICollations(db *sql.DB, timeout time.Duration) (bool, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	var v sql.NullInt64
+	if err := db.QueryRowContext(ctx, ciProbeSQL).Scan(&v); err != nil {
+		return false, fmt.Errorf("checking collation support: %w", err)
+	}
+	return v.Valid && v.Int64 == 1, nil
 }
 
 // scalarTypeNames are every scalar name that can appear in a generated schema,
@@ -210,6 +233,9 @@ type buildShared struct {
 	customOps     map[string]*customOp // schema_gen.custom_operators
 	customOrder   []string
 	filterChecks  map[string]error // validateRoleFilter cache (table+filter)
+	// ciCollations: the cluster honours *_ci collations (TiDB's new
+	// collation framework); see probeCICollations.
+	ciCollations bool
 }
 
 type builder struct {
@@ -324,7 +350,11 @@ func buildRoleBuilder(opt Options, shared *buildShared, roleName string, access 
 			return nil, graphql.Schema{}, err
 		}
 		if len(ti.table.ForeignKeys) > 0 || len(ti.table.IncomingFKs) > 0 {
-			ti.selectFilterOK = b.validateRoleFilter(ti)
+			ok, err := b.validateRoleFilter(ti)
+			if err != nil {
+				return nil, graphql.Schema{}, err
+			}
+			ti.selectFilterOK = ok
 		}
 	}
 	for _, tn := range opt.Catalog.TableOrder {

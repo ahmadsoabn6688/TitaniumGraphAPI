@@ -163,8 +163,10 @@ func (c *Config) validateFilterSurface() error {
 				}
 				return nil
 			}
-			if err := check(sel.FilterOperators, "filter_operators"); err != nil {
-				return err
+			if sel.FilterOperators != nil {
+				if err := check(*sel.FilterOperators, "filter_operators"); err != nil {
+					return err
+				}
 			}
 			if sel.FilterableColumns != nil {
 				for col, ops := range sel.FilterableColumns.Ops {
@@ -182,7 +184,7 @@ func (c *Config) validateFilterSurface() error {
 // it must reference {column} and {value}, use no other {placeholders}, contain
 // no literal "?" (all values are bound through {value}), no statement
 // separators or comments, and have balanced quotes and parentheses with every
-// placeholder outside string literals.
+// placeholder outside string literals and quoted identifiers.
 func ValidateOperatorTemplate(tmpl string) error {
 	if strings.TrimSpace(tmpl) == "" {
 		return fmt.Errorf("template is empty")
@@ -194,8 +196,18 @@ func ValidateOperatorTemplate(tmpl string) error {
 	for i := 0; i < len(tmpl); i++ {
 		c := tmpl[i]
 		if quote != 0 {
+			// The renderer substitutes placeholders wherever they appear, so
+			// one inside a literal would silently become a bound "?" there.
+			if err := placeholderInQuote(tmpl[i:]); err != nil {
+				return err
+			}
 			if c == '\\' && quote != '`' {
-				i++ // skip the escaped character
+				i++ // skip the escaped character (still no placeholder there)
+				if i < len(tmpl) {
+					if err := placeholderInQuote(tmpl[i:]); err != nil {
+						return err
+					}
+				}
 				continue
 			}
 			if c == quote {
@@ -260,6 +272,18 @@ func ValidateOperatorTemplate(tmpl string) error {
 	}
 	if vals == 0 {
 		return fmt.Errorf("template must reference {value}")
+	}
+	return nil
+}
+
+// placeholderInQuote rejects a {column}/{value} at the start of rest, which
+// lies inside a quoted section: the renderer substitutes placeholders wherever
+// they appear, so one inside a literal would silently become a bound "?".
+func placeholderInQuote(rest string) error {
+	for _, p := range []string{"{column}", "{value}"} {
+		if strings.HasPrefix(rest, p) {
+			return fmt.Errorf("placeholder %s inside a quoted string or identifier is not allowed", p)
+		}
 	}
 	return nil
 }

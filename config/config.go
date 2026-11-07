@@ -231,8 +231,9 @@ type OpPerm struct {
 	// nil = every readable column. select only.
 	FilterableColumns *FilterableColumns `yaml:"filterable_columns"`
 	// FilterOperators is a table-wide operator allow-list, intersected with
-	// any per-column list. Empty = every operator. select only.
-	FilterOperators []string `yaml:"filter_operators"`
+	// any per-column list. nil = every operator; [] = none (no column
+	// filtering, and so no relationship filters either). select only.
+	FilterOperators *[]string `yaml:"filter_operators"`
 	// FilterRelationships lists the relationship fields usable in where.
 	// nil = every relationship the role can follow; [] = none. select only.
 	FilterRelationships *[]string `yaml:"filter_relationships"`

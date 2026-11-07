@@ -27,11 +27,26 @@ func TestParseFilterSurface(t *testing.T) {
 	if fc.Ops["id"] != nil || fc.Ops["body"] != nil || !reflect.DeepEqual(fc.Ops["title"], []string{"_eq", "_ilike"}) {
 		t.Errorf("filterable_columns ops = %+v", fc.Ops)
 	}
-	if !reflect.DeepEqual(sel.FilterOperators, []string{"_eq", "_ilike", "_in"}) {
+	if sel.FilterOperators == nil || !reflect.DeepEqual(*sel.FilterOperators, []string{"_eq", "_ilike", "_in"}) {
 		t.Errorf("filter_operators = %v", sel.FilterOperators)
 	}
 	if sel.FilterRelationships == nil || len(*sel.FilterRelationships) != 0 {
 		t.Errorf("filter_relationships: [] must decode to an empty, non-nil list, got %v", sel.FilterRelationships)
+	}
+}
+
+func TestParseFilterOperatorsEmpty(t *testing.T) {
+	// An explicit empty list means "no operators", never "all of them".
+	yaml := strings.Replace(minimalYAML, "select: true", `select:
+          allow: true
+          filter_operators: []`, 1)
+	cfg, err := Parse([]byte(yaml))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ops := cfg.Roles["admin"].Tables["*"].Select.FilterOperators
+	if ops == nil || len(*ops) != 0 {
+		t.Errorf("filter_operators: [] must decode to an empty, non-nil list, got %v", ops)
 	}
 }
 
@@ -145,10 +160,16 @@ func TestValidateOperatorTemplate(t *testing.T) {
 		"{column} = 1":                         "{value}",
 		"({column} = {value}":                  "parentheses",
 		"{column} = {value})":                  "parentheses",
-		"{column} = '{value}":                  "unterminated",
+		"{column} = {value} AND 'x":            "unterminated",
 		"{column} = {value":                    "unterminated placeholder",
 		"{column} } {value}":                   "unbalanced }",
-		"   ":                                  "empty",
+		// placeholders inside quotes would be substituted by the renderer
+		"CONCAT({column}, '{value}') = {value}": "inside a quoted",
+		`{column} = "{column}" AND {value}`:     "inside a quoted",
+		"`{column}` = {value}":                  "inside a quoted",
+		`{column} = 'a\{value}' AND {value}`:    "inside a quoted",
+		`{column} = 'it''{value}' AND {value}`:  "inside a quoted",
+		"   ":                                   "empty",
 	}
 	for tmpl, wantErr := range bad {
 		err := ValidateOperatorTemplate(tmpl)

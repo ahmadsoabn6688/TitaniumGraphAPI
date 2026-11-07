@@ -4,10 +4,12 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
 
+	"github.com/go-sql-driver/mysql"
 	"github.com/graphql-go/graphql"
 
 	"gqlgate/config"
@@ -405,8 +407,10 @@ func (b *builder) relations(ti *tableInfo) []*relInfo {
 
 // resolveFilterRels decides which relationships appear in the table's
 // bool_exp: the role must be able to select the target, the relationship must
-// pass select.filter_relationships, and the target's select row filter must
-// have been verified to resolve against its own table (see
+// pass select.filter_relationships, every local join column must be
+// filterable with _eq (a relationship filter is an equality filter on them:
+// `author: {id: {_eq: 2}}` is `author_id = 2`), and the target's select row
+// filter must have been verified to resolve against its own table (see
 // validateRoleFilter) so it cannot bind to the outer query's columns.
 func (b *builder) resolveFilterRels(ti *tableInfo) error {
 	rels := b.relations(ti)
@@ -436,6 +440,15 @@ func (b *builder) resolveFilterRels(ti *tableInfo) error {
 		if r.name == "_and" || r.name == "_or" || r.name == "_not" {
 			continue
 		}
+		if col, ok := b.joinColsFilterable(ti, r); !ok {
+			// Naming the relationship explicitly while hiding its join
+			// column is a contradiction worth failing on; under the default
+			// (every relationship) it is just withheld.
+			if allow != nil && sel.Explicit {
+				return fmt.Errorf("table %q, select.filter_relationships: %q filters on join column %q, which is not filterable with _eq for this role (add it to filterable_columns, or drop the relationship)", ti.table.Name, r.name, col)
+			}
+			continue
+		}
 		if r.target.access.Select.Filter != nil && !r.target.selectFilterOK {
 			continue
 		}
@@ -445,23 +458,62 @@ func (b *builder) resolveFilterRels(ti *tableInfo) error {
 	return nil
 }
 
+// joinColsFilterable reports whether every local join column of r may be
+// compared with _eq by the role; otherwise it returns the first one that may
+// not.
+func (b *builder) joinColsFilterable(ti *tableInfo, r *relInfo) (string, bool) {
+	for _, c := range r.localCols {
+		if !ti.filterOpSet[c]["_eq"] {
+			return c, false
+		}
+	}
+	return "", true
+}
+
+// filterRejectCodes are the MySQL/TiDB error numbers that mean "this filter
+// SQL is wrong" (it does not parse, names something that does not exist, or
+// may not be used here) rather than "the database is unhappy right now".
+var filterRejectCodes = map[uint16]bool{
+	1052: true, // ambiguous column
+	1054: true, // unknown column
+	1064: true, // syntax error
+	1109: true, // unknown table in clause
+	1111: true, // invalid use of group function
+	1142: true, // command denied on table
+	1143: true, // command denied on column
+	1146: true, // table does not exist
+	1241: true, // operand should contain N columns
+	1247: true, // reference not supported
+	1248: true, // derived table needs an alias
+	1305: true, // function does not exist
+	1582: true, // wrong parameter count (native function)
+	1583: true, // wrong parameters (stored function)
+	1630: true, // function does not exist (did you mean)
+}
+
 // validateRoleFilter dry-runs a select row filter against its own table
 // alone. Relationship filters embed the target's row filter inside a
 // correlated subquery, where an identifier that does not exist on the target
 // would silently resolve against the OUTER table instead of failing. Running
 // the filter in a statement with no outer scope proves every identifier binds
 // to the filter's own table (or to subqueries inside it).
-func (b *builder) validateRoleFilter(ti *tableInfo) bool {
+//
+// It reports false (relationship filters into the table are withheld) when
+// the database rejects the filter itself. Any other failure — a timeout, a
+// dropped connection, a lock wait — is returned as an error so the build (and
+// with it a hot reload) fails and the previous schema keeps serving, instead
+// of silently publishing a schema with fields missing.
+func (b *builder) validateRoleFilter(ti *tableInfo) (bool, error) {
 	f := ti.access.Select.Filter
 	if f == nil {
-		return true
+		return true, nil
 	}
 	if b.shared.db == nil {
-		return false // cannot verify: fail closed
+		return false, nil // cannot verify: fail closed
 	}
 	key := ti.table.Name + "\x00" + f.ValidationSQL()
 	if err, done := b.shared.filterChecks[key]; done {
-		return err == nil
+		return err == nil, nil
 	}
 	q := "SELECT 1 FROM " + b.qualifiedTable(ti.table) + " WHERE (" + f.ValidationSQL() + ") LIMIT 0"
 	ctx, cancel := context.WithTimeout(context.Background(), b.shared.timeout)
@@ -470,12 +522,22 @@ func (b *builder) validateRoleFilter(ti *tableInfo) bool {
 	if err == nil {
 		err = rows.Close()
 	}
+	if err != nil && !filterRejected(err) {
+		return false, fmt.Errorf("table %q: verifying the select filter: %w", ti.table.Name, err)
+	}
 	b.shared.filterChecks[key] = err
 	if err != nil && b.opt.Logger != nil {
 		b.opt.Logger.Warn("select filter does not resolve against its own table; relationship filters into it are disabled",
 			"role", b.role, "table", ti.table.Name, "err", err)
 	}
-	return err == nil
+	return err == nil, nil
+}
+
+// filterRejected reports whether err is the database rejecting the SQL
+// itself (see filterRejectCodes).
+func filterRejected(err error) bool {
+	var me *mysql.MySQLError
+	return errors.As(err, &me) && filterRejectCodes[me.Number]
 }
 
 // --- WHERE compilation -----------------------------------------------------
@@ -672,7 +734,7 @@ func (b *builder) columnCond(col *introspect.Column, qc, op string, val any) (*c
 	}
 	isString := scalarFor(col).Name() == "String"
 	if isString {
-		if c, handled, err := stringCond(col, qc, op, val); handled {
+		if c, handled, err := stringCond(col, qc, op, val, b.shared.ciCollations); handled {
 			return c, err
 		}
 	}
@@ -753,11 +815,18 @@ func (b *builder) columnCond(col *introspect.Column, qc, op string, val any) (*c
 //     LOWER(col) LIKE LOWER(?) otherwise;
 //   - the case-sensitive literal operators (_contains/_starts_with/
 //     _ends_with) force the charset's _bin collation on *_ci columns.
+//     _starts_with additionally keeps a plain `col LIKE ?` on the same
+//     pattern, which the _bin match implies, so TiDB can still use the
+//     column's (ci) index for a range scan.
+//
+// ciCollations is false on clusters bootstrapped without the new collation
+// framework, where every *_ci collation compares as binary; every column is
+// then treated as case-sensitive.
 //
 // The literal operators escape % and _ (and the escape char) in the client
 // value and build the pattern in Go, binding `LIKE ?` so _starts_with stays an
 // index range scan.
-func stringCond(col *introspect.Column, qc, op string, val any) (*condition, bool, error) {
+func stringCond(col *introspect.Column, qc, op string, val any, ciCollations bool) (*condition, bool, error) {
 	var (
 		pattern  string
 		ci       bool // case-insensitive
@@ -803,14 +872,18 @@ func stringCond(col *introspect.Column, qc, op string, val any) (*condition, boo
 		}
 		escapeClause = " ESCAPE '" + likeEscapeChar + "'"
 	}
-	colIsCI := strings.HasSuffix(col.Collation, "_ci")
+	colIsCI := ciCollations && strings.HasSuffix(col.Collation, "_ci")
 	switch {
 	case ci && colIsCI:
 		return &condition{sql: qc + " " + not + "LIKE ?" + escapeClause, args: []any{pattern}}, true, nil
 	case ci:
 		return &condition{sql: "LOWER(" + qc + ") " + not + "LIKE LOWER(?)" + escapeClause, args: []any{pattern}}, true, nil
 	case colIsCI && col.Charset != "" && collationNamePattern(col.Charset):
-		return &condition{sql: qc + " COLLATE " + col.Charset + "_bin " + not + "LIKE ?" + escapeClause, args: []any{pattern}}, true, nil
+		bin := qc + " COLLATE " + col.Charset + "_bin " + not + "LIKE ?" + escapeClause
+		if op == "_starts_with" {
+			return &condition{sql: "(" + qc + " LIKE ?" + escapeClause + " AND " + bin + ")", args: []any{pattern, pattern}}, true, nil
+		}
+		return &condition{sql: bin, args: []any{pattern}}, true, nil
 	default:
 		return &condition{sql: qc + " " + not + "LIKE ?" + escapeClause, args: []any{pattern}}, true, nil
 	}

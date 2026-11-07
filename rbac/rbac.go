@@ -75,7 +75,8 @@ type OpAccess struct {
 	// nil = every readable column; otherwise column -> operator allow-list,
 	// where a nil list means every operator.
 	FilterColumns map[string][]string
-	// FilterOperators is the table-wide operator allow-list (nil = all).
+	// FilterOperators is the table-wide operator allow-list (nil = all,
+	// empty non-nil = none).
 	FilterOperators []string
 	// FilterRelationships lists the relationship fields usable in `where`
 	// (nil = every relationship the role can follow).
@@ -264,8 +265,10 @@ func resolveFilterSurface(roleName string, table *introspect.Table, perm *config
 			oa.FilterColumns[c] = fc.Ops[c] // nil = every operator
 		}
 	}
-	if len(perm.FilterOperators) > 0 {
-		oa.FilterOperators = append([]string{}, perm.FilterOperators...)
+	// An explicit empty list means "no operators", like filterable_columns:
+	// [] and filter_relationships: [] — never "all" (that would fail open).
+	if perm.FilterOperators != nil {
+		oa.FilterOperators = append([]string{}, (*perm.FilterOperators)...)
 	}
 	if perm.FilterRelationships != nil {
 		oa.FilterRelationships = append([]string{}, (*perm.FilterRelationships)...)

@@ -1,6 +1,7 @@
 package schema
 
 import (
+	"database/sql"
 	"reflect"
 	"sort"
 	"strings"
@@ -75,11 +76,17 @@ func buildFilterRole(t *testing.T, role *config.Role, ops ...config.CustomOperat
 }
 
 func tryBuildFilterRole(role *config.Role, ops ...config.CustomOperator) (*builder, graphql.Schema, error) {
+	return tryBuildFilterRoleDB(nil, role, ops...)
+}
+
+// tryBuildFilterRoleDB is tryBuildFilterRole with a database for the startup
+// checks (custom operator dry runs, collation probe, row filter checks).
+func tryBuildFilterRoleDB(db *sql.DB, role *config.Role, ops ...config.CustomOperator) (*builder, graphql.Schema, error) {
 	cfg := &config.Config{Roles: map[string]*config.Role{"r": role}}
 	cfg.SchemaGen.DefaultPageSize = 25
 	cfg.SchemaGen.MaxPageSize = 200
 	cfg.SchemaGen.CustomOperators = ops
-	opt := Options{Catalog: filterCatalog(), Config: cfg}
+	opt := Options{DB: db, Catalog: filterCatalog(), Config: cfg}
 	shared, err := newBuildShared(opt)
 	if err != nil {
 		return nil, graphql.Schema{}, err
@@ -89,6 +96,14 @@ func tryBuildFilterRole(role *config.Role, ops ...config.CustomOperator) (*build
 		return nil, graphql.Schema{}, err
 	}
 	return buildRoleBuilder(opt, shared, "r", access)
+}
+
+// opList builds a select.filter_operators value.
+func opList(ops ...string) *[]string {
+	if ops == nil {
+		ops = []string{}
+	}
+	return &ops
 }
 
 func selectAll() *config.Role {
@@ -167,12 +182,15 @@ func TestStringOperatorSQL(t *testing.T) {
 		{bin, "_istarts_with", "no", "LOWER(c) LIKE LOWER(?) ESCAPE '!'", []any{"no%"}},
 		{bin, "_iends_with", "_x", "LOWER(c) LIKE LOWER(?) ESCAPE '!'", []any{"%!_x"}},
 		{ci, "_icontains", "ada", "c LIKE ? ESCAPE '!'", []any{"%ada%"}},
-		// case-sensitive literal match on a _ci column forces the _bin collation
-		{ci, "_starts_with", "Ada", "c COLLATE utf8mb4_bin LIKE ? ESCAPE '!'", []any{"Ada%"}},
+		// case-sensitive literal match on a _ci column forces the _bin
+		// collation; _starts_with keeps a plain LIKE on the same pattern so
+		// the ci index still gives a range scan.
+		{ci, "_starts_with", "Ada", "(c LIKE ? ESCAPE '!' AND c COLLATE utf8mb4_bin LIKE ? ESCAPE '!')", []any{"Ada%", "Ada%"}},
 		{ci, "_contains", "x", "c COLLATE utf8mb4_bin LIKE ? ESCAPE '!'", []any{"%x%"}},
+		{ci, "_ends_with", "x", "c COLLATE utf8mb4_bin LIKE ? ESCAPE '!'", []any{"%x"}},
 	}
 	for _, tc := range tests {
-		c, handled, err := stringCond(tc.col, "c", tc.op, tc.val)
+		c, handled, err := stringCond(tc.col, "c", tc.op, tc.val, true)
 		if !handled || err != nil {
 			t.Fatalf("%s %s: handled=%v err=%v", tc.col.Collation, tc.op, handled, err)
 		}
@@ -180,10 +198,34 @@ func TestStringOperatorSQL(t *testing.T) {
 			t.Errorf("%s on %s: got %q %v, want %q %v", tc.op, tc.col.Collation, c.sql, c.args, tc.wantSQL, tc.wantArgs)
 		}
 	}
-	if _, handled, _ := stringCond(bin, "c", "_eq", "x"); handled {
+
+	// Without the new collation framework *_ci collations compare as binary,
+	// so a _ci column is treated like any case-sensitive one.
+	oldFramework := []struct {
+		op, val, wantSQL string
+		wantArgs         []any
+	}{
+		{"_ilike", "%ada%", "LOWER(c) LIKE LOWER(?)", []any{"%ada%"}},
+		{"_nilike", "%ada%", "LOWER(c) NOT LIKE LOWER(?)", []any{"%ada%"}},
+		{"_icontains", "ada", "LOWER(c) LIKE LOWER(?) ESCAPE '!'", []any{"%ada%"}},
+		{"_istarts_with", "ada", "LOWER(c) LIKE LOWER(?) ESCAPE '!'", []any{"ada%"}},
+		{"_iends_with", "ada", "LOWER(c) LIKE LOWER(?) ESCAPE '!'", []any{"%ada"}},
+		{"_starts_with", "Ada", "c LIKE ? ESCAPE '!'", []any{"Ada%"}},
+		{"_contains", "Ada", "c LIKE ? ESCAPE '!'", []any{"%Ada%"}},
+	}
+	for _, tc := range oldFramework {
+		c, handled, err := stringCond(ci, "c", tc.op, tc.val, false)
+		if !handled || err != nil {
+			t.Fatalf("old framework %s: handled=%v err=%v", tc.op, handled, err)
+		}
+		if c.sql != tc.wantSQL || !reflect.DeepEqual(c.args, tc.wantArgs) {
+			t.Errorf("old framework %s: got %q %v, want %q %v", tc.op, c.sql, c.args, tc.wantSQL, tc.wantArgs)
+		}
+	}
+	if _, handled, _ := stringCond(bin, "c", "_eq", "x", true); handled {
 		t.Error("_eq must fall through to the generic operators")
 	}
-	if _, _, err := stringCond(bin, "c", "_ilike", nil); err == nil {
+	if _, _, err := stringCond(bin, "c", "_ilike", nil, true); err == nil {
 		t.Error("null pattern must be rejected")
 	}
 }
@@ -387,9 +429,13 @@ func TestFilterableColumnsAndOperators(t *testing.T) {
 	if got := fieldTypeName(t, s, "posts_bool_exp", "id"); got != "BigInt_comparison_exp" {
 		t.Errorf("unrestricted id type = %s, want the shared BigInt_comparison_exp", got)
 	}
-	// Relationships stay filterable (filter_relationships not set).
-	if !has(fields, "author") {
-		t.Error("author relationship should still be filterable")
+	// Relationships whose join column stays filterable remain filterable
+	// (filter_relationships not set); author joins on the hidden author_id.
+	if !has(fields, "comments") {
+		t.Error("comments relationship should still be filterable")
+	}
+	if has(fields, "author") {
+		t.Error("author relationship must not be filterable while author_id is not")
 	}
 	// Defense in depth for values smuggled in through variables.
 	ti := b.tinfos["posts"]
@@ -410,7 +456,7 @@ func TestFilterableColumnsAndOperators(t *testing.T) {
 
 func TestFilterOperatorsTableWide(t *testing.T) {
 	role := selectAll()
-	role.Tables["posts"] = &config.TablePerm{Select: &config.OpPerm{Allow: true, FilterOperators: []string{"_eq", "_in", "_starts_with"}}}
+	role.Tables["posts"] = &config.TablePerm{Select: &config.OpPerm{Allow: true, FilterOperators: opList("_eq", "_in", "_starts_with")}}
 	_, s := buildFilterRole(t, role)
 	if got := inputFields(t, s, "posts_title_comparison_exp"); !reflect.DeepEqual(got, []string{"_eq", "_in", "_starts_with"}) {
 		t.Errorf("title ops = %v", got)
@@ -458,7 +504,7 @@ func TestFilterRelationshipsAllowList(t *testing.T) {
 
 func TestFilterSurfaceValidation(t *testing.T) {
 	cases := map[string]*config.OpPerm{
-		"unknown table-wide op": {Allow: true, FilterOperators: []string{"_eqq"}},
+		"unknown table-wide op": {Allow: true, FilterOperators: opList("_eqq")},
 		"unknown column op": {Allow: true, FilterableColumns: &config.FilterableColumns{
 			Names: []string{"title"}, Ops: map[string][]string{"title": {"_bogus"}}}},
 		"op not applicable": {Allow: true, FilterableColumns: &config.FilterableColumns{
@@ -524,7 +570,7 @@ func TestCustomOperators(t *testing.T) {
 
 	// Custom operators obey allow-lists like built-ins.
 	role := selectAll()
-	role.Tables["posts"] = &config.TablePerm{Select: &config.OpPerm{Allow: true, FilterOperators: []string{"_eq"}}}
+	role.Tables["posts"] = &config.TablePerm{Select: &config.OpPerm{Allow: true, FilterOperators: opList("_eq")}}
 	b, _ = buildFilterRole(t, role, ops...)
 	if _, err := b.whereSQL(b.tinfos["posts"], map[string]any{"title": map[string]any{"_len_gt": 3}}, testID); err == nil {
 		t.Error("custom operator outside the allow-list accepted")

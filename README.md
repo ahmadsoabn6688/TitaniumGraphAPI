@@ -194,7 +194,7 @@ roles:
         #   filterable_columns:           # default: every readable column
         #     id: all                     # all operators
         #     title: [_eq, _ilike, _starts_with]
-        #   filter_operators: [_eq, _in, _is_null, _ilike, _starts_with]  # table-wide allow-list
+        #   filter_operators: [_eq, _in, _is_null, _ilike, _starts_with]  # table-wide allow-list; [] = none
         #   filter_relationships: [author]  # default: every relationship; [] = none
 ```
 
@@ -208,8 +208,8 @@ roles:
 | `update/delete.filter` | Rows the role may touch. Everything else reports `affected_rows: 0`. |
 | `"*"` wildcard | Applies to tables without an explicit entry. Unknown columns in wildcard rules are skipped per table; in named rules they are startup errors. |
 | `select.filterable_columns` | Which readable columns appear in `<table>_bool_exp` (default: all of them). A list (`[id, title]`) or a map of column → `all` / operator list. Non-filterable columns stay selectable. |
-| `select.filter_operators` | Table-wide operator allow-list, intersected with any per-column list (default: every operator, custom ones included). |
-| `select.filter_relationships` | Relationship fields usable in `where` (default: every relationship the role can follow; `[]` = none). Navigation in the selection set is unaffected. |
+| `select.filter_operators` | Table-wide operator allow-list, intersected with any per-column list (default: every operator, custom ones included; `[]` = none, i.e. no column filters on the table, and so no relationship filters either). |
+| `select.filter_relationships` | Relationship fields usable in `where` (default: every relationship the role can follow whose local join columns are filterable with `_eq`; `[]` = none). Navigation in the selection set is unaffected. |
 
 Notes worth knowing:
 
@@ -221,14 +221,20 @@ Notes worth knowing:
 - Roles are startup-validated against the real schema: a typo'd table or
   column name in the YAML refuses to boot. The same goes for unknown
   operator names, operators that don't apply to a column's type (in named
-  rules) and unknown `filter_relationships` names.
+  rules), unknown `filter_relationships` names, and a named rule whose
+  `filter_relationships` lists a relationship whose join column it hides
+  from `where` (see below).
 - `select.filter` is also applied **inside relationship filters** (the related
   table's filter, for the caller's role and claims). Because there it runs as
   a correlated subquery, every select filter on a table with foreign keys is
   dry-run against its own table at startup; one that references a column the
   table lacks (which SQL would otherwise silently resolve against the *outer*
   query's table) is logged as a warning and relationship filters into that
-  table are withheld for the role.
+  table are withheld for the role. Only the database rejecting the filter
+  itself (unknown column/table/function, syntax error, missing privilege)
+  counts: a timeout or connection error during the dry run fails startup —
+  or rejects a hot reload, which keeps the previous schema serving — instead
+  of silently publishing a schema with relationship filters missing.
 
 ### JWT contract (for your signup service)
 
@@ -453,7 +459,7 @@ On top of `_eq _neq _gt _gte _lt _lte _in _nin _is_null`, string columns get:
 | `_regex` / `_nregex` | regular expression, column collation | `col REGEXP ?` |
 | `_iregex` / `_niregex` | case-insensitive regular expression | `REGEXP_LIKE(col, ?, 'i')` |
 | `_contains` / `_icontains` | literal substring | `col LIKE '%…%' ESCAPE '!'` |
-| `_starts_with` / `_istarts_with` | literal prefix | `col LIKE '…%' ESCAPE '!'` |
+| `_starts_with` / `_istarts_with` | literal prefix | `col LIKE '…%' ESCAPE '!'` (see below for `*_ci` columns) |
 | `_ends_with` / `_iends_with` | literal suffix | `col LIKE '%…' ESCAPE '!'` |
 
 The literal operators take plain text, not a pattern: `%`, `_` and `!` in the
@@ -462,17 +468,31 @@ really contain `50%`. The pattern is built in Go and bound as one parameter,
 so `_starts_with` stays an index range scan. The `_i*` variants ignore case;
 the others compare exactly — on a `*_ci` column they force the charset's
 `_bin` collation (`_like`, `_regex` and `_eq` keep following the column's
-collation, as before). JSON columns keep their own **`_contains`**
-(`JSON_CONTAINS`) and **`_has_key`** (`JSON_CONTAINS_PATH`).
+collation, as before). Forcing `_bin` alone would turn a prefix match into a
+full index scan, so on a `*_ci` column `_starts_with` renders as
+`(col LIKE ? ESCAPE '!' AND col COLLATE utf8mb4_bin LIKE ? ESCAPE '!')`
+with the pattern bound twice: the first half keeps the range scan on the
+column's index, the second enforces the case. JSON columns keep their own
+**`_contains`** (`JSON_CONTAINS`) and **`_has_key`** (`JSON_CONTAINS_PATH`).
+
+Case-insensitivity on `*_ci` columns relies on TiDB's new collation
+framework (the default since v4.0). On a cluster bootstrapped with
+`new_collations_enabled_on_first_bootstrap = false` — typically one upgraded
+from an older release — every collation compares as binary. gqlgate checks
+this at startup (`SELECT _utf8mb4'A' COLLATE utf8mb4_general_ci LIKE
+_utf8mb4'a'`, no privileges needed) and then treats every column as
+case-sensitive: the `_i*` operators use `LOWER(col) LIKE LOWER(?)`
+everywhere, so they still ignore case, but can no longer use an index.
 
 ```graphql
 posts_connection(where: {title: {_istarts_with: "notes"}, body: {_icontains: "engine"}}) { nodes { id } }
 users_connection(where: {name: {_iregex: "^(ada|grace) "}, metadata: {_has_key: "tier"}}) { nodes { id } }
 ```
 
-Performance on large tables: only `_starts_with` (and `_istarts_with` /
-`_ilike 'x%'` on a `*_ci` column) can use an index; leading-wildcard
-operators, `LOWER(col)` and regexes scan. Restrict them per role with the
+Performance on large tables: only `_starts_with` (on any collation) and
+`_istarts_with` / `_ilike 'x%'` (on a `*_ci` column, with the new collation
+framework) can use an index range; leading-wildcard operators, `LOWER(col)`
+and regexes scan. Restrict them per role with the
 filter surface below.
 
 ### Custom operators
@@ -501,8 +521,10 @@ posts_connection(where: {published_on: {_year_eq: 2026}, title: {_len_gt: 20}}) 
 `{column}` becomes the backtick-quoted (and, inside relationship filters,
 alias-qualified) column; every `{value}` becomes a bound `?` carrying the
 argument. Templates are validated when the config loads — both placeholders
-present, no other `{…}`, no literal `?`, no `;` or comments, balanced quotes
-and parentheses — and dry-run against the database at startup, so a typo'd
+present and outside quotes (`'{value}'` would not be a string literal but a
+bound parameter; build strings with `CONCAT('%', {value})` instead), no other
+`{…}`, no literal `?`, no `;` or comments, balanced quotes and parentheses —
+and dry-run against the database at startup, so a typo'd
 function fails the boot, not the first request. Custom operators obey
 `filter_operators` / `filterable_columns` like built-ins.
 
@@ -536,6 +558,17 @@ get around them. Restrictions on a related table apply when it is reached
 through a relationship too. `filterable_columns` doesn't affect `_by_pk`
 lookups or keyset cursors (they use the primary key directly).
 
+A relationship filter is an equality filter on its join columns
+(`author: {id: {_eq: 2}}` is `author_id = 2`; `_not: {author: {}}` is
+"`author_id` is null or points at a row the role can't see"), so hiding a join
+column from `where` also hides the relationships that join on it: leave
+`author_id` out of `filterable_columns` above (or drop `_eq` from its
+operators) and `author` disappears from `posts_bool_exp` too, while
+`posts { author { … } }` keeps working. Listing such a relationship in a
+named rule's `filter_relationships` is a startup error. The same goes for
+`filter_operators: []`: no operators means no column filters and no
+relationship filters on that table.
+
 ### Filtering through relationships
 
 Every relationship the role can follow is also a field of `<table>_bool_exp`,
@@ -564,7 +597,8 @@ work, and `UPDATE`/`DELETE` whose `where` reads the same table through a
 relationship run fine on TiDB (no MySQL error 1093).
 
 RBAC: a relationship is offered only if the role can select the related table
-and read the local join columns (the same rule as for navigating it); only
+and read the local join columns (the same rule as for navigating it), and may
+filter on those join columns with `_eq` (see above); only
 the related table's filterable columns can be used inside it; and the related
 table's `select.filter` for the role (JWT claims bound) is applied inside the
 subquery, so rows the role can't see can never be matched. Relationship
