@@ -2,6 +2,7 @@ package rbac
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 
 	"gqlgate/config"
@@ -166,5 +167,39 @@ func TestResolveFilterSurface(t *testing.T) {
 	oa, err = resolveOp("r", tbl, "select", perm, false)
 	if err != nil || oa.Filterable("secret") || !oa.Filterable("id") {
 		t.Errorf("wildcard rule should skip unreadable column: %v %+v", err, oa)
+	}
+}
+
+// TestViewsNeedExplicitGrant: the "*" wildcard never covers a view, and a
+// view takes select only.
+func TestViewsNeedExplicitGrant(t *testing.T) {
+	col := &introspect.Column{Name: "id", DataType: "bigint", ColumnType: "bigint"}
+	cat := &introspect.Catalog{SchemaName: "appdb", TableOrder: []string{"t", "v"}, Tables: map[string]*introspect.Table{
+		"t": {Name: "t", Columns: []*introspect.Column{col}, ColumnMap: map[string]*introspect.Column{"id": col}},
+		"v": {Name: "v", IsView: true, Columns: []*introspect.Column{col}, ColumnMap: map[string]*introspect.Column{"id": col}},
+	}}
+	all := &config.OpPerm{Allow: true}
+	wild := &config.Role{Tables: map[string]*config.TablePerm{"*": {Select: all, Insert: all}}}
+	acc, err := Resolve("r", wild, cat)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if acc.Table("t") == nil || acc.Table("v") != nil {
+		t.Errorf("wildcard: t=%v v=%v (views need an explicit grant)", acc.Table("t"), acc.Table("v"))
+	}
+	named := &config.Role{Tables: map[string]*config.TablePerm{"*": {Select: all, Insert: all}, "v": {Select: all}}}
+	if acc, err = Resolve("r", named, cat); err != nil || acc.Table("v") == nil || acc.Table("v").Insert != nil {
+		t.Errorf("named view: %v %+v", err, acc)
+	}
+	for _, perm := range []*config.TablePerm{{Select: all, Insert: all}, {Update: all}, {Delete: all}} {
+		role := &config.Role{Tables: map[string]*config.TablePerm{"v": perm}}
+		if _, err := Resolve("r", role, cat); err == nil || !strings.Contains(err.Error(), "view") {
+			t.Errorf("write grant on a view: err = %v", err)
+		}
+	}
+	// A denied write (false) on a view is fine.
+	role := &config.Role{Tables: map[string]*config.TablePerm{"v": {Select: all, Insert: &config.OpPerm{}}}}
+	if _, err := Resolve("r", role, cat); err != nil {
+		t.Errorf("insert: false on a view: %v", err)
 	}
 }

@@ -38,9 +38,17 @@ CLI can mint dev tokens (`-print-token`).
   Bulk mutations return `affected_rows` plus **`returning { … }`** (with
   relationships), and every UNIQUE index gets lookups and point mutations:
   `users_by_email(email)`, `update_users_by_email`, `delete_users_by_email`.
-- **Relationships from foreign keys.** `posts { author { name } }` and
-  `users { posts(where: …) { … } }` are generated from FK metadata, and the
-  target table's RBAC (column set + row filter) applies to nested data too.
+- **Relationships from foreign keys — or declared in YAML.** `posts { author
+  { name } }` and `users { posts(where: …) { … } }` are generated from FK
+  metadata; schemas without FKs (common on TiDB) declare them by column
+  mapping. The target table's RBAC (column set + row filter) applies to
+  nested data too.
+- **Views and keyless tables.** Views are exposed read-only to the roles that
+  name them; a view or a table without a primary key can declare a logical
+  key for cursors and `_by_pk`, and otherwise gets a bounded `<t>_list`.
+- **Your names, your docs.** Rename types, root fields, columns and
+  relationships, take descriptions from TiDB `COMMENT`s or the YAML, and mark
+  fields `@deprecated` — all from the `tables:` section.
 - **Aggregates, nested too.** `posts_aggregate(where)` computes count, sum,
   avg, min/max, per-column and distinct counts (exact or TiDB's approximate
   HyperLogLog) and standard deviation/variance in one query, and every array
@@ -194,6 +202,24 @@ schema_gen:
       applies_to: [Date, DateTime]   # column scalars that get it (default: [argument])
       sql: "YEAR({column}) = {value}"
   count_type: BigInt       # scalar of count/total_count/affected_rows: Int (default) or BigInt (64-bit)
+  descriptions_from_comments: false  # true: TiDB table/column COMMENTs become GraphQL descriptions
+
+tables:                    # optional per-table modeling (see "Modeling: views, keys, relationships, names")
+  post_stats:              # a view, or a table without a primary key
+    primary_key: [post_id] # logical key (not enforced): cursors + _by_pk
+    type_name: PostStats   # renames the type and every <type>_… type
+    description: "Comment statistics per post."
+    root_fields:           # by_pk connection aggregate list insert insert_one update update_by_pk delete delete_by_pk
+      connection: postStatsPage
+      by_pk: {name: postStats, description: "…", deprecated: "use posts.stats"}
+    columns:               # keyed by SQL column name
+      comment_count: commentCount            # shorthand: just the new name
+      author_id: {description: "…", deprecated: "use post"}
+    relationships:
+      post: {type: object, target: posts, mapping: {post_id: id}}   # no FK needed
+  posts:
+    relationships:
+      writer: {foreign_key: fk_posts_author, description: "The author"}  # names an FK relationship
 
 roles:
   <role-name>:
@@ -224,7 +250,7 @@ roles:
 | `insert/update.presets` | Server-forced column values. Preset columns are removed from the input types, so clients cannot even attempt to set them. |
 | `update/delete.filter` | Rows the role may touch. Everything else reports `affected_rows: 0`. |
 | `insert/update.check` | A row condition (same SQL + `:jwt.<path>` syntax as `filter`) that every inserted row, and every row an update leaves behind, must satisfy. One failing row rolls the whole mutation back with `extensions.code: permission_error`. See [Write checks](#write-checks). |
-| `"*"` wildcard | Applies to tables without an explicit entry. Unknown columns in wildcard rules are skipped per table; in named rules they are startup errors. |
+| `"*"` wildcard | Applies to tables without an explicit entry — base tables only: a view is visible to a role only when the role names it. Unknown columns in wildcard rules are skipped per table; in named rules they are startup errors. |
 | `select.filterable_columns` | Which readable columns appear in `<table>_bool_exp` (default: all of them). A list (`[id, title]`) or a map of column → `all` / operator list. Non-filterable columns stay selectable. |
 | `select.filter_operators` | Table-wide operator allow-list, intersected with any per-column list (default: every operator, custom ones included; `[]` = none, i.e. no column filters on the table, and so no relationship filters either). |
 | `select.filter_relationships` | Relationship fields usable in `where` (default: every relationship the role can follow whose local join columns are filterable with `_eq`; `[]` = none). Navigation in the selection set is unaffected. |
@@ -298,6 +324,8 @@ posts_aggregate(where: posts_bool_exp): posts_aggregate_result!
 posts_nearest_by_<vectorcol>(to: Vector!, metric: vector_metric, first: Int, where: posts_bool_exp): [posts_neighbor!]!
   # posts_neighbor { node: posts!  distance: Float! }   (only for VECTOR columns)
 users_by_email(email: String!): users          # one per UNIQUE index (see "Lookups by unique key")
+event_log_list(limit: Int, where: event_log_bool_exp): [event_log!]!
+  # only for a table/view the role has no readable key for (no cursor possible)
 
 # mutations
 insert_posts(objects: [posts_insert_input!]!): posts_mutation_response!
@@ -341,6 +369,12 @@ Schema-generation details that just work:
   `insert_<t>_one`) are generated only when the whole primary key is readable
   by the role — so hiding the PK via `select.columns` also removes it as a
   lookup argument, not just from output.
+- **Descriptions** are generated ("Row of table appdb.posts", "Column title
+  (varchar(200))") unless `tables:` sets one; with
+  `schema_gen.descriptions_from_comments: true` the TiDB table and column
+  `COMMENT`s are used where the config sets none. It is opt-in because a
+  comment written for DBAs becomes visible to every role that can read the
+  table.
 - **Foreign keys are scoped to the exposed schema**: an FK pointing at a
   same-named table in another schema is ignored rather than mis-joined.
 - **Name collisions fail at startup** with an actionable message: if two
@@ -358,6 +392,166 @@ Schema-generation details that just work:
   `information_schema.tables`, not as `auto_increment`): they are optional
   on insert, and `insert_<t>_one` / `returning` find the generated rows.
 
+## Modeling: views, keys, relationships, names
+
+The optional top-level `tables:` section shapes individual tables and views,
+independently of roles. Everything in it is validated against the
+introspected schema at startup and on every hot reload (a table, column or
+foreign key that does not exist, an incompatible mapping or a name collision
+refuses to boot, or rejects the reload). Names given here are GraphQL names;
+the rest of the config — roles, `columns`, `filter`, `check`, `presets`,
+mappings — keeps using SQL table and column names.
+
+### Views (read-only)
+
+Views in `database.schema` are introspected when the config **names** them:
+in a role rule, a `tables:` entry, a relationship `target`, or
+`schema_gen.tables.include`. A view becomes a query-only type for every role
+that grants it `select` by name — the `"*"` wildcard never covers a view, and
+granting `insert`/`update`/`delete` on one is a startup error (TiDB views are
+not updatable). Row filters, column lists, the filter surface, aggregates,
+vector search and relationship filters work exactly as on tables.
+
+```yaml
+roles:
+  author:
+    tables:
+      post_stats:
+        select: {allow: true, filter: "author_id = :jwt.sub"}
+```
+
+A view has no primary key or foreign keys, so give it a `primary_key` (below)
+for cursors, and `relationships` to join it.
+
+### Logical keys and keyless tables
+
+```yaml
+tables:
+  post_stats: {primary_key: [post_id]}
+  post_tags:  {primary_key: [post_id, tag]}   # composite works too
+```
+
+A view or a base table **without** a primary key can declare one. It is used
+for `<t>_connection` (keyset cursor on the key, in key order), `<t>_by_pk`,
+the window order of nested lists, and as a target of object relationships.
+It drives reads only: no `update_<t>_by_pk` / `delete_<t>_by_pk` /
+`insert_<t>_one` is generated from it, and `returning` / write checks still
+need a real primary key. Caveats:
+
+- **It is not enforced.** If the columns do not really identify one row,
+  pages can skip or repeat rows and `_by_pk` returns an arbitrary match.
+- Rows whose key has a NULL (TiDB reports every view column as nullable) are
+  left out of the connection and its `total_count`; `_aggregate` still counts
+  them.
+- On a view, `ORDER BY key` with `key > cursor` is a range scan only when TiDB
+  can push the predicate into the view; for an aggregating view (`GROUP BY`)
+  each page may compute and sort the whole view. Keep `max_page_size` modest
+  for such views, or page a base table instead.
+- The key columns must be readable by the role (as for a primary key), or the
+  role gets the list field below instead. JSON, VECTOR, TEXT and BLOB columns
+  cannot be key columns.
+
+A table or view a role has **no usable key** for — none at all, or one it
+cannot read — gets a bounded list instead of a connection:
+
+```graphql
+query { event_log_list(limit: 50, where: {level: {_eq: "error"}}) { ts message } }
+```
+
+It returns at most `limit` rows (default `default_page_size`, clamped to
+`max_page_size`) **in no particular order**. There is deliberately no
+`offset`, `order_by` or cursor: narrow it with `where` (and use
+`<t>_aggregate` for counts). The name `<t>_list` is new, so when another
+generated or custom field already has it, the list is left out with a startup
+warning; `root_fields.list` names it explicitly.
+
+### Declared relationships
+
+```yaml
+tables:
+  posts:
+    relationships:
+      stats: {type: object, target: post_stats, mapping: {id: post_id}}
+      tags:  {type: array,  target: post_tags,  mapping: {id: post_id}, description: "Tags of the post"}
+  users:
+    relationships:
+      events: {type: array, target: event_log, mapping: {id: user_id}}
+```
+
+Each entry adds one field (named by the key) on the declaring table,
+following `mapping` (this table's columns → the target's columns; several
+pairs make a composite join). Hasura-style, a declaration is one-directional:
+declare the reverse on the target if you want it too. Declared relationships
+behave exactly like foreign-key ones: batched by the dataloader, `where` /
+`order_by` / `limit` / `offset` on array relationships, a nested
+`<rel>_aggregate` on every array relationship, usable in relationship
+filters (`posts(where: {stats: {commentCount: {_gt: 1}}})`) subject to
+`filter_relationships`, and the target's row filter and column permissions
+for the role apply everywhere. A role sees the field only if it can select
+the target and read the local join columns.
+
+Validated at startup: the target exists among the exposed tables/views; every
+mapped column exists; each pair is join-compatible (same GraphQL scalar, or
+`Int`/`BigInt`; `DECIMAL` with the same declared type; never JSON, VECTOR,
+TEXT or BLOB); and an `object` relationship must map onto the target's
+primary key, a unique key, or its declared `primary_key` (a declared key is
+not enforced — at most one matching row is returned). The name may not be a
+column's field name or another relationship's name (a clash with a generated
+foreign-key relationship name is a startup error; rename either one).
+
+`foreign_key:` instead names (and documents / deprecates) a relationship
+generated from a foreign key, on either side:
+
+```yaml
+tables:
+  posts:
+    relationships:
+      writer: {foreign_key: fk_posts_author}             # posts.author → posts.writer
+  users:
+    relationships:
+      articles: {foreign_key: fk_posts_author}           # users.posts → users.articles
+  categories:
+    relationships:
+      parent:   {foreign_key: fk_cat_parent, type: object}  # self-referencing: say which side
+      children: {foreign_key: fk_cat_parent, type: array}
+```
+
+Write `<child_table>.<constraint>` if a constraint name alone is ambiguous.
+
+### Custom names, descriptions, deprecation
+
+```yaml
+tables:
+  posts:
+    type_name: Post                     # Post, Post_bool_exp, Post_connection, Post_insert_input, …
+    description: "A blog post."
+    root_fields:
+      connection: allPosts
+      by_pk: {name: post, deprecated: "use allPosts"}
+      insert_one: createPost
+    columns:
+      title: headline
+      body: {description: "Markdown body", deprecated: "use content"}
+```
+
+- `type_name` renames the object type and every type derived from it.
+  Root field names do **not** follow it: each keeps its default
+  (`posts_by_pk`, `insert_posts`, …) unless `root_fields` renames it. The
+  unique-key and nearest-neighbor fields keep their generated names (built
+  from the column field names).
+- Column renames apply everywhere the column appears: output fields, `where`,
+  aggregates, insert/`_set` inputs, `_by_pk` / unique-key arguments.
+- `deprecated: "reason"` marks a column field, relationship field (and its
+  `<rel>_aggregate`) or root field `@deprecated(reason: …)`; deprecated fields
+  keep working. GraphQL (and graphql-go) cannot deprecate input fields, so
+  the column stays undeprecated in `where` and the insert/`_set` inputs.
+- Descriptions: the YAML wins, then (with
+  `schema_gen.descriptions_from_comments: true`) the TiDB `COMMENT`, then the
+  generated text.
+- Collisions are checked on the final names, like the defaults: a custom name
+  that clashes with any other generated type or field (or with a built-in
+  such as `page_info`) refuses to boot with a message naming both owners.
+
 ## Layout
 
 ```
@@ -367,7 +561,7 @@ docker-compose.yml   one-command build+seed+serve
 Dockerfile           builds the gateway with hooks/ (runs `go mod tidy`)
 register/            registry the hooks/ files use (MutationHook/CustomField/…)
 config/              YAML loading + validation (env expansion, strict keys)
-introspect/          information_schema → tables, columns, PKs, FKs
+introspect/          information_schema → tables, views, columns, PKs, FKs, comments
 rbac/                role resolution, row-filter compilation, claim lookup
 auth/                JWT verification middleware (alg-pinned) + DB role resolver
 schema/              per-role GraphQL schema, parameterized SQL, where/filter
@@ -390,6 +584,7 @@ posts and one `SELECT … FROM users WHERE id IN (…)` for all their authors
 same way — one query, bounded per parent by a `ROW_NUMBER()` window so each
 parent's `limit`/`offset` also caps what the database returns (not just what's
 shown), with `where`/`order_by` applied and each group paged in memory.
+Declared relationships (see "Modeling") batch exactly the same way.
 Batching is per-request, multi-round (so recursive/self-referential
 relationships like category trees or org charts resolve correctly at every
 depth), and applies whenever the join columns are readable by the role;
@@ -420,7 +615,9 @@ With `server.hot_reload: true`, gqlgate watches the config file and rebuilds
 roles, RBAC, hook wiring and the per-role schemas **in place** when it changes
 — no restart, no dropped connections. Edit a role's columns, add a role, or
 tweak a filter, save, and the next request sees it (poll interval
-`reload_interval_seconds`, default 2s). Changing which `hooks/` files exist
+`reload_interval_seconds`, default 2s). The `tables:` section reloads the
+same way (the schema is re-introspected, so a view named for the first time
+appears). Changing which `hooks/` files exist
 still needs a rebuild (they're compiled in).
 
 ```yaml
@@ -490,7 +687,8 @@ bound to the query's `where`, so it can't be replayed against a different
 filter. `first` is clamped to `schema_gen.max_page_size`. `total_count` is a
 separate field whose `COUNT` runs only when selected (skip it for the fastest
 paging on huge tables). Connections are generated for tables whose primary key
-the role can read.
+(or declared `primary_key`, for views and keyless tables) the role can read;
+other readable tables get a bounded `<t>_list` instead (see "Modeling").
 
 ### Aggregates
 
@@ -1088,7 +1286,8 @@ anonymous) with the role taken from the token's `role` claim. Options adjust
 it: `WithRolesYAML`, `WithExtraYAML` (e.g. a `hooks:` block),
 `WithConfigTemplate`, `WithFixtures`, `WithSQL`, `WithConfig`,
 `WithGateOptions`, `WithDebug`. `env.Reload(t, rolesYAML)` rewrites the
-config file and hot-reloads; `env.DB`/`env.Exec`/`env.QueryInt` reach the
+config file and hot-reloads (`env.ReloadExtra(t, yaml)` does the same for
+the extra block, e.g. a `tables:` section); `env.DB`/`env.Exec`/`env.QueryInt` reach the
 private database directly to verify what actually happened.
 
 ## Limitations (deliberate, v1)
@@ -1097,11 +1296,14 @@ private database directly to verify what actually happened.
   arbitrary `order_by` on connections (that's the point — PK order is free on
   TiDB, arbitrary sorts aren't). Sort application-side, or add a covering index
   and query by it via `where`.
-- Connections require a table with a role-readable primary key.
+- Connections require a role-readable primary key or declared `primary_key`;
+  otherwise only the bounded, unordered `<t>_list` (no paging) is offered.
+  Declared keys and declared object relationships are not enforced by the
+  database.
 - No arbitrary `GROUP BY`/grouped aggregates yet (aggregates are whole-filter,
   or per parent row via `<rel>_aggregate`), no aggregate predicates in
-  `where` (e.g. "authors with more than 5 posts"), no subscriptions, no views
-  (base tables only).
+  `where` (e.g. "authors with more than 5 posts"), no subscriptions. Views are
+  read-only and must be named in the config to be exposed.
 - TiDB has no spatial/GIS types; use lat/lng columns + bounding-box filters, or
   `VECTOR` columns for similarity search.
 - Schema is introspected once at startup (or on hot reload) — restart after DDL
@@ -1118,8 +1320,9 @@ private database directly to verify what actually happened.
   is supplied. With `returning` or a check, an update/delete holds the keys
   of all matching rows in memory (written in chunks of 1000).
 - Unique-key fields cover plain UNIQUE indexes on `NOT NULL` columns only (no
-  nullable, prefix or expression indexes); there is no YAML override for
-  their names.
+  nullable, prefix or expression indexes); their names (and the
+  nearest-neighbor fields') follow the column field names but cannot be set
+  individually.
 - `SELECT … FOR UPDATE` only blocks in pessimistic transactions (TiDB's
   default); in optimistic mode a concurrent write to the same rows makes the
   commit fail with `extensions.code: conflict` instead.

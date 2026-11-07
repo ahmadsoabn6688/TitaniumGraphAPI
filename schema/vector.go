@@ -64,7 +64,7 @@ func (b *builder) addVectorFields(fields graphql.Fields, ti *tableInfo) {
 
 	for _, col := range cols {
 		col := col
-		fields[ti.typeName+"_nearest_by_"+ti.colToField[col.Name]] = &graphql.Field{
+		fields[ti.model.fieldBase+"_nearest_by_"+ti.colToField[col.Name]] = &graphql.Field{
 			Type:        graphql.NewNonNull(graphql.NewList(graphql.NewNonNull(neighbor))),
 			Description: fmt.Sprintf("Rows of %s ordered by vector distance of %s to `to` (nearest first).", tn, col.Name),
 			Args: graphql.FieldConfigArgument{

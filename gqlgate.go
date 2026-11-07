@@ -119,8 +119,13 @@ func (g *Gate) buildState(ctx context.Context, cfg *config.Config) (*gateState, 
 	if err != nil {
 		return nil, err
 	}
-	catalog, err := introspect.Load(ctx, g.db, cfg.Database.Schema,
-		cfg.SchemaGen.Tables.Include, cfg.SchemaGen.Tables.Exclude)
+	// Views are exposed only when the config names them (a role rule, a
+	// tables: entry, a relationship target or the include list).
+	catalog, err := introspect.LoadWith(ctx, g.db, cfg.Database.Schema, introspect.Options{
+		Include: cfg.SchemaGen.Tables.Include,
+		Exclude: cfg.SchemaGen.Tables.Exclude,
+		Views:   cfg.NamedTables(),
+	})
 	if err != nil {
 		return nil, err
 	}

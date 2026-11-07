@@ -5,6 +5,9 @@
 //   - server:   HTTP listener + GraphiQL toggle (dev)
 //   - jwt:      how to *verify* tokens (issuance/signup is out of scope)
 //   - roles:    RBAC rules per role -> table -> operation
+//
+// plus the optional tables: section that shapes individual tables and views
+// (logical keys, declared relationships, GraphQL names, docs).
 package config
 
 import (
@@ -26,6 +29,10 @@ type Config struct {
 	SchemaGen SchemaGen        `yaml:"schema_gen"`
 	Roles     map[string]*Role `yaml:"roles"`
 	Hooks     HooksConfig      `yaml:"hooks"`
+	// Tables shapes individual tables and views in the API: logical primary
+	// keys, declared relationships, custom GraphQL names, descriptions and
+	// deprecations (see TableConfig). Keyed by SQL table name.
+	Tables map[string]*TableConfig `yaml:"tables"`
 }
 
 // HooksConfig wires custom logic to the API. Hook names referenced here are
@@ -191,6 +198,11 @@ type SchemaGen struct {
 	// recommended for new deployments and large tables; it changes the
 	// declared type of those fields, which matters to generated clients).
 	CountType string `yaml:"count_type"`
+	// DescriptionsFromComments uses the TiDB table and column COMMENTs as
+	// the GraphQL descriptions of the generated object types and column
+	// fields (a description under tables: still wins). Off by default:
+	// comments written for DBAs become visible in every role's schema.
+	DescriptionsFromComments bool `yaml:"descriptions_from_comments"`
 }
 
 // Count scalar names accepted by schema_gen.count_type.
@@ -491,6 +503,9 @@ func (c *Config) validate() error {
 		return fmt.Errorf("server.max_response_bytes must be >= 0 (0 = unlimited)")
 	}
 	if err := c.validateChecks(); err != nil {
+		return err
+	}
+	if err := c.validateTables(); err != nil {
 		return err
 	}
 	return c.validateFilterSurface()

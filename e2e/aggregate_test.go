@@ -464,9 +464,10 @@ func TestDemoConfigAggregates(t *testing.T) {
 	if err != nil {
 		t.Fatalf("demo gqlgate.yaml: %v", err)
 	}
-	env := New(t, WithConfig(func(c *config.Config) {
+	env := New(t, WithSQL(demoModelingSQL(t)), WithConfig(func(c *config.Config) {
 		c.Roles = demo.Roles
 		c.SchemaGen = demo.SchemaGen
+		c.Tables = demo.Tables
 	}))
 
 	r := env.MustGQL(t, "", `{ users_connection { nodes {

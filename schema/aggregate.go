@@ -160,7 +160,7 @@ func (b *builder) countScalar() *graphql.Scalar {
 
 // addAggregateField adds the <t>_aggregate query field.
 func (b *builder) addAggregateField(fields graphql.Fields, ti *tableInfo) {
-	fields[ti.typeName+"_aggregate"] = &graphql.Field{
+	fields[ti.rootName(config.RootAggregate)] = &graphql.Field{
 		Type:        graphql.NewNonNull(b.aggTypes[ti.table.Name]),
 		Description: fmt.Sprintf("Aggregates over %s matching the filter (count/sum/avg/min/max/count_distinct/stddev/...).", ti.table.Name),
 		Args: graphql.FieldConfigArgument{
@@ -534,18 +534,23 @@ func (b *builder) runAggregateByKeys(ctx context.Context, ti *tableInfo, id *rba
 // Unlike the list field, batching does not need the child's FK columns to be
 // readable: they are only selected as the GROUP BY key and matched against
 // parent key values the role can already read, never returned to the client.
-func (b *builder) addArrayRelAggField(fields graphql.Fields, rel *relInfo) {
-	fk, child := rel.fk, rel.target
-	parent := b.tinfos[fk.RefTable]
-	keyCols := make([]*introspect.Column, len(fk.RefColumns))
-	for i, rc := range fk.RefColumns {
-		keyCols[i] = parent.table.ColumnMap[rc]
+func (b *builder) addArrayRelAggField(fields graphql.Fields, parent *tableInfo, rel *relInfo) {
+	child := rel.target
+	localCols, childCols := rel.localCols, rel.targetCols
+	keyCols := make([]*introspect.Column, len(localCols))
+	for i, lc := range localCols {
+		keyCols[i] = parent.table.ColumnMap[lc]
+	}
+	desc := fmt.Sprintf("Aggregates over the %s rows of %s.", child.table.Name, rel.name)
+	if rel.fk != nil {
+		desc = fmt.Sprintf("Aggregates over the %s rows whose %s reference this row.", rel.fk.Table, strings.Join(rel.fk.Columns, ", "))
 	}
 	fields[rel.aggName] = &graphql.Field{
-		Type:        graphql.NewNonNull(b.aggTypes[fk.Table]),
-		Description: fmt.Sprintf("Aggregates over the %s rows whose %s reference this row.", fk.Table, strings.Join(fk.Columns, ", ")),
+		Type:              graphql.NewNonNull(b.aggTypes[child.table.Name]),
+		Description:       desc,
+		DeprecationReason: rel.deprecated,
 		Args: graphql.FieldConfigArgument{
-			"where": &graphql.ArgumentConfig{Type: b.boolExps[fk.Table]},
+			"where": &graphql.ArgumentConfig{Type: b.boolExps[child.table.Name]},
 		},
 		Resolve: func(p graphql.ResolveParams) (any, error) {
 			id, err := identityFrom(p)
@@ -554,9 +559,9 @@ func (b *builder) addArrayRelAggField(fields graphql.Fields, rel *relInfo) {
 			}
 			req := b.collectAggSelections(child, p.Info)
 			row, _ := p.Source.(map[string]any)
-			key := make([]any, len(fk.RefColumns))
-			for i, rc := range fk.RefColumns {
-				v := row[rc]
+			key := make([]any, len(localCols))
+			for i, lc := range localCols {
+				v := row[lc]
 				if v == nil {
 					return emptyAggResult(req), nil // NULL key: no child can reference it
 				}
@@ -566,8 +571,8 @@ func (b *builder) addArrayRelAggField(fields graphql.Fields, rel *relInfo) {
 			if serialMutation(p.Info) {
 				// Resolve now, before the next root mutation runs (see
 				// serialMutation): one query for this parent.
-				parts := make([]string, len(fk.Columns))
-				for i, c := range fk.Columns {
+				parts := make([]string, len(childCols))
+				for i, c := range childCols {
 					parts[i] = quoteIdent(c) + " = ?"
 				}
 				return b.runAggregate(p.Context, child, id, where, req,
@@ -578,10 +583,10 @@ func (b *builder) addArrayRelAggField(fields graphql.Fields, rel *relInfo) {
 				return nil, fmt.Errorf("encoding where: %w", err)
 			}
 			loader := loadersFrom(p.Context).getOrCreate(
-				loaderKey("agg", fk.Table+"."+fk.ConstraintName, string(sig)+"\x00"+req.signature()),
+				loaderKey("agg", rel.aggKey, string(sig)+"\x00"+req.signature()),
 				func() *relLoader {
 					return newRelLoader(func(ctx context.Context, keys [][]any) (map[string][]map[string]any, error) {
-						return b.runAggregateByKeys(ctx, child, id, fk.Columns, keyCols, keys, where, req)
+						return b.runAggregateByKeys(ctx, child, id, childCols, keyCols, keys, where, req)
 					})
 				})
 			loader.enqueue(key)

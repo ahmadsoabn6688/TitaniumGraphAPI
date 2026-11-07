@@ -352,7 +352,12 @@ func TestMutationResponseTypes(t *testing.T) {
 }
 
 func TestMutationResponseNameCollision(t *testing.T) {
-	r, err := reserveNames(cat("x", "x_mutation_response"))
+	c := cat("x", "x_mutation_response")
+	m, err := buildModel(c, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := reserveNames(c, m)
 	if err != nil {
 		t.Fatalf("a table named <t>_mutation_response must not fail the build: %v", err)
 	}

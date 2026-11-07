@@ -147,11 +147,21 @@ func Resolve(roleName string, role *config.Role, cat *introspect.Catalog) (*Acce
 	for _, tableName := range cat.TableOrder {
 		table := cat.Tables[tableName]
 		perm, explicit := role.Tables[tableName], true
-		if perm == nil {
+		if perm == nil && !table.IsView {
+			// The "*" wildcard covers base tables only: a view is exposed
+			// to a role only when the role names it.
 			perm, explicit = wildcard, false
 		}
 		if perm == nil {
 			continue
+		}
+		if table.IsView {
+			for i, p := range []*config.OpPerm{perm.Insert, perm.Update, perm.Delete} {
+				if p != nil && p.Allow {
+					op := []string{"insert", "update", "delete"}[i]
+					return nil, fmt.Errorf("role %q grants %s on %q, which is a view (views are read-only; grant select only)", roleName, op, tableName)
+				}
+			}
 		}
 		ta := &TableAccess{}
 		var err error

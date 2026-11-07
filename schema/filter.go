@@ -337,16 +337,26 @@ var opDescriptions = map[string]string{
 
 // --- relationships ---------------------------------------------------------
 
-// relInfo is one foreign-key relationship of a table as seen by a role: an
-// object relationship (this table's FK -> one target row) or an array
-// relationship (target rows whose FK references this row).
+// relInfo is one relationship of a table as seen by a role: an object
+// relationship (this row -> at most one target row) or an array relationship
+// (target rows matching this row). It comes from a foreign key (either
+// direction) or from a declaration under tables.<t>.relationships.
 type relInfo struct {
-	name       string
-	fk         *introspect.ForeignKey
-	outgoing   bool // object relationship
+	name string
+	// key identifies the relationship for request-scoped loaders: the FK's
+	// constraint name, or "\x00cfg:<table>.<name>" for a declared one (a
+	// constraint name cannot contain NUL, so the two never collide).
+	key string
+	// aggKey identifies its <rel>_aggregate loader.
+	aggKey     string
+	fk         *introspect.ForeignKey // nil for a declared relationship
+	outgoing   bool                   // object relationship
 	target     *tableInfo
 	localCols  []string // join columns on this table
 	targetCols []string // join columns on the target table
+	// unenforced: a declared object relationship onto a logical key.
+	unenforced              bool
+	description, deprecated string
 	// filterable: offered in this table's <t>_bool_exp.
 	filterable bool
 	// aggName is the <rel>_aggregate field of an array relationship.
@@ -355,8 +365,11 @@ type relInfo struct {
 
 // relations returns the role-visible relationships of a select-able table,
 // in the order (and with the names) their object-type fields get: outgoing
-// FKs first, then incoming ones, names deconflicted against the readable
-// columns and each other.
+// FKs first, then incoming ones, then the declared relationships (by name).
+// FK relationships keep their generated names (deconflicted against the
+// readable columns and each other) unless the config names them; a name the
+// config gives that another relationship of the role already has is an error
+// (recorded in ti.relErr).
 func (b *builder) relations(ti *tableInfo) []*relInfo {
 	if ti.relsDone {
 		return ti.rels
@@ -375,6 +388,7 @@ func (b *builder) relations(ti *tableInfo) []*relInfo {
 		}
 		return true
 	}
+	var nameCols [][]string // per relationship: the columns a name suffix uses
 
 	// Outgoing: this table's FK -> one row of the referenced table. The
 	// parent row map only holds readable columns, and the join needs the
@@ -388,10 +402,12 @@ func (b *builder) relations(ti *tableInfo) []*relInfo {
 		if len(fk.Columns) == 1 && strings.HasSuffix(fk.Columns[0], "_id") && len(fk.Columns[0]) > 3 {
 			candidate = graphqlName(strings.TrimSuffix(fk.Columns[0], "_id"))
 		}
-		name := relFieldName(taken, candidate, fk)
+		name := relFieldName(taken, candidate, fk.Columns)
 		taken[name] = true
-		ti.rels = append(ti.rels, &relInfo{name: name, fk: fk, outgoing: true, target: target,
-			localCols: fk.Columns, targetCols: fk.RefColumns})
+		ti.rels = append(ti.rels, &relInfo{name: name, key: fk.ConstraintName, aggKey: fk.Table + "." + fk.ConstraintName,
+			fk: fk, outgoing: true, target: target, localCols: fk.Columns, targetCols: fk.RefColumns,
+			description: fmt.Sprintf("Row of %s referenced by %s", fk.RefTable, strings.Join(fk.Columns, ", "))})
+		nameCols = append(nameCols, fk.Columns)
 	}
 	// Incoming: FKs on other tables pointing here -> list of child rows.
 	for _, fk := range ti.table.IncomingFKs {
@@ -399,20 +415,77 @@ func (b *builder) relations(ti *tableInfo) []*relInfo {
 		if child == nil || child.access.Select == nil || !readable(fk.RefColumns) {
 			continue
 		}
-		name := relFieldName(taken, graphqlName(fk.Table), fk)
+		name := relFieldName(taken, graphqlName(fk.Table), fk.Columns)
 		taken[name] = true
-		ti.rels = append(ti.rels, &relInfo{name: name, fk: fk, outgoing: false, target: child,
-			localCols: fk.RefColumns, targetCols: fk.Columns})
+		ti.rels = append(ti.rels, &relInfo{name: name, key: fk.ConstraintName, aggKey: fk.Table + "." + fk.ConstraintName,
+			fk: fk, outgoing: false, target: child, localCols: fk.RefColumns, targetCols: fk.Columns,
+			description: fmt.Sprintf("Rows of %s whose %s reference this row", fk.Table, strings.Join(fk.Columns, ", "))})
+		nameCols = append(nameCols, fk.Columns)
+	}
+	// Names from the config: FK relationships it names, then declared ones.
+	final := map[string]string{} // relationship name -> what owns it
+	var explicit []*relInfo
+	for _, r := range ti.rels {
+		if n := ti.model.fkName(r.fk, r.outgoing); n != nil {
+			r.name = n.name
+			if n.description != "" {
+				r.description = n.description
+			}
+			r.deprecated = n.deprecated
+			explicit = append(explicit, r)
+		}
+	}
+	for _, d := range ti.model.declared {
+		target := b.tinfos[d.target]
+		if target == nil || target.access.Select == nil || !readable(d.localCols) {
+			continue
+		}
+		desc := d.description
+		if desc == "" {
+			if d.object {
+				desc = fmt.Sprintf("Row of %s whose %s match this row's %s", d.target, strings.Join(d.targetCols, ", "), strings.Join(d.localCols, ", "))
+			} else {
+				desc = fmt.Sprintf("Rows of %s whose %s match this row's %s", d.target, strings.Join(d.targetCols, ", "), strings.Join(d.localCols, ", "))
+			}
+		}
+		key := "\x00cfg:" + ti.table.Name + "." + d.name
+		r := &relInfo{name: d.name, key: key, aggKey: key, outgoing: d.object, target: target,
+			localCols: d.localCols, targetCols: d.targetCols, unenforced: d.unenforced,
+			description: desc, deprecated: d.deprecated}
+		ti.rels = append(ti.rels, r)
+		nameCols = append(nameCols, d.localCols)
+		explicit = append(explicit, r)
+	}
+	isExplicit := map[*relInfo]bool{}
+	for _, r := range explicit {
+		isExplicit[r] = true
+	}
+	for _, r := range ti.rels {
+		if !isExplicit[r] {
+			final[r.name] = "the foreign-key relationship " + r.fk.ConstraintName
+		}
+	}
+	for _, r := range explicit {
+		if other, dup := final[r.name]; dup {
+			ti.relErr = fmt.Errorf("table %q: relationship name %q from tables.%s.relationships is already used by %s for role %q; choose another name (or name that relationship with foreign_key:)",
+				ti.table.Name, r.name, ti.table.Name, other, b.role)
+			return ti.rels
+		}
+		final[r.name] = "tables." + ti.table.Name + ".relationships." + r.name
+		taken[r.name] = true
 	}
 	// Array relationships also get <rel>_aggregate. Those names are assigned
 	// only after every relationship is named, so adding them never renames an
 	// existing relationship field; they are deconflicted against the columns,
 	// the relationships and each other.
 	for _, r := range ti.rels {
+		taken[r.name] = true
+	}
+	for i, r := range ti.rels {
 		if r.outgoing {
 			continue
 		}
-		r.aggName = relFieldName(taken, r.name+"_aggregate", r.fk)
+		r.aggName = relFieldName(taken, r.name+"_aggregate", nameCols[i])
 		taken[r.aggName] = true
 	}
 	return ti.rels

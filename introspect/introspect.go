@@ -20,9 +20,14 @@ type Catalog struct {
 	TableOrder []string // stable iteration order
 }
 
-// Table describes one base table.
+// Table describes one base table or view.
 type Table struct {
-	Name        string
+	Name string
+	// IsView marks a view: read-only, without keys or foreign keys of its
+	// own (a logical key and relationships can be declared in the config).
+	IsView bool
+	// Comment is the table COMMENT ("" for none, and always for views).
+	Comment     string
 	Columns     []*Column
 	ColumnMap   map[string]*Column
 	PrimaryKey  []string      // column names, in key order; empty if no PK
@@ -63,6 +68,8 @@ type Column struct {
 	// pick a case-(in)sensitive comparison that can still use an index.
 	Charset   string
 	Collation string
+	// Comment is the column COMMENT ("" for none).
+	Comment string
 }
 
 // ForeignKey is a (possibly composite) foreign key relationship.
@@ -102,46 +109,76 @@ func TableColumns(ctx context.Context, db *sql.DB, schema, table string) (map[st
 	return cols, rows.Err()
 }
 
-// Load introspects the given schema. include/exclude filter table names;
-// an empty include list means every base table in the schema.
+// Options selects what Load introspects.
+type Options struct {
+	// Include/Exclude filter table names; an empty include list means every
+	// base table in the schema. Exclude wins.
+	Include, Exclude []string
+	// Views lists the views that may be loaded (subject to Include/Exclude
+	// like tables). A view not listed here is never loaded, so exposing views
+	// is opt-in by name.
+	Views []string
+}
+
+// Load introspects the given schema's base tables. include/exclude filter
+// table names; an empty include list means every base table in the schema.
 func Load(ctx context.Context, db *sql.DB, schema string, include, exclude []string) (*Catalog, error) {
+	return LoadWith(ctx, db, schema, Options{Include: include, Exclude: exclude})
+}
+
+// LoadWith introspects the given schema: its base tables and the views named
+// in opt.Views, filtered by opt.Include/opt.Exclude.
+func LoadWith(ctx context.Context, db *sql.DB, schema string, opt Options) (*Catalog, error) {
 	cat := &Catalog{SchemaName: schema, Tables: map[string]*Table{}}
 
 	includeSet := map[string]bool{}
-	for _, t := range include {
+	for _, t := range opt.Include {
 		includeSet[t] = true
 	}
 	excludeSet := map[string]bool{}
-	for _, t := range exclude {
+	for _, t := range opt.Exclude {
 		excludeSet[t] = true
+	}
+	viewSet := map[string]bool{}
+	for _, t := range opt.Views {
+		viewSet[t] = true
 	}
 
 	rows, err := db.QueryContext(ctx,
-		`SELECT table_name FROM information_schema.tables
-		 WHERE table_schema = ? AND table_type = 'BASE TABLE'
+		`SELECT table_name, table_type, IFNULL(table_comment, '') FROM information_schema.tables
+		 WHERE table_schema = ? AND table_type IN ('BASE TABLE', 'VIEW')
 		 ORDER BY table_name`, schema)
 	if err != nil {
 		return nil, fmt.Errorf("list tables of schema %q: %w", schema, err)
 	}
 	defer rows.Close()
+	baseTables := 0
 	for rows.Next() {
-		var name string
-		if err := rows.Scan(&name); err != nil {
+		var name, kind, comment string
+		if err := rows.Scan(&name, &kind, &comment); err != nil {
 			return nil, err
 		}
-		if excludeSet[name] {
+		isView := strings.EqualFold(kind, "VIEW")
+		if excludeSet[name] || (isView && !viewSet[name]) {
 			continue
 		}
 		if len(includeSet) > 0 && !includeSet[name] {
 			continue
 		}
-		cat.Tables[name] = &Table{Name: name, ColumnMap: map[string]*Column{}}
+		t := &Table{Name: name, IsView: isView, ColumnMap: map[string]*Column{}}
+		if isView {
+			comment = "" // TiDB/MySQL report the literal "VIEW" here
+		} else {
+			baseTables++
+		}
+		t.Comment = comment
+		cat.Tables[name] = t
 		cat.TableOrder = append(cat.TableOrder, name)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-	if len(cat.Tables) == 0 {
+	if baseTables == 0 {
 		return nil, fmt.Errorf("schema %q contains no exposable base tables (check database.schema and schema_gen.tables filters)", schema)
 	}
 
@@ -306,7 +343,8 @@ func loadColumns(ctx context.Context, db *sql.DB, schema string, t *Table) error
 	rows, err := db.QueryContext(ctx,
 		`SELECT column_name, data_type, column_type, is_nullable, column_key, extra,
 		        column_default IS NOT NULL,
-		        IFNULL(character_set_name, ''), IFNULL(collation_name, '')
+		        IFNULL(character_set_name, ''), IFNULL(collation_name, ''),
+		        IFNULL(column_comment, '')
 		 FROM information_schema.columns
 		 WHERE table_schema = ? AND table_name = ?
 		 ORDER BY ordinal_position`, schema, t.Name)
@@ -318,7 +356,7 @@ func loadColumns(ctx context.Context, db *sql.DB, schema string, t *Table) error
 		var c Column
 		var nullable, key, extra string
 		var hasDefault bool
-		if err := rows.Scan(&c.Name, &c.DataType, &c.ColumnType, &nullable, &key, &extra, &hasDefault, &c.Charset, &c.Collation); err != nil {
+		if err := rows.Scan(&c.Name, &c.DataType, &c.ColumnType, &nullable, &key, &extra, &hasDefault, &c.Charset, &c.Collation, &c.Comment); err != nil {
 			return err
 		}
 		c.DataType = strings.ToLower(c.DataType)
@@ -338,7 +376,7 @@ func loadColumns(ctx context.Context, db *sql.DB, schema string, t *Table) error
 		c.Ordinal = len(t.Columns)
 		t.Columns = append(t.Columns, &c)
 		t.ColumnMap[c.Name] = &c
-		if c.IsPrimary {
+		if c.IsPrimary && !t.IsView {
 			t.PrimaryKey = append(t.PrimaryKey, c.Name)
 		}
 	}

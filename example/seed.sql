@@ -82,3 +82,20 @@ CREATE TABLE audit_log (
     row_count  INT         NOT NULL,
     created_at TIMESTAMP   NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+
+-- A view. Views are read-only in the API and only exposed to roles that name
+-- them; gqlgate.yaml (tables.post_stats) declares its key and relationships.
+CREATE VIEW post_stats AS
+    SELECT p.id AS post_id, p.author_id, COUNT(c.id) AS comment_count, MAX(c.created_at) AS last_comment_at
+    FROM posts p LEFT JOIN comments c ON c.post_id = p.id
+    GROUP BY p.id, p.author_id;
+
+-- No primary key and no foreign key: gqlgate.yaml declares a logical key and
+-- the posts.tags relationship. The COMMENTs become GraphQL descriptions
+-- (schema_gen.descriptions_from_comments).
+CREATE TABLE post_tags (
+    post_id BIGINT      NOT NULL COMMENT 'The tagged post',
+    tag     VARCHAR(30) NOT NULL COMMENT 'Lower-case tag'
+) COMMENT 'Free-form tags on posts';
+INSERT INTO post_tags (post_id, tag) VALUES
+    (1, 'history'), (1, 'math'), (3, 'compilers'), (4, 'math');

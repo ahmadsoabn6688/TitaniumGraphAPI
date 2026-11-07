@@ -122,6 +122,9 @@ func (b *builder) windowOrder(ti *tableInfo, orderBy []any, joinCols []string) (
 	}
 	fallback := ti.table.PrimaryKey
 	if len(fallback) == 0 {
+		fallback = ti.model.readKey // a declared key (views, keyless tables)
+	}
+	if len(fallback) == 0 {
 		fallback = joinCols
 	}
 	quoted := make([]string, len(fallback))
@@ -318,11 +321,12 @@ func (b *builder) scanRowsOn(ctx context.Context, q queryer, cols []*introspect.
 	return out, extras, nil
 }
 
-// pkOrderClause orders by the primary key ascending — the clustered-index
-// order in TiDB, so it is a range scan, not a sort.
+// pkOrderClause orders by the read key ascending: the primary key — the
+// clustered-index order in TiDB, so it is a range scan, not a sort — or a
+// declared logical key (on a view this may sort).
 func (b *builder) pkOrderClause(ti *tableInfo) string {
-	parts := make([]string, len(ti.table.PrimaryKey))
-	for i, pk := range ti.table.PrimaryKey {
+	parts := make([]string, len(ti.model.readKey))
+	for i, pk := range ti.model.readKey {
 		parts[i] = quoteIdent(pk) + " ASC"
 	}
 	return " ORDER BY " + strings.Join(parts, ", ")
@@ -366,7 +370,7 @@ func (b *builder) runKeysetPage(ctx context.Context, ti *tableInfo, id *rbac.Ide
 	if err != nil {
 		return nil, err
 	}
-	where := combineConds(userCond, filterCond, after)
+	where := combineConds(userCond, filterCond, b.readKeyNotNull(ti), after)
 	query := "SELECT " + selectList(sel.Columns) + " FROM " + b.qualifiedTable(ti.table) +
 		" WHERE " + where.sql + b.pkOrderClause(ti) + " LIMIT ?"
 	args := append(append([]any{}, where.args...), limit)
@@ -486,7 +490,7 @@ func inCondition(cols []string, keys [][]any) *condition {
 	return &condition{sql: "(" + strings.Join(quoted, ", ") + ") IN (" + strings.Join(tuples, ", ") + ")", args: args}
 }
 
-func (b *builder) runCount(ctx context.Context, ti *tableInfo, id *rbac.Identity, where map[string]any) (int64, error) {
+func (b *builder) runCount(ctx context.Context, ti *tableInfo, id *rbac.Identity, where map[string]any, extra *condition) (int64, error) {
 	var userCond *condition
 	var err error
 	if where != nil {
@@ -498,7 +502,7 @@ func (b *builder) runCount(ctx context.Context, ti *tableInfo, id *rbac.Identity
 	if err != nil {
 		return 0, err
 	}
-	cond := combineConds(userCond, filterCond)
+	cond := combineConds(userCond, filterCond, extra)
 	query := "SELECT COUNT(*) FROM " + b.qualifiedTable(ti.table) + " WHERE " + cond.sql
 
 	b.logSQL(query, cond.args)

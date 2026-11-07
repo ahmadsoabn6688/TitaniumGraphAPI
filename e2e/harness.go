@@ -396,6 +396,20 @@ func (e *Env) Reload(t testing.TB, rolesYAML string) error {
 	return e.Gate.Reload(ctx)
 }
 
+// ReloadExtra rewrites the config file with a new extra top-level YAML
+// block (see WithExtraYAML; e.g. a tables: section) and hot-reloads the
+// gateway, returning the Reload error.
+func (e *Env) ReloadExtra(t testing.TB, extra string) error {
+	t.Helper()
+	e.tmplData.Extra = extra
+	if err := e.writeConfig(); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	return e.Gate.Reload(ctx)
+}
+
 func (e *Env) writeConfig() error {
 	tmpl, err := template.New("gqlgate.yaml").Parse(e.settings.template)
 	if err != nil {

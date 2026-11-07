@@ -481,9 +481,10 @@ func TestDemoConfigFilters(t *testing.T) {
 	if err != nil {
 		t.Fatalf("demo gqlgate.yaml: %v", err)
 	}
-	env := New(t, WithConfig(func(c *config.Config) {
+	env := New(t, WithSQL(demoModelingSQL(t)), WithConfig(func(c *config.Config) {
 		c.Roles = demo.Roles
 		c.SchemaGen.CustomOperators = demo.SchemaGen.CustomOperators
+		c.Tables = demo.Tables
 	}))
 
 	r := env.MustGQL(t, "", `{ posts_connection(where: {published_on: {_year_eq: 2026}, author: {name: {_eq: "Ada Lovelace"}}, title: {_istarts_with: "notes"}}) { nodes { id } } }`, nil)
