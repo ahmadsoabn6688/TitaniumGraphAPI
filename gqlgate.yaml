@@ -24,6 +24,14 @@ server:
   hot_reload: true        # edit this file and save; no restart needed
   max_response_rows: 10000  # fail requests that would return more rows (0 = no limit)
   max_parallel_root_fields: 4  # independent query root fields run concurrently (1 = serial)
+  # Live queries over WebSocket (graphql-transport-ws) on the same path; a
+  # role subscribes to a table with select.subscribe: true (see roles below).
+  # In GraphiQL, as an author:
+  #   subscription { posts_connection(where: {published: {_eq: false}}) { nodes { id title } } }
+  subscriptions:
+    poll_interval_ms: 1000      # re-run every second, push only on change
+    max_subscriptions_per_connection: 20
+    reauth_interval_seconds: 10 # re-check the token and users.role this often
   cors:
     enabled: true
     allowed_origins: ["*"]
@@ -78,6 +86,9 @@ tables:
     relationships:
       stats: {type: object, target: post_stats, mapping: {id: post_id}}
       tags: {type: array, target: post_tags, mapping: {id: post_id}}
+    subscriptions:
+      root_fields:
+        aggregate: 5000   # posts_aggregate live counts poll every 5s
   users:
     columns:
       metadata: {json_type: UserMetadata}   # typed instead of an opaque JSON value
@@ -164,7 +175,9 @@ roles:
           allow: true
           columns: [id, name, is_active, created_at]
       posts:
-        select: true
+        select:
+          allow: true
+          subscribe: true   # live queries: posts_connection / _by_pk / _aggregate
         insert:
           allow: true
           columns: [title, body, published, published_on]
@@ -217,6 +230,7 @@ roles:
             title: [_eq, _in, _starts_with, _istarts_with, _icontains]
             published_on: all
             created_at: all
+          subscribe: true   # a live public feed; published = 1 applies on every poll
       users:
         select:
           allow: true

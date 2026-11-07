@@ -135,6 +135,9 @@ type Server struct {
 	// 1 runs them one after another. Mutations always run serially. Above 1
 	// it must be less than database.max_open_conns.
 	MaxParallelRootFields int `yaml:"max_parallel_root_fields"`
+	// Subscriptions configures live queries over WebSocket (see
+	// Subscriptions).
+	Subscriptions Subscriptions `yaml:"subscriptions"`
 }
 
 // CORS configures cross-origin access (useful when GraphiQL or a SPA runs on
@@ -324,11 +327,16 @@ type TablePerm struct {
 //	    title: [_eq, _ilike, _starts_with]
 //	  filter_operators: [_eq, _in, _is_null, _ilike]  # table-wide operator allow-list
 //	  filter_relationships: [author]  # relationships usable in where ([] = none)
+//	  subscribe: true                 # live queries over WebSocket (default false)
 type OpPerm struct {
 	Allow   bool              `yaml:"allow"`
 	Columns []string          `yaml:"columns"`
 	Filter  string            `yaml:"filter"`
 	Presets map[string]string `yaml:"presets"`
+	// Subscribe lets the role subscribe to the table's read root fields
+	// (live queries over WebSocket, re-polled with this same permission).
+	// select (and native query grants) only; default false.
+	Subscribe bool `yaml:"subscribe"`
 	// Check is a row condition (same SQL + :jwt.<claim> syntax as Filter)
 	// that every row an insert writes, or an update leaves behind, must
 	// satisfy; otherwise the whole mutation is rolled back. insert/update
@@ -533,6 +541,7 @@ func (c *Config) applyDefaults() {
 			}
 		}
 	}
+	c.Server.Subscriptions.applyDefaults()
 	if c.SchemaGen.DefaultPageSize == 0 {
 		c.SchemaGen.DefaultPageSize = 25
 	}
@@ -614,6 +623,9 @@ func (c *Config) validate() error {
 		return err
 	}
 	if err := c.validateNativeQueries(); err != nil {
+		return err
+	}
+	if err := c.validateSubscriptions(); err != nil {
 		return err
 	}
 	return c.validateFilterSurface()

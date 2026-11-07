@@ -111,7 +111,11 @@ func (b *builder) dbErr(err error) error {
 		return &CodedError{Message: err.Error(), Code: code, DBNumber: number}
 	}
 	if b.opt.Logger != nil {
-		if code == CodeDatabaseError {
+		if errors.Is(err, context.Canceled) {
+			// The caller went away: a closed connection, or a subscription
+			// completed or shut down mid-poll. Routine, not a fault.
+			b.opt.Logger.Debug("database query cancelled", "role", b.role, "err", err)
+		} else if code == CodeDatabaseError {
 			b.opt.Logger.Error("database error", "role", b.role, "err", err)
 		} else {
 			b.opt.Logger.Info("database rejected the request", "role", b.role, "code", code, "err", err)

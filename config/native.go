@@ -63,6 +63,9 @@ type NativeQuery struct {
 	// Relationships declares relationships from result rows to tables or
 	// views (type, target and mapping, as under tables:).
 	Relationships map[string]*RelationshipConfig `yaml:"relationships"`
+	// Subscriptions overrides the polling interval of the query's
+	// subscription fields (kinds list and connection).
+	Subscriptions *SubscriptionPolling `yaml:"subscriptions"`
 }
 
 // NativeRootFields configures a native query's root fields.

@@ -90,6 +90,12 @@ CLI can mint dev tokens (`-print-token`).
   caller's claims and the database — batched like relationships.
 - **Concurrent root fields.** The independent root fields of one query run
   in parallel (bounded per request); mutations stay strictly serial.
+- **Subscriptions (live queries).** `subscription { posts_connection { … } }`
+  over WebSocket (the `graphql-transport-ws` protocol, on the same path):
+  the role's own query re-runs on an interval and is pushed only when the
+  result changed. Opt-in per role and table (`select.subscribe: true`),
+  authenticated in `connection_init`, closed when the token expires or the
+  role lookup no longer accepts the caller.
 - **Safe by construction**: claim values and all client inputs are always
   bound as SQL parameters; identifiers come from `information_schema` and are
   backtick-quoted; algorithm-pinned JWT verification (no alg confusion);
@@ -149,10 +155,10 @@ refuses to run against any other host, so it can never touch your real data.
 ```go
 cfg, err := config.Load("gqlgate.yaml")
 gate, err := gqlgate.Open(ctx, cfg)
-defer gate.Close()
+defer gate.Close() // also closes open subscription WebSockets
 
 mux := http.NewServeMux()
-mux.Handle("/graphql", gate.Handler()) // GraphQL + GraphiQL + /healthz
+mux.Handle("/graphql", gate.Handler()) // GraphQL (HTTP + WebSocket) + GraphiQL + /healthz
 mux.Handle("/signup", yourSignupHandler) // you issue the JWTs
 http.ListenAndServe(":8080", mux)
 ```
@@ -183,7 +189,18 @@ server:
   reload_interval_seconds: 2
   cors:
     enabled: true
-    allowed_origins: ["*"]
+    allowed_origins: ["*"]   # also the origins allowed to open a WebSocket
+  subscriptions:           # live queries over WebSocket (see "Subscriptions")
+    enabled: true          # default true; nothing is subscribable until a role grants select.subscribe
+    poll_interval_ms: 1000 # default polling interval
+    min_poll_interval_ms: 250    # bounds for every interval in the file
+    max_poll_interval_ms: 60000
+    max_connections: 1000        # open sockets per gateway (-1 = unlimited)
+    max_subscriptions_per_connection: 100
+    connection_init_timeout_seconds: 10
+    keepalive_seconds: 30        # WebSocket ping interval (-1 = no pings)
+    ping_timeout_seconds: 10     # an unanswered ping closes the socket
+    reauth_interval_seconds: 10  # re-verify the token / role lookup this often
 
 jwt:
   algorithm: HS256         # HS256/384/512, RS256/384/512, ES256/384/512 — exactly one
@@ -244,6 +261,9 @@ tables:                    # optional per-table modeling (see "Modeling: views, 
   posts:
     relationships:
       writer: {foreign_key: fk_posts_author, description: "The author"}  # names an FK relationship
+    subscriptions:         # polling interval of this table's subscription fields
+      poll_interval_ms: 2000
+      root_fields: {aggregate: 10000}   # per kind: by_pk connection aggregate list unique
 
 json_types:                # optional shapes for JSON columns (see "Typed JSON columns")
   StatsDetails:
@@ -270,6 +290,7 @@ native_queries:            # optional parameterized SQL root fields (see "Native
     key: [post_id]         # optional: adds author_post_stats_connection (keyset cursor)
     relationships:
       author: {type: object, target: users, mapping: {author_id: id}}
+    subscriptions: {poll_interval_ms: 5000}   # optional; kinds list and connection
 
 roles:
   <role-name>:
@@ -289,6 +310,7 @@ roles:
         #     title: [_eq, _ilike, _starts_with]
         #   filter_operators: [_eq, _in, _is_null, _ilike, _starts_with]  # table-wide allow-list; [] = none
         #   filter_relationships: [author]  # default: every relationship; [] = none
+        #   subscribe: true               # live queries on this table (default false)
     native_queries:        # grants by name (no "*"); same shape as select
       author_post_stats:
         allow: true
@@ -310,6 +332,7 @@ roles:
 | `select.filterable_columns` | Which readable columns appear in `<table>_bool_exp` (default: all of them). A list (`[id, title]`) or a map of column → `all` / operator list. Non-filterable columns stay selectable. |
 | `select.filter_operators` | Table-wide operator allow-list, intersected with any per-column list (default: every operator, custom ones included; `[]` = none, i.e. no column filters on the table, and so no relationship filters either). |
 | `select.filter_relationships` | Relationship fields usable in `where` (default: every relationship the role can follow whose local join columns are filterable with `_eq`; `[]` = none). Navigation in the selection set is unaffected. |
+| `select.subscribe` | The table's read root fields (`_by_pk`, `_connection`, `_aggregate`, unique-key lookups, `_list`) also appear on the role's `Subscription` root, as live queries running with this same select permission. Default `false`: every subscription is a recurring query. Only valid on `select` (and native query grants). See [Subscriptions](#subscriptions-live-queries). |
 | `native_queries.<q>` | Grants a native query to the role (explicit only; no wildcard). `columns`, `filter` and the filter-surface keys work as for `select`, over the query's result columns; `presets` force **argument** values. See [Native queries](#native-queries). |
 
 Notes worth knowing:
@@ -450,6 +473,11 @@ delete_users_by_email(email: String!): users
   # posts_mutation_response implements mutation_response { affected_rows: Int! }
   #   and adds returning: [posts!]! (see "Mutation results")
   # (count, total_count and affected_rows are BigInt! with schema_gen.count_type: BigInt)
+
+# subscriptions (with select.subscribe: true) — the same fields as live queries
+subscription { posts_connection(first: Int, after: String, where: posts_bool_exp): posts_connection! }
+  # also posts_by_pk, posts_aggregate, users_by_email, <t>_list and native
+  # query fields; one root field per subscription (see "Subscriptions")
 
 # on each row type, per array relationship (here users <- posts.author_id)
 users { posts(where, order_by, limit, offset): [posts!]!
@@ -943,7 +971,8 @@ schema/              per-role GraphQL schema, parameterized SQL, where/filter
                      object fields, typed JSON, concurrent root fields,
                      writes (returning, checks), error codes, response limits,
                      native queries
-server/              HTTP handler, GraphiQL (embedded), CORS, depth limit
+server/              HTTP handler, GraphiQL (embedded), CORS, depth limit,
+                     WebSocket subscriptions (graphql-transport-ws)
 options.go           hook resolution (YAML names → hooks/ registry) + JWT signer
 cmd/gqlgate/         CLI: serve (with startup retry) + -print-token
 example/             seed schema + seeding tool
@@ -1022,6 +1051,154 @@ server:
   concurrently too: their resolvers must be safe to run in parallel with
   others (they already had to be, across requests).
 
+## Subscriptions (live queries)
+
+A role can **subscribe** to the tables it is allowed to: the read root fields
+of the table appear on the role's `Subscription` root, and the gateway keeps
+re-running the subscription and pushes the result whenever it changed.
+
+```yaml
+server:
+  subscriptions:
+    poll_interval_ms: 1000        # default; bounded by min/max_poll_interval_ms
+
+tables:
+  posts:
+    subscriptions:                # optional per-table override…
+      poll_interval_ms: 2000
+      root_fields:                # …and per field kind
+        aggregate: 10000          # live counts over a big table: poll less often
+
+roles:
+  author:
+    tables:
+      posts:
+        select:
+          allow: true
+          filter: "author_id = :jwt.sub"
+          subscribe: true         # default false
+```
+
+```graphql
+subscription MyDrafts {
+  posts_connection(where: {published: {_eq: false}}, first: 20) {
+    nodes { id title author { name } comments_aggregate { count } }
+  }
+}
+subscription { posts_aggregate(where: {published: {_eq: true}}) { count } }
+subscription { posts_by_pk(id: 42) { title published } }
+```
+
+**What is subscribable.** With `select.subscribe: true`, the table's
+`<t>_by_pk`, `<t>_connection`, `<t>_aggregate`, unique-key lookups
+(`<t>_by_<cols>`) and, for a table without a readable key, `<t>_list`, under
+the same names and with the same arguments as the query fields; for a
+native query granted with `subscribe: true`, `<q>` and `<q>_connection`. A
+subscription field *is* the query field: the role's columns, row filter,
+filter surface, cursor rules and argument presets apply on every poll, so a
+subscription can never read more than the same query. `subscribe` gates the
+root fields only — relationships and nested aggregates in the selection
+follow the related table's `select` permission, exactly as in queries. A
+role with no subscribable table has no `Subscription` type at all, and
+`server.subscriptions.enabled: false` removes it (and the WebSocket
+endpoint) for everyone. Each subscription selects exactly one root field.
+Vector search fields and custom fields from `hooks/` are not offered.
+
+**How it runs.** Each subscription re-executes its operation every interval
+(TiDB has no change notifications to listen to) with a fresh request
+context — query timeout (`database.query_timeout_seconds`), relationship
+dataloaders (so `author { name }` stays one batched query per poll, never
+N+1), `max_response_rows` / `max_response_bytes` — and pushes a `next`
+message only when the JSON result differs from the last one sent (SHA-256
+of the encoded result). The first result is always pushed. An execution
+error (a timeout, a response limit) is pushed as a result with `errors`, and
+polling continues. The interval is the field kind's `root_fields` entry,
+else the table's (or native query's) `poll_interval_ms`, else the server
+default; every value must lie between `min_poll_interval_ms` and
+`max_poll_interval_ms`. Field descriptions in the schema state the
+interval.
+
+**Protocol.** WebSocket on the GraphQL path with the subprotocol
+`graphql-transport-ws` — the protocol of the [`graphql-ws`](https://github.com/enisdenjo/graphql-ws)
+client (Apollo Client's `GraphQLWsLink`, urql's `subscriptionExchange`,
+GraphiQL). The legacy `subscriptions-transport-ws` protocol is not
+supported. Queries and mutations sent over the socket run once (`next`, then
+`complete`), with the same permissions as over HTTP. (Conversely, a subscription
+operation POSTed over HTTP runs once and returns the current result.)
+
+```ts
+import { createClient } from "graphql-ws";
+
+const client = createClient({
+  url: "ws://localhost:8080/graphql",
+  // Browsers cannot set headers on a WebSocket: the token travels in
+  // connection_init. {headers: {Authorization: …}} works too, and so does
+  // the role header (X-Gqlgate-Role) next to it.
+  connectionParams: () => ({ Authorization: `Bearer ${token}` }),
+});
+const stop = client.subscribe(
+  { query: "subscription { posts_aggregate { count } }" },
+  { next: (r) => console.log(r.data), error: console.error, complete: () => {} },
+);
+```
+
+**Authentication.** The `connection_init` payload carries the
+`Authorization` header (and optionally the role header), as top-level keys
+or under `headers` — nothing else from the payload is used. Non-browser
+clients may instead send them on the upgrade request. They are verified
+exactly like an HTTP request's (role claim or `role_lookup`, allowed roles);
+an anonymous connection gets the anonymous role. Afterwards:
+
+- the socket closes with **4401** when the token expires (`exp` plus
+  `jwt.leeway_seconds`), even with no poll in flight;
+- every `reauth_interval_seconds` (and after every reload) the next poll
+  re-verifies the token and re-resolves the role — a role lookup that now
+  fails, names an unconfigured role or **a different role** than the socket
+  started with, or a token the current config rejects closes it with
+  **4403**. A transient database error during that re-check also closes the
+  socket (fail closed); clients reconnect.
+
+The browser `Origin` of the upgrade must be the gateway's own, or match
+`server.cors.allowed_origins` when CORS is enabled.
+
+| Close code | Meaning |
+|---|---|
+| 4400 | Invalid message (not JSON, unknown type, binary frame, subscribe without id) |
+| 4401 | `subscribe` before `connection_ack`, or the token expired |
+| 4403 | `connection_init` rejected, or the re-check no longer accepts the caller |
+| 4406 | Subprotocol other than `graphql-transport-ws` |
+| 4408 | No `connection_init` within `connection_init_timeout_seconds` |
+| 4409 | An operation id that is already running |
+| 4429 | A second `connection_init` |
+| 1001 | Server shutting down |
+| 1008 | A WebSocket ping unanswered for `ping_timeout_seconds` |
+
+An invalid operation (unknown field, hidden column, more than one root
+field, too deep, no subscriptions for the role) gets an `error` message and
+ends; the socket stays open.
+
+**Limits.** `max_connections` (further upgrades get HTTP 503),
+`max_subscriptions_per_connection` (further operations get an `error`
+message), `connection_init_timeout_seconds`, WebSocket pings every
+`keepalive_seconds` with `ping_timeout_seconds` to answer, and the 1 MiB
+message limit of HTTP requests.
+
+**Reload and shutdown.** Subscriptions are re-validated after a hot reload
+(see [Hot config reload](#hot-config-reload-dev)). `Gate.Close` and the
+built-in server's shutdown close every socket with 1001 and wait for the
+polls to stop; an embedding host serving `gate.Handler()` itself calls
+`gate.Close()` on shutdown (`http.Server.Shutdown` does not track
+WebSockets).
+
+**Cost.** Each subscription is its own poll — subscribers are not
+multiplexed, so 1,000 subscribers at 1 s are 1,000 queries per second.
+Grant `subscribe` deliberately, prefer `_by_pk` and narrow `where` filters,
+give aggregates longer intervals, and use the limits above. Every poll reads
+the latest data (no stale or follower reads).
+
+**GraphiQL** runs subscriptions too: it opens a socket lazily with the
+Headers tab as the `connection_init` payload.
+
 ## Hot config reload (dev)
 
 With `server.hot_reload: true`, gqlgate watches the config file and rebuilds
@@ -1044,6 +1221,13 @@ Connection settings (including `max_open_conns` / `max_idle_conns`) and the
 listen host/port/path can't change this way (they need a new pool/listener); such a change is rejected and the previous config
 keeps serving. Embedding hosts can also call `gate.Reload(ctx)` directly (e.g.
 on SIGHUP). Keep `hot_reload` off in production.
+
+Open subscriptions are **re-validated**, not frozen: on its next poll each
+connection re-authenticates against the new config, and each subscription is
+checked against its role's new schema before it runs again (picking up a new
+polling interval). One the new permissions reject — a column or table no
+longer readable, `subscribe` revoked — ends with an `error` message; a caller
+the new config no longer accepts is disconnected (close code 4403).
 
 ## Querying it (React or any client)
 
@@ -1755,6 +1939,11 @@ it: `WithRolesYAML`, `WithExtraYAML` (e.g. a `hooks:` block),
 config file and hot-reloads (`env.ReloadExtra(t, yaml)` does the same for
 the extra block, e.g. a `tables:` section); `env.DB`/`env.Exec`/`env.QueryInt` reach the
 private database directly to verify what actually happened.
+Subscriptions are tested over a real WebSocket: `ws := env.DialWS(t,
+e2e.AuthPayload(token))` connects and waits for the ack, then
+`ws.Subscribe(t, id, query, vars)`, `ws.Next(t, id, timeout)`,
+`ws.Quiet(t, d)` (asserts no push) and `ws.WaitClose(t, timeout)` (the close
+code and reason).
 
 ## Limitations (deliberate, v1)
 
@@ -1768,13 +1957,23 @@ private database directly to verify what actually happened.
   database.
 - No arbitrary `GROUP BY`/grouped aggregates yet (aggregates are whole-filter,
   or per parent row via `<rel>_aggregate`), no aggregate predicates in
-  `where` (e.g. "authors with more than 5 posts"), no subscriptions. Views are
+  `where` (e.g. "authors with more than 5 posts"). Views are
   read-only and must be named in the config to be exposed.
+- Subscriptions are live queries by polling (TiDB has no LISTEN/NOTIFY or
+  triggers): each subscription runs its own query every interval, with no
+  sharing between identical subscriptions, so N subscribers cost N queries
+  per interval — size `max_connections`, `max_subscriptions_per_connection`
+  and the intervals accordingly (aggregates over big tables deserve long
+  ones). Changes between two polls that cancel out are never seen; there
+  are no streaming (`_stream`) subscriptions, no custom subscription fields
+  from `hooks/`, and only `graphql-transport-ws` (not the legacy
+  `subscriptions-transport-ws` "graphql-ws" protocol).
 - TiDB has no spatial/GIS types; use lat/lng columns + bounding-box filters, or
   `VECTOR` columns for similarity search.
 - Schema is introspected once at startup (or on hot reload) — restart after DDL
   changes that aren't picked up by a reload.
-- GraphiQL loads its JS/CSS from unpkg.com (needs internet in dev).
+- GraphiQL loads its JS/CSS (and the `graphql-ws` client it uses for
+  subscriptions) from unpkg.com (needs internet in dev).
 - Relationship filters nest at most 8 levels; custom operators take a single
   scalar argument (no list arguments).
 - A role's select filter that doesn't resolve against its own table (see RBAC
@@ -1835,5 +2034,10 @@ never for unauthenticated requests) — keep `allowed_roles_column` and
 must not escalate (see "Role selection"), since a role that writes them grants
 itself roles; hook object fields exist only for roles
 that can read the columns they consume; mistyped stored JSON yields a coded
-field error, never a crash; and concurrent root fields are capped per request
-below the pool size.
+field error, never a crash; concurrent root fields are capped per request
+below the pool size; and a subscription is an ordinary query of the role
+re-run per poll — validated and depth-checked like a request, re-validated
+after a reload, with a fresh timeout, dataloader and row budget each time —
+on a socket that only accepts the configured origins, authenticates before
+any operation, and closes when its token expires or a periodic re-check of
+the token and role lookup fails.

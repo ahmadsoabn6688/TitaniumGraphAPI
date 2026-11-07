@@ -89,6 +89,9 @@ type OpAccess struct {
 	// FilterRelationships lists the relationship fields usable in `where`
 	// (nil = every relationship the role can follow).
 	FilterRelationships []string
+	// Subscribe: the role may subscribe to the read root fields (select
+	// only; live queries re-run with this same permission).
+	Subscribe bool
 }
 
 // Filterable reports whether a readable column may appear in `where` at all
@@ -224,6 +227,9 @@ func resolveOp(roleName string, table *introspect.Table, op string, perm *config
 		if err := resolveFilterSurface(roleName, table, perm, oa, explicit); err != nil {
 			return nil, err
 		}
+		oa.Subscribe = perm.Subscribe
+	} else if perm.Subscribe {
+		return nil, fmt.Errorf("role %q, table %q: subscribe applies to select only, not %s", roleName, table.Name, op)
 	}
 
 	if perm.Filter != "" {

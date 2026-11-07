@@ -4,11 +4,13 @@
 package auth
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -165,6 +167,44 @@ func (v *Verifier) Identify(r *http.Request) (*rbac.Identity, int, error) {
 	}
 	return &rbac.Identity{Role: role, Claims: claims}, 0, nil
 }
+
+// IdentifyHeaders authenticates a caller from a header set instead of an
+// HTTP request — a WebSocket connection's connection_init payload. Only the
+// Authorization header and the role header are read; ctx bounds the role
+// and allowed-roles lookups.
+func (v *Verifier) IdentifyHeaders(ctx context.Context, h http.Header) (*rbac.Identity, int, error) {
+	r, err := http.NewRequestWithContext(ctx, http.MethodGet, "/", nil)
+	if err != nil {
+		return nil, http.StatusInternalServerError, err
+	}
+	for _, k := range []string{"Authorization", v.cfg.RoleHeader} {
+		if val := h.Get(k); val != "" {
+			r.Header.Set(k, val)
+		}
+	}
+	return v.Identify(r)
+}
+
+// RoleHeader is the request header that selects one of the caller's
+// allowed roles.
+func (v *Verifier) RoleHeader() string { return v.cfg.RoleHeader }
+
+// Deadline is when an identity's token stops being accepted: its exp claim
+// plus the configured leeway. ok is false for an identity without a token
+// expiry (the anonymous role).
+func (v *Verifier) Deadline(id *rbac.Identity) (deadline time.Time, ok bool) {
+	if id == nil || id.Claims == nil {
+		return time.Time{}, false
+	}
+	exp, err := jwt.MapClaims(id.Claims).GetExpirationTime()
+	if err != nil || exp == nil {
+		return time.Time{}, false
+	}
+	return exp.Add(time.Duration(v.cfg.LeewaySeconds) * time.Second), true
+}
+
+// IsExpired reports whether an Identify error is an expired token.
+func IsExpired(err error) bool { return errors.Is(err, jwt.ErrTokenExpired) }
 
 // defaultRole resolves the role a verified caller gets without the role
 // header: from the role resolver when one is set, else from the role claim.

@@ -186,3 +186,47 @@ func TestParseRoleList(t *testing.T) {
 		t.Error("a JSON array with a non-string must fail")
 	}
 }
+
+// IdentifyHeaders authenticates a WebSocket connection from its
+// connection_init headers exactly like a request, reading only the
+// Authorization and role headers.
+func TestIdentifyHeadersAndDeadline(t *testing.T) {
+	v := testVerifier(t, func(c *config.JWT) {
+		c.AllowedRolesClaim = "roles"
+		c.LeewaySeconds = 30
+	}, nil)
+	exp := time.Now().Add(time.Hour).Unix()
+	tok := token(t, jwt.MapClaims{"role": "author", "roles": []any{"editor"}, "exp": exp})
+	h := http.Header{}
+	h.Set("Authorization", "Bearer "+tok)
+	h.Set(config.DefaultRoleHeader, "editor")
+	id, _, err := v.IdentifyHeaders(context.Background(), h)
+	if err != nil || id.Role != "editor" {
+		t.Fatalf("identify: %v %+v", err, id)
+	}
+	deadline, ok := v.Deadline(id)
+	if !ok || deadline.Unix() != exp+30 {
+		t.Errorf("deadline = %v %v, want exp + leeway", deadline, ok)
+	}
+	h.Set(config.DefaultRoleHeader, "admin")
+	if _, status, err := v.IdentifyHeaders(context.Background(), h); err == nil || status != http.StatusForbidden {
+		t.Errorf("a role outside the allowed list: %d %v", status, err)
+	}
+	// No token: the anonymous role, which has no deadline.
+	id, _, err = v.IdentifyHeaders(context.Background(), http.Header{})
+	if err != nil || id.Role != "anonymous" {
+		t.Fatalf("anonymous: %v %+v", err, id)
+	}
+	if _, ok := v.Deadline(id); ok {
+		t.Error("an anonymous identity has no deadline")
+	}
+	// An expired token is reported as such.
+	h = http.Header{}
+	h.Set("Authorization", "Bearer "+token(t, jwt.MapClaims{"role": "author", "exp": time.Now().Add(-time.Hour).Unix()}))
+	if _, _, err := v.IdentifyHeaders(context.Background(), h); !IsExpired(err) {
+		t.Errorf("expired token: %v", err)
+	}
+	if IsExpired(errors.New("other")) {
+		t.Error("IsExpired on an unrelated error")
+	}
+}

@@ -30,21 +30,35 @@ type Options struct {
 
 // BuildAll builds one GraphQL schema per configured role.
 func BuildAll(opt Options) (map[string]graphql.Schema, error) {
+	built, err := buildAll(opt)
+	if err != nil {
+		return nil, err
+	}
+	return built.Schemas, nil
+}
+
+func buildAll(opt Options) (*Built, error) {
 	shared, err := newBuildShared(opt)
 	if err != nil {
 		return nil, err
 	}
-	out := make(map[string]graphql.Schema, len(opt.Config.Roles))
+	out := &Built{
+		Schemas:       make(map[string]graphql.Schema, len(opt.Config.Roles)),
+		PollIntervals: map[string]map[string]time.Duration{},
+	}
 	for roleName, role := range opt.Config.Roles {
 		access, err := rbac.Resolve(roleName, role, opt.Catalog)
 		if err != nil {
 			return nil, err
 		}
-		s, err := buildRole(opt, shared, roleName, access)
+		b, s, err := buildRoleBuilder(opt, shared, roleName, access)
 		if err != nil {
 			return nil, fmt.Errorf("building schema for role %q: %w", roleName, err)
 		}
-		out[roleName] = s
+		out.Schemas[roleName] = s
+		if len(b.pollIntervals) > 0 {
+			out.PollIntervals[roleName] = b.pollIntervals
+		}
 	}
 	return out, nil
 }
@@ -480,6 +494,9 @@ type builder struct {
 	fieldErr error
 	// natives are the role's views of the native queries it is granted.
 	natives map[string]*nativeInfo
+	// pollIntervals are the polling intervals of the role's subscription
+	// root fields (see subscription.go).
+	pollIntervals map[string]time.Duration
 }
 
 func buildRole(opt Options, shared *buildShared, roleName string, access *rbac.Access) (graphql.Schema, error) {
@@ -666,6 +683,9 @@ func buildRoleBuilder(opt Options, shared *buildShared, roleName string, access 
 	}
 	b.addNativeFields(queryFields)
 	b.applyRootDocs(queryFields, mutationFields)
+	// Live-query copies of the subscribable read fields, taken before a
+	// custom field can replace a generated one of the same name.
+	subscriptionFields := b.subscriptionFields(queryFields)
 
 	// Developer-provided custom fields (e.g. a signup mutation) visible to
 	// this role. They win over generated fields of the same name, and a
@@ -685,6 +705,15 @@ func buildRoleBuilder(opt Options, shared *buildShared, roleName string, access 
 	}
 	if len(mutationFields) > 0 {
 		schemaCfg.Mutation = graphql.NewObject(graphql.ObjectConfig{Name: "Mutation", Fields: mutationFields})
+	}
+	if len(subscriptionFields) > 0 {
+		// Subscription is not a reserved type name (configs from before
+		// subscriptions may use it), so a clash only fails the roles that
+		// actually subscribe.
+		if owner, taken := b.shared.reservedTypes["Subscription"]; taken {
+			return nil, graphql.Schema{}, fmt.Errorf("the type name Subscription (the subscription root) is taken by %s; rename it with tables.<table>.type_name", owner)
+		}
+		schemaCfg.Subscription = graphql.NewObject(graphql.ObjectConfig{Name: "Subscription", Fields: subscriptionFields})
 	}
 	sch, err := graphql.NewSchema(schemaCfg)
 	if err == nil && b.fieldErr != nil {

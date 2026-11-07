@@ -55,6 +55,7 @@ type Gate struct {
 	staticCfg  *config.Config // routing (path/cors/addr) fixed at Open
 	configPath string         // for hot reload; "" disables it
 	handler    http.Handler
+	server     *server.Server // owns the WebSocket (subscription) connections
 
 	state    atomic.Pointer[gateState]
 	reloadMu sync.Mutex // serializes reloads
@@ -108,7 +109,8 @@ func Open(ctx context.Context, cfg *config.Config, opts ...Option) (*Gate, error
 	// Wrap the handler so every request context carries the Gate; custom
 	// field resolvers reach it (and its DB) via gqlgate.FromContext. The
 	// server reads live cfg/schemas/verifier through currentServerState.
-	g.handler = g.injectContext(server.New(cfg, g.currentServerState, logger))
+	g.server = server.NewServer(cfg, g.currentServerState, logger)
+	g.handler = g.injectContext(g.server)
 	return g, nil
 }
 
@@ -129,7 +131,7 @@ func (g *Gate) buildState(ctx context.Context, cfg *config.Config) (*gateState, 
 	if err != nil {
 		return nil, err
 	}
-	schemas, err := schema.BuildAll(schema.Options{
+	built, err := schema.Build(schema.Options{
 		DB:      g.db,
 		Catalog: catalog,
 		Config:  cfg,
@@ -167,7 +169,10 @@ func (g *Gate) buildState(ctx context.Context, cfg *config.Config) (*gateState, 
 		verifier.SetAllowedRoles(auth.NewDBAllowedRoles(g.db, cfg.JWT.RoleLookup))
 	}
 	return &gateState{
-		srv:     &server.State{Cfg: cfg, Schemas: schemas, Verifier: verifier},
+		srv: &server.State{
+			Cfg: cfg, Schemas: built.Schemas, Verifier: verifier,
+			PollIntervals: built.PollIntervals,
+		},
 		catalog: catalog,
 	}, nil
 }
@@ -259,8 +264,14 @@ func (g *Gate) Addr() string {
 	return net.JoinHostPort(g.staticCfg.Server.Host, fmt.Sprintf("%d", g.staticCfg.Server.Port))
 }
 
-// Close releases the database pool.
-func (g *Gate) Close() error { return g.db.Close() }
+// Close closes the open WebSocket (subscription) connections, waiting up to
+// 5 seconds for them to finish, then releases the database pool.
+func (g *Gate) Close() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_ = g.server.Shutdown(ctx)
+	return g.db.Close()
+}
 
 // ListenAndServe serves until ctx is cancelled, then shuts down gracefully.
 // When server.hot_reload is on and a config path is known, it also watches the
@@ -271,6 +282,13 @@ func (g *Gate) ListenAndServe(ctx context.Context) error {
 		Handler:           g.handler,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
+	// http.Server.Shutdown does not wait for hijacked (WebSocket)
+	// connections; close them (code 1001) when it starts.
+	httpServer.RegisterOnShutdown(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = g.server.Shutdown(ctx)
+	})
 
 	if g.staticCfg.Server.HotReload && g.configPath != "" {
 		go g.watchConfig(ctx)

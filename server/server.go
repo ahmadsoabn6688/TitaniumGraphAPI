@@ -35,13 +35,40 @@ type State struct {
 	Cfg      *config.Config
 	Schemas  map[string]graphql.Schema
 	Verifier *auth.Verifier
+	// PollIntervals maps role -> subscription root field -> polling
+	// interval (schema.Built.PollIntervals).
+	PollIntervals map[string]map[string]time.Duration
 }
+
+// Server is the gateway's HTTP handler plus its WebSocket (subscription)
+// connections, which outlive a request and so need their own shutdown.
+type Server struct {
+	handler http.Handler
+	hub     *wsHub
+}
+
+// ServeHTTP serves GraphQL over HTTP and WebSocket, GraphiQL and /healthz.
+func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) { s.handler.ServeHTTP(w, r) }
+
+// Shutdown closes every open WebSocket connection (close code 1001, going
+// away), stops accepting new ones and waits until their goroutines have
+// finished or ctx ends. http.Server.Shutdown does not track hijacked
+// connections, so a host serving the handler calls this too (Gate.Close
+// and Gate.ListenAndServe do).
+func (s *Server) Shutdown(ctx context.Context) error { return s.hub.shutdown(ctx) }
 
 // New assembles the HTTP handler. Routing (path, CORS) is fixed from static;
 // the config/schemas/verifier used per request come from current(), so a
 // reload that swaps the State takes effect on the next request.
 func New(static *config.Config, current func() *State, logger *slog.Logger) http.Handler {
+	return NewServer(static, current, logger)
+}
+
+// NewServer is New, returning the Server so its WebSocket connections can be
+// shut down.
+func NewServer(static *config.Config, current func() *State, logger *slog.Logger) *Server {
 	s := &srv{current: current, logger: logger}
+	hub := newWSHub(s, static)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -52,6 +79,12 @@ func New(static *config.Config, current func() *State, logger *slog.Logger) http
 	mux.HandleFunc(static.Server.Path, func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
+			// A WebSocket upgrade wins over GraphiQL (a browser's upgrade
+			// request may well accept text/html).
+			if isWebSocketUpgrade(r) {
+				hub.serve(w, r)
+				return
+			}
 			if s.current().Cfg.Server.GraphiQL && wantsHTML(r) {
 				w.Header().Set("Content-Type", "text/html; charset=utf-8")
 				_, _ = w.Write(graphiqlHTML)
@@ -65,10 +98,11 @@ func New(static *config.Config, current func() *State, logger *slog.Logger) http
 		}
 	})
 
+	var h http.Handler = mux
 	if static.Server.CORS.Enabled {
-		return corsMiddleware(static.Server.CORS, static.JWT.RoleHeader, mux)
+		h = corsMiddleware(static.Server.CORS, static.JWT.RoleHeader, mux)
 	}
-	return mux
+	return &Server{handler: h, hub: hub}
 }
 
 type srv struct {
@@ -112,16 +146,8 @@ func (s *srv) execute(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx := rbac.WithIdentity(r.Context(), id)
-	timeout := time.Duration(st.Cfg.Database.QueryTimeoutSeconds) * time.Second
-	ctx, cancel := context.WithTimeout(ctx, timeout)
+	ctx, cancel := requestContext(r.Context(), st, id)
 	defer cancel()
-	// Per-request relationship dataloaders (batch N+1 relationship queries).
-	ctx = gqlschema.WithLoaders(ctx)
-	// Per-request response row budget (server.max_response_rows).
-	ctx = gqlschema.WithResponseLimit(ctx, st.Cfg.Server.MaxResponseRows)
-	// Per-request cap on concurrently running root fields of a query.
-	ctx = gqlschema.WithRootParallelism(ctx, st.Cfg.Server.MaxParallelRootFields)
 
 	start := time.Now()
 	result := graphql.Do(graphql.Params{
@@ -131,33 +157,59 @@ func (s *srv) execute(w http.ResponseWriter, r *http.Request) {
 		OperationName:  req.OperationName,
 		Context:        ctx,
 	})
+	out, err := s.encodeResult(ctx, st, result, id.Role, req.OperationName, start)
+	if err != nil {
+		auth.WriteError(w, http.StatusInternalServerError, "could not encode the response")
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	if _, err := w.Write(append(out, '\n')); err != nil && s.logger != nil {
+		s.logger.Error("writing response", "err", err)
+	}
+}
+
+// requestContext prepares the context one GraphQL execution runs in: the
+// caller's identity, the query timeout, fresh relationship dataloaders, the
+// response row budget and the root-field parallelism cap. A subscription
+// gets a new one for every poll.
+func requestContext(parent context.Context, st *State, id *rbac.Identity) (context.Context, context.CancelFunc) {
+	ctx := rbac.WithIdentity(parent, id)
+	timeout := time.Duration(st.Cfg.Database.QueryTimeoutSeconds) * time.Second
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	// Per-request relationship dataloaders (batch N+1 relationship queries).
+	ctx = gqlschema.WithLoaders(ctx)
+	// Per-request response row budget (server.max_response_rows).
+	ctx = gqlschema.WithResponseLimit(ctx, st.Cfg.Server.MaxResponseRows)
+	// Per-request cap on concurrently running root fields of a query.
+	ctx = gqlschema.WithRootParallelism(ctx, st.Cfg.Server.MaxParallelRootFields)
+	return ctx, cancel
+}
+
+// encodeResult finishes one execution: error codes restored, the response
+// row and byte limits applied, the result encoded as JSON.
+func (s *srv) encodeResult(ctx context.Context, st *State, result *graphql.Result, role, operation string, start time.Time) ([]byte, error) {
 	restoreExtensions(result.Errors)
 	if gqlschema.ResponseLimitExceeded(ctx) {
 		limitResult(result, gqlschema.MutationCommitted(ctx))
 	}
 	if st.Cfg.Server.Debug && s.logger != nil {
 		s.logger.Debug("graphql",
-			"role", id.Role,
-			"operation", req.OperationName,
+			"role", role,
+			"operation", operation,
 			"duration", time.Since(start).String(),
 			"errors", len(result.Errors))
 	}
-
 	out, err := json.Marshal(result)
 	if err != nil {
 		if s.logger != nil {
 			s.logger.Error("encoding response", "err", err)
 		}
-		auth.WriteError(w, http.StatusInternalServerError, "could not encode the response")
-		return
+		return nil, err
 	}
 	if limit := st.Cfg.Server.MaxResponseBytes; limit > 0 && len(out) > limit {
 		out = tooLargeBody(len(out), limit, gqlschema.MutationCommitted(ctx))
 	}
-	w.Header().Set("Content-Type", "application/json")
-	if _, err := w.Write(append(out, '\n')); err != nil && s.logger != nil {
-		s.logger.Error("writing response", "err", err)
-	}
+	return out, nil
 }
 
 // restoreExtensions puts back the extensions (error codes) of errors that

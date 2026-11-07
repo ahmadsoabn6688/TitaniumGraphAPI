@@ -57,6 +57,9 @@ type TableConfig struct {
 	// (documents, deprecates) a foreign-key relationship, keyed by the
 	// GraphQL field name.
 	Relationships map[string]*RelationshipConfig `yaml:"relationships"`
+	// Subscriptions overrides the polling interval of the table's
+	// subscription fields (see SubscriptionPolling).
+	Subscriptions *SubscriptionPolling `yaml:"subscriptions"`
 }
 
 // RootFields configures the per-table root fields. Each entry is either a
