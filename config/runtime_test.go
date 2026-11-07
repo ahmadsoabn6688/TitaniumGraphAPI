@@ -35,8 +35,23 @@ func TestMaxParallelRootFields(t *testing.T) {
 		t.Errorf("3 connections: default = %d, want 1", cfg.Server.MaxParallelRootFields)
 	}
 	if _, err := Parse([]byte(withDB("  max_open_conns: 3", "  max_parallel_root_fields: 5\n"))); err == nil ||
-		!strings.Contains(err.Error(), "exceeds database.max_open_conns") {
+		!strings.Contains(err.Error(), "must be less than database.max_open_conns") {
 		t.Errorf("a cap above the pool must be rejected, got %v", err)
+	}
+	// A cap equal to the pool lets one request hold every connection.
+	if _, err := Parse([]byte(withDB("  max_open_conns: 10", "  max_parallel_root_fields: 10\n"))); err == nil ||
+		!strings.Contains(err.Error(), "must be less than database.max_open_conns") {
+		t.Errorf("a cap equal to the pool must be rejected, got %v", err)
+	}
+	if cfg, err := Parse([]byte(withDB("  max_open_conns: 10", "  max_parallel_root_fields: 9\n"))); err != nil || cfg.Server.MaxParallelRootFields != 9 {
+		t.Errorf("a cap below the pool: %v", err)
+	}
+	// Serial (1) holds one connection per request, as without the feature.
+	if _, err := Parse([]byte(withDB("  max_open_conns: 1", "  max_parallel_root_fields: 1\n"))); err != nil {
+		t.Errorf("serial with a one-connection pool: %v", err)
+	}
+	if cfg, err := Parse([]byte(withDB("  max_open_conns: 2", "  port: 8080\n"))); err != nil || cfg.Server.MaxParallelRootFields != 1 {
+		t.Errorf("2 connections: default must be 1, got %v", err)
 	}
 	if _, err := Parse([]byte(withDB("", "  max_parallel_root_fields: -1\n"))); err == nil {
 		t.Error("a negative cap must be rejected")

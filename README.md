@@ -377,6 +377,17 @@ X-Gqlgate-Role: editor
 - With CORS enabled the header is an allowed request header. Changing
   `role_header` needs a restart for CORS; requests pick it up on reload.
 - `{ _role }` reports the role a request was served as.
+- **Keep the allowed-roles source out of reach of the roles it grants.**
+  `allowed_roles_column` sits on the identity table and `allowed_roles_table`
+  is a table of the exposed schema, so both are normally reachable through
+  the generated API. A role that may write them can grant itself any role:
+  `update: {allow: true, filter: "id = :jwt.sub"}` on `users` with no
+  `columns:` list lets a user set its own `allowed_roles` to `'["admin"]'`
+  and then send `X-Gqlgate-Role: admin`; `insert` on `user_roles` does the
+  same. Leave the column out of the `insert`/`update` `columns:` of every
+  role that must not escalate, grant writes on the role table only to
+  admins (or keep that table outside `database.schema`), and treat an
+  `allowed_roles_claim` the same way on the token issuer's side.
 
 ## Generated API, per table (role permitting)
 
@@ -675,7 +686,10 @@ tables:
   JSON `null` is `null`; a value of the wrong kind (a string where an `Int`
   is declared, an array where an object is) is `null` with an error
   carrying `extensions.code: json_shape_mismatch` and the path, while the
-  rest of the row and the response resolve normally.
+  rest of the row and the response resolve normally. Inside a list only the
+  mismatched element is `null` (its error's path ends in the element's
+  index): `[{"city": "A"}, "oops", {"city": "B"}]` as `[Address]` returns
+  both addresses with `null` between them.
 - Column RBAC is unchanged: a role that cannot read the column has neither
   the field nor the declared types in its schema. Shapes are not per-role:
   every role that reads the column sees all of its declared fields.
@@ -765,9 +779,13 @@ server:
   max_parallel_root_fields: 4   # per request; 1 = one after another
 ```
 
-- The default is `min(4, database.max_open_conns / 2)` (at least 1), and the
-  value may not exceed `max_open_conns`, so one wide request cannot take the
-  whole pool. A request with a single root field runs exactly as before.
+- The default is `min(4, database.max_open_conns / 2)` (at least 1). Above
+  1 the value must be **less than** `max_open_conns`, so one wide request
+  always leaves a pooled connection for role lookups and other requests. A
+  request with a single root field runs exactly as before.
+- The pool is sized once at startup, so a hot reload that changes
+  `max_open_conns` / `max_idle_conns` is rejected (restart instead); the cap
+  is therefore always checked against the pool in use.
 - **Mutations always run serially**, in document order.
 - Everything below the root still resolves on one goroutine, so
   relationship batching is unchanged — batches even merge across the root
@@ -797,8 +815,8 @@ server:
   reload_interval_seconds: 2
 ```
 
-Connection settings and the listen host/port/path can't change this way (they
-need a new pool/listener); such a change is rejected and the previous config
+Connection settings (including `max_open_conns` / `max_idle_conns`) and the
+listen host/port/path can't change this way (they need a new pool/listener); such a change is rejected and the previous config
 keeps serving. Embedding hosts can also call `gate.Reload(ctx)` directly (e.g.
 on SIGHUP). Keep `hot_reload` off in production.
 
@@ -1447,7 +1465,8 @@ register.ObjectField(register.ObjectFieldDef{
   resolver's own query decides what it reveals, so restrict it to what every
   role seeing the field may know (use `p.Role` / `p.Claims` to decide).
 - Startup rejects a field whose name collides with a column, relationship
-  or `<rel>_aggregate` field, a `Requires` column the table lacks, an
+  or nested aggregate field (`<rel>_aggregate`, or the name it was renamed to
+  when that was taken, e.g. `posts_aggregate_by_author_id`), a `Requires` column the table lacks, an
   unknown role, or a duplicate table+name; a field for a table the schema
   does not expose is skipped with a warning. A panic in the resolver
   becomes a field error.
@@ -1579,7 +1598,10 @@ exist only for columns the role may read and `_eq`-filter, expected database
 errors carry codes without leaking the database's message, and response
 row/byte limits bound alias and relationship fan-out. A role header can only
 select a configured role from the caller's allowed list (403 otherwise, and
-never for unauthenticated requests); hook object fields exist only for roles
+never for unauthenticated requests) — keep `allowed_roles_column` and
+`allowed_roles_table` out of the insert/update permissions of every role that
+must not escalate (see "Role selection"), since a role that writes them grants
+itself roles; hook object fields exist only for roles
 that can read the columns they consume; mistyped stored JSON yields a coded
 field error, never a crash; and concurrent root fields are capped per request
 below the pool size.

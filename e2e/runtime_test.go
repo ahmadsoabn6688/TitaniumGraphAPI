@@ -325,6 +325,51 @@ func TestConcurrentRootFieldsLimits(t *testing.T) {
 	}
 }
 
+// TestConcurrentRootFieldsPoolGuard: the per-request cap must leave a pooled
+// connection free, and a hot reload cannot resize the pool (it is sized once
+// at startup), so it cannot raise the cap past the pool actually in use.
+func TestConcurrentRootFieldsPoolGuard(t *testing.T) {
+	t.Parallel()
+	env := New(t)
+	raw, err := os.ReadFile(env.ConfigPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rewrite := func(pool, parallel string) string {
+		y := strings.Replace(string(raw), "  max_open_conns: 10\n", "  max_open_conns: "+pool+"\n", 1)
+		return strings.Replace(y, "server:\n", "server:\n  max_parallel_root_fields: "+parallel+"\n", 1)
+	}
+	// Equal to the pool: one request could hold every connection.
+	equal := filepath.Join(t.TempDir(), "equal.yaml")
+	if err := os.WriteFile(equal, []byte(rewrite("10", "10")), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := config.Load(equal); err == nil || !strings.Contains(err.Error(), "must be less than database.max_open_conns") {
+		t.Errorf("max_parallel_root_fields == max_open_conns must be rejected, got %v", err)
+	}
+
+	// A reload that grows the pool to 40 and the cap to 20 is rejected: the
+	// live pool stays at 10.
+	if err := os.WriteFile(env.ConfigPath, []byte(rewrite("40", "20")), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	if err := env.Gate.Reload(ctx); err == nil || !strings.Contains(err.Error(), "max_open_conns") {
+		t.Fatalf("a pool-size change must be rejected on reload, got %v", err)
+	}
+	// The previous config keeps serving, for every role.
+	r := env.MustGQL(t, env.Token(t, "admin", 4), `{ a: posts_aggregate { count } b: users_aggregate { count } }`, nil)
+	if r.Int(t, "a.count") != 4 || r.Int(t, "b.count") != 4 {
+		t.Errorf("admin after rejected reload: %s", r.Raw)
+	}
+	r = env.MustGQL(t, "", `{ a: posts_aggregate { count } }`, nil)
+	if r.Int(t, "a.count") != 3 {
+		t.Errorf("anonymous after rejected reload: %s", r.Raw)
+	}
+	env.GQL(t, "", `{ users_connection { nodes { email } } }`, nil).MustFail(t, "email")
+}
+
 // --- #16 object fields ------------------------------------------------------------
 
 func TestObjectFields(t *testing.T) {
@@ -449,6 +494,45 @@ func TestObjectFieldStartupErrors(t *testing.T) {
 			t.Errorf("want %q, got %v", want, err)
 		}
 	}
+}
+
+// TestObjectFieldRenamedAggregate: a declared relationship called
+// posts_aggregate pushes the posts aggregate to posts_aggregate_by_author_id;
+// a hook field may not take that name and replace the aggregate.
+func TestObjectFieldRenamedAggregate(t *testing.T) {
+	t.Parallel()
+	env := New(t, WithExtraYAML(`tables:
+  users:
+    relationships:
+      posts_aggregate: {type: array, target: comments, mapping: {id: user_id}}
+`))
+	ok := func(context.Context, gqlgate.ObjectFieldParams) (any, error) { return "hook", nil }
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	g, err := gqlgate.Open(ctx, env.Config, gqlgate.WithObjectFields(gqlgate.ObjectField{
+		Table: "users", Name: "posts_aggregate_by_author_id", Type: graphql.String, Resolve: ok}))
+	if err == nil {
+		g.Close()
+		t.Fatal("a hook field named like the renamed aggregate must be rejected at startup")
+	}
+	if !strings.Contains(err.Error(), "collides with the nested aggregate field") {
+		t.Errorf("startup error = %v", err)
+	}
+
+	// The renamed aggregate itself works for admin and author (ada has two
+	// posts); anonymous only counts the published one (row filter) and
+	// cannot read users.email.
+	for _, tok := range []string{env.Token(t, "admin", 4), env.Token(t, "author", 1)} {
+		r := env.MustGQL(t, tok, `{ users_by_pk(id: 1) { posts_aggregate_by_author_id { count } posts_aggregate { id } } }`, nil)
+		if r.Int(t, "users_by_pk.posts_aggregate_by_author_id.count") != 2 {
+			t.Errorf("posts aggregate: %s", r.Raw)
+		}
+	}
+	r := env.MustGQL(t, "", `{ users_by_pk(id: 1) { posts_aggregate_by_author_id { count } } }`, nil)
+	if r.Int(t, "users_by_pk.posts_aggregate_by_author_id.count") != 1 {
+		t.Errorf("anonymous must not count the draft: %s", r.Raw)
+	}
+	env.GQL(t, "", `{ users_by_pk(id: 1) { email } }`, nil).MustFail(t, `Cannot query field "email"`)
 }
 
 // --- #17 typed JSON columns -------------------------------------------------------
@@ -580,6 +664,54 @@ func TestTypedJSONColumns(t *testing.T) {
 	}
 	// Anonymous cannot reach orders at all.
 	env.GQL(t, "", `{ orders_connection { nodes { id } } }`, nil).MustFail(t, "orders_connection")
+}
+
+// TestTypedJSONListElements: one element of the wrong kind nulls only that
+// element (with an error at its path); the other elements still resolve.
+func TestTypedJSONListElements(t *testing.T) {
+	t.Parallel()
+	env := New(t, WithSQL(
+		`CREATE TABLE orders (id BIGINT PRIMARY KEY, user_id BIGINT NOT NULL, items JSON NULL)`,
+		`INSERT INTO orders VALUES
+		   (1, 1, '[{"sku": "A-1"}, "oops", {"sku": "B-2"}]'),
+		   (2, 2, '[{"sku": "C-3"}, 42]')`,
+		`UPDATE users SET metadata = '{"tier": "gold", "tags": ["a", 7, "c"]}' WHERE id = 1`,
+	), WithExtraYAML(jsonTypesYAML), WithRolesYAML(jsonRoles))
+	admin := env.Token(t, "admin", 4)
+	author := env.Token(t, "author", 1)
+
+	r := env.GQL(t, admin, `{ orders_connection { nodes { id lines { sku } } } }`, nil)
+	if r.String(t, "orders_connection.nodes.0.lines.0.sku") != "A-1" || r.Get("orders_connection.nodes.0.lines.1") != nil ||
+		r.String(t, "orders_connection.nodes.0.lines.2.sku") != "B-2" || r.String(t, "orders_connection.nodes.1.lines.0.sku") != "C-3" ||
+		r.Get("orders_connection.nodes.1.lines.1") != nil {
+		t.Errorf("admin lines: %s", r.Raw)
+	}
+	paths := map[string]bool{}
+	for _, e := range r.Errors {
+		if e.Extensions["code"] != "json_shape_mismatch" {
+			t.Errorf("error without json_shape_mismatch: %s", r.Raw)
+		}
+		paths[fmt.Sprint(e.Path)] = true
+	}
+	if len(r.Errors) != 2 || !paths["[orders_connection nodes 0 lines 1]"] || !paths["[orders_connection nodes 1 lines 1]"] {
+		t.Errorf("want errors at both bad elements: %s", r.Raw)
+	}
+
+	r = env.GQL(t, admin, `{ users_by_pk(id: 1) { metadata { tier tags } } }`, nil)
+	if tags := r.List(t, "users_by_pk.metadata.tags"); len(tags) != 3 || tags[0] != "a" || tags[1] != nil || tags[2] != "c" ||
+		r.String(t, "users_by_pk.metadata.tier") != "gold" || len(r.Errors) != 1 ||
+		!strings.Contains(r.Errors[0].Message, "UserMetadata.tags[1]") {
+		t.Errorf("admin tags: %s", r.Raw)
+	}
+
+	// The author sees its own order the same way, never order 2 (row
+	// filter), and cannot read users.metadata at all.
+	r = env.GQL(t, author, `{ orders_connection { nodes { id lines { sku } } } }`, nil)
+	if ids := r.IDs(t, "orders_connection.nodes"); len(ids) != 1 || ids[0] != 1 ||
+		r.String(t, "orders_connection.nodes.0.lines.2.sku") != "B-2" || len(r.Errors) != 1 {
+		t.Errorf("author lines: %s", r.Raw)
+	}
+	env.GQL(t, author, `{ users_by_pk(id: 1) { metadata { tags } } }`, nil).MustFail(t, "metadata")
 }
 
 func TestTypedJSONStartupAndReload(t *testing.T) {

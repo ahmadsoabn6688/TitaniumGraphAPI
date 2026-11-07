@@ -127,8 +127,8 @@ type Server struct {
 	// MaxParallelRootFields caps how many root fields of one query
 	// operation run at the same time (each on its own pooled connection).
 	// 0 (the default) picks min(4, database.max_open_conns/2), at least 1;
-	// 1 runs them one after another. Mutations always run serially. It may
-	// not exceed database.max_open_conns.
+	// 1 runs them one after another. Mutations always run serially. Above 1
+	// it must be less than database.max_open_conns.
 	MaxParallelRootFields int `yaml:"max_parallel_root_fields"`
 }
 
@@ -583,8 +583,10 @@ func (c *Config) validate() error {
 	}
 	if n := c.Server.MaxParallelRootFields; n < 0 {
 		return fmt.Errorf("server.max_parallel_root_fields must be >= 0 (0 = default, 1 = serial)")
-	} else if n > c.Database.MaxOpenConns {
-		return fmt.Errorf("server.max_parallel_root_fields (%d) exceeds database.max_open_conns (%d): one request could take every pooled connection", n, c.Database.MaxOpenConns)
+	} else if n > 1 && n >= c.Database.MaxOpenConns {
+		// At least one pooled connection must stay free for role lookups and
+		// other requests while one wide query runs all its root fields.
+		return fmt.Errorf("server.max_parallel_root_fields (%d) must be less than database.max_open_conns (%d): one request could take every pooled connection", n, c.Database.MaxOpenConns)
 	}
 	if err := c.validateRoleSelection(); err != nil {
 		return err

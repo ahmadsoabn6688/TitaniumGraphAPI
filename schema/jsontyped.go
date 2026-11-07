@@ -20,8 +20,8 @@ import (
 // key from the decoded object. The database does not enforce the shape, so
 // every field is nullable: a missing key is null, and a value of the wrong
 // kind (a string where an Int is declared, an array where an object is) is
-// null with a json_shape_mismatch error on that field — the rest of the
-// response is unaffected.
+// null with a json_shape_mismatch error on that field (or, inside a list, on
+// that element) — the rest of the response is unaffected.
 //
 // The object types are built per role, and only when a column the role can
 // read uses them, so a role that cannot read the column does not even see
@@ -108,7 +108,9 @@ func (b *builder) jsonObject(name string) *graphql.Object {
 // coerceJSON checks a decoded JSON value against a declared type and returns
 // it in the form the GraphQL type serializes. Objects are only checked to be
 // objects (their fields check themselves when selected); lists are checked
-// element by element. A mismatch is a json_shape_mismatch error.
+// element by element. A mismatch is a json_shape_mismatch error; inside a
+// list only the mismatched element is null (see elementError), so one bad
+// element does not discard the others.
 func coerceJSON(ref config.JSONTypeRef, v any, where string) (any, error) {
 	if v == nil {
 		return nil, nil
@@ -124,7 +126,8 @@ func coerceJSON(ref config.JSONTypeRef, v any, where string) (any, error) {
 		for i, e := range list {
 			c, err := coerceJSON(inner, e, fmt.Sprintf("%s[%d]", where, i))
 			if err != nil {
-				return nil, err
+				out[i] = elementError(err)
+				continue
 			}
 			out[i] = c
 		}
@@ -155,6 +158,15 @@ func coerceJSON(ref config.JSONTypeRef, v any, where string) (any, error) {
 		}
 	}
 	return nil, shapeMismatch(where, ref, v)
+}
+
+// elementError stands in for a list element that does not fit its declared
+// type. graphql-go completes a list element that is a
+// func() (interface{}, error) like a deferred field value: an error nulls just
+// that (nullable) element and is reported with the element's path, e.g.
+// ["users", 0, "contacts", 1].
+func elementError(err error) func() (any, error) {
+	return func() (any, error) { return nil, err }
 }
 
 // jsonNumber reads a decoded JSON number (float64; other numeric kinds are

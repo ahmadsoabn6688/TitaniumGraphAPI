@@ -454,6 +454,10 @@ type builder struct {
 	// jsonObjs are the role's object types of declared JSON shapes, by
 	// json_types name (see jsontyped.go).
 	jsonObjs map[string]*graphql.Object
+	// fieldErr is a problem found while a type's fields thunk ran (see
+	// addObjectHookFields); thunks cannot return errors, so the build checks
+	// it after NewSchema has resolved them.
+	fieldErr error
 }
 
 func buildRole(opt Options, shared *buildShared, roleName string, access *rbac.Access) (graphql.Schema, error) {
@@ -654,6 +658,9 @@ func buildRoleBuilder(opt Options, shared *buildShared, roleName string, access 
 		schemaCfg.Mutation = graphql.NewObject(graphql.ObjectConfig{Name: "Mutation", Fields: mutationFields})
 	}
 	sch, err := graphql.NewSchema(schemaCfg)
+	if err == nil && b.fieldErr != nil {
+		err = b.fieldErr
+	}
 	return b, sch, err
 }
 

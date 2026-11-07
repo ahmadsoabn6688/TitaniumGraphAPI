@@ -40,6 +40,19 @@ func TestReloadCompatible(t *testing.T) {
 	if err := reloadCompatible(mk(), dbChanged); err == nil {
 		t.Error("a DB connection change must be rejected for reload")
 	}
+	// The pool is sized at Open: a larger max_open_conns would otherwise pass
+	// the max_parallel_root_fields check while the real pool stays smaller.
+	poolChanged := mk()
+	poolChanged.Database.MaxOpenConns = 40
+	poolChanged.Server.MaxParallelRootFields = 20
+	if err := reloadCompatible(mk(), poolChanged); err == nil || !strings.Contains(err.Error(), "max_open_conns") {
+		t.Errorf("a pool-size change must be rejected for reload, got %v", err)
+	}
+	idleChanged := mk()
+	idleChanged.Database.MaxIdleConns = 7
+	if err := reloadCompatible(mk(), idleChanged); err == nil {
+		t.Error("an idle-pool change must be rejected for reload")
+	}
 	portChanged := mk()
 	portChanged.Server.Port = 9090
 	if err := reloadCompatible(mk(), portChanged); err == nil {

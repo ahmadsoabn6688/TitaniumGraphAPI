@@ -220,7 +220,8 @@ var peopleRows = []map[string]driver.Value{
 	{"id": int64(2), "email": []byte("bad@example.com"),
 		"profile":  []byte(`{"name": 7, "age": 1.5, "tags": ["x", 3], "address": "nowhere"}`),
 		"contacts": []byte(`{"city": "not a list"}`)},
-	{"id": int64(3), "email": []byte("none@example.com"), "profile": []byte(`[1, 2]`), "contacts": nil},
+	{"id": int64(3), "email": []byte("none@example.com"), "profile": []byte(`[1, 2]`),
+		"contacts": []byte(`[{"city": "A"}, "oops", {"city": "B"}]`)},
 }
 
 // peopleAnswer serves people pages in the column order of the select list.
@@ -407,6 +408,76 @@ func TestObjectFieldErrors(t *testing.T) {
 	}
 }
 
+// TestObjectFieldAggregateRenamed: when <rel>_aggregate is taken (here by a
+// declared relationship of that name) the nested aggregate is renamed, and a
+// hook field may not take the renamed field's name either.
+func TestObjectFieldAggregateRenamed(t *testing.T) {
+	tables := `
+users:
+  relationships:
+    posts_aggregate: {type: array, target: events, mapping: {id: user_id}}
+`
+	roles := adminRoles + `
+reader:
+  tables:
+    users: {select: {allow: true, columns: [id]}}
+    posts: {select: {allow: true, columns: [id, title]}}
+`
+	build := func(defs ...ObjectField) (map[string]graphql.Schema, error) {
+		hooks := NewHooks(nil, nil, nil)
+		hooks.SetObjectFields(defs)
+		return BuildAll(Options{Catalog: modelCatalog(), Config: modelConfig(t, tables, roles), Hooks: hooks})
+	}
+	all, err := build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	const renamed = "posts_aggregate_by_author_id"
+	if objField(t, all["admin"], "users", renamed) == nil {
+		t.Fatalf("admin: users.%s missing", renamed)
+	}
+	// reader cannot read events, so its posts_aggregate relationship is
+	// absent and posts' aggregate keeps the plain name.
+	if objField(t, all["reader"], "users", "posts_aggregate") == nil {
+		t.Fatal("reader: users.posts_aggregate missing")
+	}
+
+	str := graphql.String
+	ok := func(context.Context, ObjectFieldParams) (any, error) { return "x", nil }
+	_, err = build(ObjectField{Table: "users", Name: renamed, Type: str, Resolve: ok, AllowedRoles: []string{"admin"}})
+	if err == nil || !strings.Contains(err.Error(), "collides with the nested aggregate field") {
+		t.Errorf("a hook field named like the renamed aggregate must be rejected, got %v", err)
+	}
+	_, err = build(ObjectField{Table: "users", Name: "posts_aggregate", Type: str, Resolve: ok, AllowedRoles: []string{"reader"}})
+	if err == nil || !strings.Contains(err.Error(), "collides with the nested aggregate field") {
+		t.Errorf("reader: a hook field named like posts' aggregate must be rejected, got %v", err)
+	}
+	// For reader the renamed name is free, so the field mounts there.
+	all, err = build(ObjectField{Table: "users", Name: renamed, Type: str, Resolve: ok, AllowedRoles: []string{"reader"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if objField(t, all["reader"], "users", renamed) == nil {
+		t.Error("reader: hook field missing")
+	}
+}
+
+// TestAddObjectHookFieldsBackstop: should a generated field slip past
+// resolveObjectFields, mounting the hook field fails the build instead of
+// replacing the generated field.
+func TestAddObjectHookFieldsBackstop(t *testing.T) {
+	b := &builder{role: "r", objFields: map[string][]ObjectField{"people": {{Table: "people", Name: "taken", Type: graphql.String}}}}
+	gen := &graphql.Field{Type: graphql.Int}
+	fields := graphql.Fields{"taken": gen}
+	b.addObjectHookFields(&tableInfo{table: &introspect.Table{Name: "people"}}, fields)
+	if fields["taken"] != gen {
+		t.Error("the generated field was replaced")
+	}
+	if b.fieldErr == nil || !strings.Contains(b.fieldErr.Error(), "people.taken collides") {
+		t.Errorf("fieldErr = %v", b.fieldErr)
+	}
+}
+
 func TestObjectFieldBatchFailures(t *testing.T) {
 	db, _ := newFakeDB(peopleAnswer)
 	hooks := NewHooks(nil, nil, nil)
@@ -493,10 +564,14 @@ func TestTypedJSONColumns(t *testing.T) {
 	// Row 2 holds the wrong kinds: those fields are null with an error each;
 	// the rest of the row (and the response) is intact.
 	p1 := n[1].(map[string]any)["profile"].(map[string]any)
-	for _, f := range []string{"name", "age", "tags", "address"} {
+	for _, f := range []string{"name", "age", "address"} {
 		if p1[f] != nil {
 			t.Errorf("row 2 profile.%s = %v, want null", f, p1[f])
 		}
+	}
+	// Inside a list only the mismatched element is null: tags ["x", 3].
+	if tags, _ := p1["tags"].([]any); len(tags) != 2 || tags[0] != "x" || tags[1] != nil {
+		t.Errorf("row 2 profile.tags = %#v, want [x <nil>]", p1["tags"])
 	}
 	if n[1].(map[string]any)["contacts"] != nil || n[1].(map[string]any)["id"] == nil {
 		t.Errorf("row 2 = %v", n[1])
@@ -505,6 +580,12 @@ func TestTypedJSONColumns(t *testing.T) {
 	if n[2].(map[string]any)["profile"] != nil {
 		t.Errorf("row 3 profile = %v", n[2])
 	}
+	// Row 3's contacts hold one string among two addresses: the addresses
+	// survive and only that element is null.
+	c2, _ := n[2].(map[string]any)["contacts"].([]any)
+	if len(c2) != 3 || c2[1] != nil || c2[0].(map[string]any)["city"] != "A" || c2[2].(map[string]any)["city"] != "B" {
+		t.Errorf("row 3 contacts = %#v", n[2].(map[string]any)["contacts"])
+	}
 	want := []string{
 		"Profile.name: the stored JSON holds a number where a String is declared",
 		"Profile.age: the stored JSON holds a fractional number where an Int is declared",
@@ -512,6 +593,7 @@ func TestTypedJSONColumns(t *testing.T) {
 		"Profile.address: the stored JSON holds a string where an object Address is declared",
 		"people.contacts: the stored JSON holds an object where a list [Address] is declared",
 		"people.profile: the stored JSON holds an array where an object Profile is declared",
+		"people.contacts[1]: the stored JSON holds a string where an object Address is declared",
 	}
 	msgs := ""
 	for _, e := range res.Errors {
@@ -524,6 +606,16 @@ func TestTypedJSONColumns(t *testing.T) {
 	}
 	if len(res.Errors) != len(want) {
 		t.Errorf("got %d errors, want %d:\n%s", len(res.Errors), len(want), msgs)
+	}
+	// An element's error carries the element's path.
+	paths := map[string]bool{}
+	for _, e := range res.Errors {
+		paths[fmt.Sprint(e.Path)] = true
+	}
+	for _, w := range []string{"[people_connection nodes 2 contacts 1]", "[people_connection nodes 1 profile tags 1]"} {
+		if !paths[w] {
+			t.Errorf("no error at path %s; paths: %v", w, paths)
+		}
 	}
 
 	// Negative RBAC: "limited" cannot read profile, so neither the field nor
@@ -590,7 +682,7 @@ func TestCoerceJSON(t *testing.T) {
 		{"String", "s", "s", false},
 		{"JSON", []any{"x"}, []any{"x"}, false},
 		{"[[Int]]", []any{[]any{float64(1)}, nil}, []any{[]any{1}, nil}, false},
-		{"[[Int]]", []any{float64(1)}, nil, true},
+		{"[[Int]]", "x", nil, true},
 		{"Thing", map[string]any{}, map[string]any{}, false},
 		{"Thing", "x", nil, true},
 		{"Int", nil, nil, false},
@@ -609,6 +701,44 @@ func TestCoerceJSON(t *testing.T) {
 		}
 		if fmtAny(got) != fmtAny(tc.want) {
 			t.Errorf("%s %v = %#v, want %#v", tc.typ, tc.in, got, tc.want)
+		}
+	}
+
+	// A mismatched list element becomes a thunk failing with that element's
+	// error; the other elements are kept.
+	for _, tc := range []struct {
+		typ  string
+		in   any
+		bad  int
+		want string
+	}{
+		{"[[Int]]", []any{float64(1)}, 0, "f[0]: the stored JSON holds a number where a list [Int] is declared"},
+		{"[String]", []any{"a", float64(2), "c"}, 1, "f[1]: the stored JSON holds a number where a String is declared"},
+		{"[Thing]", []any{map[string]any{}, "oops"}, 1, "f[1]: the stored JSON holds a string where an object Thing is declared"},
+	} {
+		got, err := coerceJSON(ref(tc.typ), tc.in, "f")
+		if err != nil {
+			t.Errorf("%s %v: the list itself must not fail: %v", tc.typ, tc.in, err)
+			continue
+		}
+		list := got.([]any)
+		for i, e := range list {
+			fn, isThunk := e.(func() (any, error))
+			if i != tc.bad {
+				if isThunk || e == nil {
+					t.Errorf("%s %v: element %d = %#v, want kept", tc.typ, tc.in, i, e)
+				}
+				continue
+			}
+			if !isThunk {
+				t.Errorf("%s %v: element %d = %#v, want an error thunk", tc.typ, tc.in, i, e)
+				continue
+			}
+			v, err := fn()
+			var ce *CodedError
+			if v != nil || !errors.As(err, &ce) || ce.Code != CodeJSONShapeMismatch || ce.Message != tc.want {
+				t.Errorf("%s %v: element %d = %v, %v; want %q", tc.typ, tc.in, i, v, err, tc.want)
+			}
 		}
 	}
 }

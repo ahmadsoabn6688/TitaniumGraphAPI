@@ -139,7 +139,7 @@ func (b *builder) resolveObjectFields() error {
 			if rel.name == f.Name {
 				return fmt.Errorf("object field %s.%s collides with the relationship field of the same name for role %q", f.Table, f.Name, b.role)
 			}
-			if !rel.outgoing && rel.name+"_aggregate" == f.Name {
+			if !rel.outgoing && rel.aggName == f.Name {
 				return fmt.Errorf("object field %s.%s collides with the nested aggregate field of the same name for role %q", f.Table, f.Name, b.role)
 			}
 		}
@@ -161,8 +161,17 @@ func (b *builder) firstRole() string {
 }
 
 // addObjectHookFields mounts the role's object fields onto a table type.
+// resolveObjectFields already rejected names taken by generated fields; as a
+// backstop a field that would still replace one is not mounted and the build
+// fails (fieldErr is checked once the schema's thunks have run).
 func (b *builder) addObjectHookFields(ti *tableInfo, fields graphql.Fields) {
 	for _, f := range b.objFields[ti.table.Name] {
+		if _, taken := fields[f.Name]; taken {
+			if b.fieldErr == nil {
+				b.fieldErr = fmt.Errorf("object field %s.%s collides with a generated field of the same name for role %q", f.Table, f.Name, b.role)
+			}
+			continue
+		}
 		fields[f.Name] = b.objectHookField(f)
 	}
 }

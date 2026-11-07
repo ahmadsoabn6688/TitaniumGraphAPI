@@ -208,6 +208,12 @@ func reloadCompatible(old, next *config.Config) error {
 	if old.Database.DSN() != next.Database.DSN() {
 		return fmt.Errorf("reload rejected: database connection/schema changed — restart required")
 	}
+	// The pool is sized once in Open. Accepting a new size without applying it
+	// would also let server.max_parallel_root_fields be validated against a
+	// pool larger than the one actually in use.
+	if old.Database.MaxOpenConns != next.Database.MaxOpenConns || old.Database.MaxIdleConns != next.Database.MaxIdleConns {
+		return fmt.Errorf("reload rejected: database.max_open_conns/max_idle_conns changed — restart required")
+	}
 	if old.Server.Host != next.Server.Host || old.Server.Port != next.Server.Port || old.Server.Path != next.Server.Path {
 		return fmt.Errorf("reload rejected: server host/port/path changed — restart required")
 	}
