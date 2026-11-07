@@ -42,6 +42,13 @@ jwt:
 schema_gen:
   default_page_size: 25
   max_page_size: 200
+  # Extra comparison operators for `where` ({column} is the quoted column,
+  # each {value} a bound parameter), e.g. posts(where: {published_on: {_year_eq: 2026}}).
+  custom_operators:
+    - name: _year_eq
+      argument: Int
+      applies_to: [Date, DateTime]
+      sql: "YEAR({column}) = {value}"
 
 # Custom logic lives in the hooks/ directory (compiled in on build; any Go
 # library allowed). Activate the sample: rename hooks/signup.go.sample to
@@ -106,6 +113,14 @@ roles:
           allow: true
           columns: [id, author_id, title, body, published_on, created_at]
           filter: "published = 1"
+          # Public clients get an index-friendly filter surface: no
+          # regex / LIKE scans, and body is readable but not filterable.
+          filterable_columns:
+            id: all
+            author_id: all
+            title: [_eq, _in, _starts_with, _istarts_with, _icontains]
+            published_on: all
+            created_at: all
       users:
         select:
           allow: true

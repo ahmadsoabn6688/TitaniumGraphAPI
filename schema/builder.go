@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"time"
 
 	"github.com/graphql-go/graphql"
 
@@ -28,7 +29,8 @@ type Options struct {
 
 // BuildAll builds one GraphQL schema per configured role.
 func BuildAll(opt Options) (map[string]graphql.Schema, error) {
-	if err := checkNameCollisions(opt.Catalog); err != nil {
+	shared, err := newBuildShared(opt)
+	if err != nil {
 		return nil, err
 	}
 	out := make(map[string]graphql.Schema, len(opt.Config.Roles))
@@ -37,13 +39,41 @@ func BuildAll(opt Options) (map[string]graphql.Schema, error) {
 		if err != nil {
 			return nil, err
 		}
-		s, err := buildRole(opt, roleName, access)
+		s, err := buildRole(opt, shared, roleName, access)
 		if err != nil {
 			return nil, fmt.Errorf("building schema for role %q: %w", roleName, err)
 		}
 		out[roleName] = s
 	}
 	return out, nil
+}
+
+// newBuildShared runs the role-independent checks (name collisions, custom
+// operator compilation + database dry run) and returns the state every role's
+// build shares.
+func newBuildShared(opt Options) (*buildShared, error) {
+	reserved, err := reservedNames(opt.Catalog)
+	if err != nil {
+		return nil, err
+	}
+	shared := &buildShared{
+		db:            opt.DB,
+		reservedTypes: reserved,
+		filterChecks:  map[string]error{},
+		timeout:       time.Duration(opt.Config.Database.QueryTimeoutSeconds) * time.Second,
+	}
+	if shared.timeout <= 0 {
+		shared.timeout = 30 * time.Second
+	}
+	if shared.customOps, shared.customOrder, err = compileCustomOps(opt.Config.SchemaGen.CustomOperators); err != nil {
+		return nil, err
+	}
+	if opt.DB != nil {
+		if err := validateCustomOps(opt.DB, shared.customOps, shared.customOrder, shared.timeout); err != nil {
+			return nil, err
+		}
+	}
+	return shared, nil
 }
 
 // scalarTypeNames are every scalar name that can appear in a generated schema,
@@ -64,18 +94,26 @@ var scalarTypeNames = []string{
 // "unique named types" error. Catching it here (independent of role) turns
 // those into an actionable startup message pointing at the offending table.
 func checkNameCollisions(cat *introspect.Catalog) error {
+	_, err := reservedNames(cat)
+	return err
+}
+
+// reservedNames runs the collision check and returns the global type
+// namespace it built (type name -> owner), which later per-role type names
+// (e.g. restricted comparison types) are checked against.
+func reservedNames(cat *introspect.Catalog) (map[string]string, error) {
 	seenTables := map[string]string{}
 	for _, tn := range cat.TableOrder {
 		n := graphqlName(tn)
 		if other, dup := seenTables[n]; dup {
-			return fmt.Errorf("tables %q and %q both map to GraphQL name %q; exclude one via schema_gen.tables", other, tn, n)
+			return nil, fmt.Errorf("tables %q and %q both map to GraphQL name %q; exclude one via schema_gen.tables", other, tn, n)
 		}
 		seenTables[n] = tn
 		seenCols := map[string]string{}
 		for _, c := range cat.Tables[tn].Columns {
 			cn := graphqlName(c.Name)
 			if other, dup := seenCols[cn]; dup {
-				return fmt.Errorf("table %q: columns %q and %q both map to GraphQL name %q", tn, other, c.Name, cn)
+				return nil, fmt.Errorf("table %q: columns %q and %q both map to GraphQL name %q", tn, other, c.Name, cn)
 			}
 			seenCols[cn] = c.Name
 		}
@@ -127,21 +165,21 @@ func checkNameCollisions(cat *introspect.Catalog) error {
 		}
 		for _, f := range queryOf {
 			if err := claim(queryFields, f, tn, "query field"); err != nil {
-				return err
+				return nil, err
 			}
 		}
 		for _, f := range mutOf {
 			if err := claim(mutationFields, f, tn, "mutation field"); err != nil {
-				return err
+				return nil, err
 			}
 		}
 		for _, t := range typeOf {
 			if err := claim(types, t, tn, "type"); err != nil {
-				return err
+				return nil, err
 			}
 		}
 	}
-	return nil
+	return types, nil
 }
 
 // tableInfo is the per-role view of one table.
@@ -151,10 +189,32 @@ type tableInfo struct {
 	typeName   string
 	fieldToCol map[string]*introspect.Column // GraphQL field name -> column
 	colToField map[string]string             // column name -> GraphQL field name
+
+	// Filter surface (select-able tables only).
+	filterOps   map[string][]string        // filterable column -> allowed operators
+	filterOpSet map[string]map[string]bool // same, as sets (enforced in compileWhere)
+	rels        []*relInfo                 // role-visible relationships (see relations)
+	relsDone    bool
+	filterRels  map[string]*relInfo // relationships usable in this table's bool_exp
+	// selectFilterOK: the select row filter (if any) was verified to resolve
+	// against this table alone, so it may be embedded in relationship
+	// subqueries (see validateRoleFilter).
+	selectFilterOK bool
+}
+
+// buildShared is state shared by every role's build within one BuildAll.
+type buildShared struct {
+	db            *sql.DB
+	timeout       time.Duration
+	reservedTypes map[string]string    // global type names -> owner
+	customOps     map[string]*customOp // schema_gen.custom_operators
+	customOrder   []string
+	filterChecks  map[string]error // validateRoleFilter cache (table+filter)
 }
 
 type builder struct {
 	opt        Options
+	shared     *buildShared
 	role       string
 	access     *rbac.Access
 	tinfos     map[string]*tableInfo
@@ -163,15 +223,24 @@ type builder struct {
 	boolExps   map[string]*graphql.InputObject
 	orderBys   map[string]*graphql.InputObject
 	cmpExps    map[string]*graphql.InputObject
+	cmpOwners  map[string]string // restricted comparison type -> "table.column"
 	orderEnum  *graphql.Enum
 	mutResp    *graphql.Object
 	pageInfo   *graphql.Object
 	metricEnum *graphql.Enum
 }
 
-func buildRole(opt Options, roleName string, access *rbac.Access) (graphql.Schema, error) {
+func buildRole(opt Options, shared *buildShared, roleName string, access *rbac.Access) (graphql.Schema, error) {
+	_, s, err := buildRoleBuilder(opt, shared, roleName, access)
+	return s, err
+}
+
+// buildRoleBuilder builds one role's schema and also returns the builder
+// (whose table views tests use to inspect the generated SQL).
+func buildRoleBuilder(opt Options, shared *buildShared, roleName string, access *rbac.Access) (*builder, graphql.Schema, error) {
 	b := &builder{
 		opt:       opt,
+		shared:    shared,
 		role:      roleName,
 		access:    access,
 		tinfos:    map[string]*tableInfo{},
@@ -180,6 +249,7 @@ func buildRole(opt Options, roleName string, access *rbac.Access) (graphql.Schem
 		boolExps:  map[string]*graphql.InputObject{},
 		orderBys:  map[string]*graphql.InputObject{},
 		cmpExps:   map[string]*graphql.InputObject{},
+		cmpOwners: map[string]string{},
 	}
 
 	// page_info is the cursor-pagination metadata, shared by every connection.
@@ -243,6 +313,30 @@ func buildRole(opt Options, roleName string, access *rbac.Access) (graphql.Schem
 		b.tinfos[tn] = ti
 	}
 
+	// Filter surface: per-column operator sets, verified row filters, then
+	// the relationships each table's bool_exp offers.
+	for _, tn := range opt.Catalog.TableOrder {
+		ti := b.tinfos[tn]
+		if ti == nil || ti.access.Select == nil {
+			continue
+		}
+		if err := b.resolveFilterOps(ti); err != nil {
+			return nil, graphql.Schema{}, err
+		}
+		if len(ti.table.ForeignKeys) > 0 || len(ti.table.IncomingFKs) > 0 {
+			ti.selectFilterOK = b.validateRoleFilter(ti)
+		}
+	}
+	for _, tn := range opt.Catalog.TableOrder {
+		ti := b.tinfos[tn]
+		if ti == nil || ti.access.Select == nil {
+			continue
+		}
+		if err := b.resolveFilterRels(ti); err != nil {
+			return nil, graphql.Schema{}, err
+		}
+	}
+
 	// Pass 2: types for select-able tables (mutation-only tables get none).
 	for _, tn := range opt.Catalog.TableOrder {
 		ti := b.tinfos[tn]
@@ -250,7 +344,11 @@ func buildRole(opt Options, roleName string, access *rbac.Access) (graphql.Schem
 			continue
 		}
 		b.objTypes[tn] = b.buildObjectType(ti)
-		b.boolExps[tn] = b.buildBoolExp(ti)
+		be, err := b.buildBoolExp(ti)
+		if err != nil {
+			return nil, graphql.Schema{}, err
+		}
+		b.boolExps[tn] = be
 		b.orderBys[tn] = b.buildOrderBy(ti)
 	}
 
@@ -294,10 +392,10 @@ func buildRole(opt Options, roleName string, access *rbac.Access) (graphql.Schem
 	// this role. They win over generated fields of the same name, and a
 	// collision is reported so it can't silently shadow a table operation.
 	if err := b.addCustomFields(queryFields, "query"); err != nil {
-		return graphql.Schema{}, err
+		return nil, graphql.Schema{}, err
 	}
 	if err := b.addCustomFields(mutationFields, "mutation"); err != nil {
-		return graphql.Schema{}, err
+		return nil, graphql.Schema{}, err
 	}
 
 	schemaCfg := graphql.SchemaConfig{
@@ -306,7 +404,8 @@ func buildRole(opt Options, roleName string, access *rbac.Access) (graphql.Schem
 	if len(mutationFields) > 0 {
 		schemaCfg.Mutation = graphql.NewObject(graphql.ObjectConfig{Name: "Mutation", Fields: mutationFields})
 	}
-	return graphql.NewSchema(schemaCfg)
+	sch, err := graphql.NewSchema(schemaCfg)
+	return b, sch, err
 }
 
 // addCustomFields mounts the role's custom fields of the given operation onto
@@ -368,8 +467,8 @@ func (b *builder) buildObjectType(ti *tableInfo) *graphql.Object {
 
 // relFieldName picks a free field name for a relationship, appending
 // deterministic suffixes when the candidate is taken.
-func relFieldName(fields graphql.Fields, candidate string, fk *introspect.ForeignKey) string {
-	if _, taken := fields[candidate]; !taken {
+func relFieldName(taken map[string]bool, candidate string, fk *introspect.ForeignKey) string {
+	if !taken[candidate] {
 		return candidate
 	}
 	cols := make([]string, len(fk.Columns))
@@ -382,201 +481,187 @@ func relFieldName(fields graphql.Fields, candidate string, fk *introspect.Foreig
 		if i > 0 {
 			name = fmt.Sprintf("%s_%d", candidate, i)
 		}
-		if _, taken := fields[name]; !taken {
+		if !taken[name] {
 			return name
 		}
 	}
 }
 
+// addRelationFields adds one field per role-visible relationship (see
+// relations for which FKs qualify and how they are named).
 func (b *builder) addRelationFields(ti *tableInfo, fields graphql.Fields) {
-	sel := ti.access.Select
-
-	// Outgoing: this table's FK -> one row of the referenced table.
-	for _, fk := range ti.table.ForeignKeys {
-		fk := fk
-		target := b.tinfos[fk.RefTable]
-		if target == nil || target.access.Select == nil {
-			continue
-		}
-		// The parent row map only holds readable columns, and the join needs
-		// the local FK values — so those must be readable for this role.
-		readable := true
-		for _, c := range fk.Columns {
-			if !sel.ColumnSet[c] {
-				readable = false
-				break
-			}
-		}
-		if !readable {
-			continue
-		}
-		candidate := graphqlName(fk.RefTable)
-		if len(fk.Columns) == 1 && strings.HasSuffix(fk.Columns[0], "_id") && len(fk.Columns[0]) > 3 {
-			candidate = graphqlName(strings.TrimSuffix(fk.Columns[0], "_id"))
-		}
-		name := relFieldName(fields, candidate, fk)
-		// Batch only when the target's referenced columns (the grouping key)
-		// are readable for this role; otherwise fall back to a per-row query.
-		batchable := columnsReadable(target, fk.RefColumns)
-		fields[name] = &graphql.Field{
-			Type:        b.objTypes[fk.RefTable],
-			Description: fmt.Sprintf("Row of %s referenced by %s", fk.RefTable, strings.Join(fk.Columns, ", ")),
-			Resolve: func(p graphql.ResolveParams) (any, error) {
-				id, err := identityFrom(p)
-				if err != nil {
-					return nil, err
-				}
-				row, _ := p.Source.(map[string]any)
-				key := make([]any, len(fk.Columns))
-				for i, lc := range fk.Columns {
-					v := row[lc]
-					if v == nil {
-						return nil, nil // NULL FK -> no related row
-					}
-					key[i] = v
-				}
-
-				if !batchable {
-					parts := make([]string, len(fk.RefColumns))
-					for i, rc := range fk.RefColumns {
-						parts[i] = quoteIdent(rc) + " = ?"
-					}
-					rows, err := b.runSelect(p.Context, target, id, listArgs{},
-						&condition{sql: strings.Join(parts, " AND "), args: key}, true)
-					if err != nil {
-						return nil, err
-					}
-					if len(rows) == 0 {
-						return nil, nil
-					}
-					return rows[0], nil
-				}
-
-				loader := loadersFrom(p.Context).getOrCreate(
-					loaderKey("out", fk.ConstraintName, ""),
-					func() *relLoader {
-						return newRelLoader(func(ctx context.Context, keys [][]any) (map[string][]map[string]any, error) {
-							// To-one: each referenced key yields at most one row.
-							rows, err := b.runSelectByKeys(ctx, target, id, fk.RefColumns, keys, nil, nil, 0)
-							if err != nil {
-								return nil, err
-							}
-							return groupByColumns(rows, fk.RefColumns), nil
-						})
-					})
-				loader.enqueue(key)
-				return func() (any, error) {
-					rows, err := loader.fetch(p.Context, key)
-					if err != nil {
-						return nil, err
-					}
-					if len(rows) == 0 {
-						return nil, nil
-					}
-					return rows[0], nil // FK references a unique key
-				}, nil
-			},
-		}
-	}
-
-	// Incoming: FKs on other tables pointing here -> list of child rows.
-	for _, fk := range ti.table.IncomingFKs {
-		fk := fk
-		child := b.tinfos[fk.Table]
-		if child == nil || child.access.Select == nil {
-			continue
-		}
-		readable := true
-		for _, rc := range fk.RefColumns {
-			if !sel.ColumnSet[rc] {
-				readable = false
-				break
-			}
-		}
-		if !readable {
-			continue
-		}
-		name := relFieldName(fields, graphqlName(fk.Table), fk)
-		// Batch only when the child's FK columns (the grouping key) are
-		// readable for this role; otherwise fall back to a per-row query.
-		batchable := columnsReadable(child, fk.Columns)
-		fields[name] = &graphql.Field{
-			Type:        graphql.NewNonNull(graphql.NewList(graphql.NewNonNull(b.objTypes[fk.Table]))),
-			Description: fmt.Sprintf("Rows of %s whose %s reference this row", fk.Table, strings.Join(fk.Columns, ", ")),
-			Args:        b.listFieldArgs(fk.Table),
-			Resolve: func(p graphql.ResolveParams) (any, error) {
-				id, err := identityFrom(p)
-				if err != nil {
-					return nil, err
-				}
-				row, _ := p.Source.(map[string]any)
-				key := make([]any, len(fk.RefColumns))
-				for i, rc := range fk.RefColumns {
-					v := row[rc]
-					if v == nil {
-						return []map[string]any{}, nil
-					}
-					key[i] = v
-				}
-				la, err := extractListArgs(p.Args)
-				if err != nil {
-					return nil, err
-				}
-
-				if !batchable {
-					parts := make([]string, len(fk.Columns))
-					for i, cc := range fk.Columns {
-						parts[i] = quoteIdent(cc) + " = ?"
-					}
-					rows, err := b.runSelect(p.Context, child, id, la,
-						&condition{sql: strings.Join(parts, " AND "), args: key}, false)
-					if err != nil {
-						return nil, err
-					}
-					if rows == nil {
-						rows = []map[string]any{}
-					}
-					return rows, nil
-				}
-
-				// One windowed query fetches up to (limit+offset) children per
-				// parent; each group is paged in memory below. The loader is
-				// keyed by all list args (incl. limit/offset) so batches with
-				// different page sizes don't share the capped fetch.
-				limit, offset, err := b.pageBounds(la)
-				if err != nil {
-					return nil, err
-				}
-				perKey := limit + offset
-				loader := loadersFrom(p.Context).getOrCreate(
-					loaderKey("in", fk.ConstraintName, argsSignature(la)),
-					func() *relLoader {
-						return newRelLoader(func(ctx context.Context, keys [][]any) (map[string][]map[string]any, error) {
-							rows, err := b.runSelectByKeys(ctx, child, id, fk.Columns, keys, la.where, la.orderBy, perKey)
-							if err != nil {
-								return nil, err
-							}
-							return groupByColumns(rows, fk.Columns), nil
-						})
-					})
-				loader.enqueue(key)
-				return func() (any, error) {
-					rows, err := loader.fetch(p.Context, key)
-					if err != nil {
-						return nil, err
-					}
-					page, err := b.applyPage(rows, la)
-					if err != nil {
-						return nil, err
-					}
-					return page, nil
-				}, nil
-			},
+	for _, rel := range b.relations(ti) {
+		if rel.outgoing {
+			b.addObjectRelField(fields, rel)
+		} else {
+			b.addArrayRelField(fields, rel)
 		}
 	}
 }
 
-func (b *builder) buildBoolExp(ti *tableInfo) *graphql.InputObject {
+// addObjectRelField: this table's FK -> one row of the referenced table.
+func (b *builder) addObjectRelField(fields graphql.Fields, rel *relInfo) {
+	fk, target, name := rel.fk, rel.target, rel.name
+	// Batch only when the target's referenced columns (the grouping key)
+	// are readable for this role; otherwise fall back to a per-row query.
+	batchable := columnsReadable(target, fk.RefColumns)
+	fields[name] = &graphql.Field{
+		Type:        b.objTypes[fk.RefTable],
+		Description: fmt.Sprintf("Row of %s referenced by %s", fk.RefTable, strings.Join(fk.Columns, ", ")),
+		Resolve: func(p graphql.ResolveParams) (any, error) {
+			id, err := identityFrom(p)
+			if err != nil {
+				return nil, err
+			}
+			row, _ := p.Source.(map[string]any)
+			key := make([]any, len(fk.Columns))
+			for i, lc := range fk.Columns {
+				v := row[lc]
+				if v == nil {
+					return nil, nil // NULL FK -> no related row
+				}
+				key[i] = v
+			}
+
+			if !batchable {
+				parts := make([]string, len(fk.RefColumns))
+				for i, rc := range fk.RefColumns {
+					parts[i] = quoteIdent(rc) + " = ?"
+				}
+				rows, err := b.runSelect(p.Context, target, id, listArgs{},
+					&condition{sql: strings.Join(parts, " AND "), args: key}, true)
+				if err != nil {
+					return nil, err
+				}
+				if len(rows) == 0 {
+					return nil, nil
+				}
+				return rows[0], nil
+			}
+
+			loader := loadersFrom(p.Context).getOrCreate(
+				loaderKey("out", fk.ConstraintName, ""),
+				func() *relLoader {
+					return newRelLoader(func(ctx context.Context, keys [][]any) (map[string][]map[string]any, error) {
+						// To-one: each referenced key yields at most one row.
+						rows, err := b.runSelectByKeys(ctx, target, id, fk.RefColumns, keys, nil, nil, 0)
+						if err != nil {
+							return nil, err
+						}
+						return groupByColumns(rows, fk.RefColumns), nil
+					})
+				})
+			loader.enqueue(key)
+			return func() (any, error) {
+				rows, err := loader.fetch(p.Context, key)
+				if err != nil {
+					return nil, err
+				}
+				if len(rows) == 0 {
+					return nil, nil
+				}
+				return rows[0], nil // FK references a unique key
+			}, nil
+		},
+	}
+}
+
+// addArrayRelField: an FK on another table pointing here -> list of child rows.
+func (b *builder) addArrayRelField(fields graphql.Fields, rel *relInfo) {
+	fk, child, name := rel.fk, rel.target, rel.name
+	// Batch only when the child's FK columns (the grouping key) are
+	// readable for this role; otherwise fall back to a per-row query.
+	batchable := columnsReadable(child, fk.Columns)
+	fields[name] = &graphql.Field{
+		Type:        graphql.NewNonNull(graphql.NewList(graphql.NewNonNull(b.objTypes[fk.Table]))),
+		Description: fmt.Sprintf("Rows of %s whose %s reference this row", fk.Table, strings.Join(fk.Columns, ", ")),
+		Args:        b.listFieldArgs(fk.Table),
+		Resolve: func(p graphql.ResolveParams) (any, error) {
+			id, err := identityFrom(p)
+			if err != nil {
+				return nil, err
+			}
+			row, _ := p.Source.(map[string]any)
+			key := make([]any, len(fk.RefColumns))
+			for i, rc := range fk.RefColumns {
+				v := row[rc]
+				if v == nil {
+					return []map[string]any{}, nil
+				}
+				key[i] = v
+			}
+			la, err := extractListArgs(p.Args)
+			if err != nil {
+				return nil, err
+			}
+
+			if !batchable {
+				parts := make([]string, len(fk.Columns))
+				for i, cc := range fk.Columns {
+					parts[i] = quoteIdent(cc) + " = ?"
+				}
+				rows, err := b.runSelect(p.Context, child, id, la,
+					&condition{sql: strings.Join(parts, " AND "), args: key}, false)
+				if err != nil {
+					return nil, err
+				}
+				if rows == nil {
+					rows = []map[string]any{}
+				}
+				return rows, nil
+			}
+
+			// One windowed query fetches up to (limit+offset) children per
+			// parent; each group is paged in memory below. The loader is
+			// keyed by all list args (incl. limit/offset) so batches with
+			// different page sizes don't share the capped fetch.
+			limit, offset, err := b.pageBounds(la)
+			if err != nil {
+				return nil, err
+			}
+			perKey := limit + offset
+			loader := loadersFrom(p.Context).getOrCreate(
+				loaderKey("in", fk.ConstraintName, argsSignature(la)),
+				func() *relLoader {
+					return newRelLoader(func(ctx context.Context, keys [][]any) (map[string][]map[string]any, error) {
+						rows, err := b.runSelectByKeys(ctx, child, id, fk.Columns, keys, la.where, la.orderBy, perKey)
+						if err != nil {
+							return nil, err
+						}
+						return groupByColumns(rows, fk.Columns), nil
+					})
+				})
+			loader.enqueue(key)
+			return func() (any, error) {
+				rows, err := loader.fetch(p.Context, key)
+				if err != nil {
+					return nil, err
+				}
+				page, err := b.applyPage(rows, la)
+				if err != nil {
+					return nil, err
+				}
+				return page, nil
+			}, nil
+		},
+	}
+}
+
+// buildBoolExp builds <t>_bool_exp: _and/_or/_not, one comparison field per
+// filterable column (with the role's allowed operators), and one field per
+// filterable relationship, typed as the target table's bool_exp.
+func (b *builder) buildBoolExp(ti *tableInfo) (*graphql.InputObject, error) {
+	colFields := graphql.InputObjectConfigFieldMap{}
+	for _, col := range ti.access.Select.Columns {
+		if ti.filterOps[col.Name] == nil {
+			continue
+		}
+		e, err := b.cmpExpFor(ti, col)
+		if err != nil {
+			return nil, err
+		}
+		colFields[ti.colToField[col.Name]] = &graphql.InputObjectFieldConfig{Type: e}
+	}
 	var boolExp *graphql.InputObject
 	boolExp = graphql.NewInputObject(graphql.InputObjectConfig{
 		Name:        ti.typeName + "_bool_exp",
@@ -587,55 +672,23 @@ func (b *builder) buildBoolExp(ti *tableInfo) *graphql.InputObject {
 				"_or":  &graphql.InputObjectFieldConfig{Type: graphql.NewList(graphql.NewNonNull(boolExp))},
 				"_not": &graphql.InputObjectFieldConfig{Type: boolExp},
 			}
-			for _, col := range ti.access.Select.Columns {
-				f[ti.colToField[col.Name]] = &graphql.InputObjectFieldConfig{Type: b.cmpExp(scalarFor(col))}
+			for name, cf := range colFields {
+				f[name] = cf
+			}
+			for _, rel := range b.relations(ti) {
+				if !rel.filterable {
+					continue
+				}
+				desc := fmt.Sprintf("Rows whose %s (%s) matches; {} = has one.", rel.name, rel.target.table.Name)
+				if !rel.outgoing {
+					desc = fmt.Sprintf("Rows with at least one %s row matching; {} = has any, wrap in _not for none.", rel.target.table.Name)
+				}
+				f[rel.name] = &graphql.InputObjectFieldConfig{Type: b.boolExps[rel.target.table.Name], Description: desc}
 			}
 			return f
 		}),
 	})
-	return boolExp
-}
-
-// cmpExp returns (building on first use) the comparison input type for one
-// scalar, e.g. String_comparison_exp with _eq/_like/_in/...
-func (b *builder) cmpExp(s *graphql.Scalar) *graphql.InputObject {
-	if e, ok := b.cmpExps[s.Name()]; ok {
-		return e
-	}
-	f := graphql.InputObjectConfigFieldMap{
-		"_eq":      &graphql.InputObjectFieldConfig{Type: s},
-		"_neq":     &graphql.InputObjectFieldConfig{Type: s},
-		"_is_null": &graphql.InputObjectFieldConfig{Type: graphql.Boolean},
-	}
-	switch s.Name() {
-	case "JSON":
-		// TiDB JSON predicates: _contains (JSON_CONTAINS) and _has_key
-		// (JSON_CONTAINS_PATH on a top-level key).
-		f["_contains"] = &graphql.InputObjectFieldConfig{Type: s}
-		f["_has_key"] = &graphql.InputObjectFieldConfig{Type: graphql.String}
-	case "Boolean":
-		// equality only
-	default:
-		f["_gt"] = &graphql.InputObjectFieldConfig{Type: s}
-		f["_gte"] = &graphql.InputObjectFieldConfig{Type: s}
-		f["_lt"] = &graphql.InputObjectFieldConfig{Type: s}
-		f["_lte"] = &graphql.InputObjectFieldConfig{Type: s}
-		f["_in"] = &graphql.InputObjectFieldConfig{Type: graphql.NewList(graphql.NewNonNull(s))}
-		f["_nin"] = &graphql.InputObjectFieldConfig{Type: graphql.NewList(graphql.NewNonNull(s))}
-		if s.Name() == "String" {
-			f["_like"] = &graphql.InputObjectFieldConfig{Type: s}
-			f["_nlike"] = &graphql.InputObjectFieldConfig{Type: s}
-			// TiDB REGEXP (RE2). _regex / _nregex.
-			f["_regex"] = &graphql.InputObjectFieldConfig{Type: s}
-			f["_nregex"] = &graphql.InputObjectFieldConfig{Type: s}
-		}
-	}
-	e := graphql.NewInputObject(graphql.InputObjectConfig{
-		Name:   s.Name() + "_comparison_exp",
-		Fields: f,
-	})
-	b.cmpExps[s.Name()] = e
-	return e
+	return boolExp, nil
 }
 
 func (b *builder) buildOrderBy(ti *tableInfo) *graphql.InputObject {
@@ -988,7 +1041,7 @@ func (b *builder) addMutationFields(fields graphql.Fields, ti *tableInfo) {
 					}
 					where, _ := p.Args["where"].(map[string]any)
 					set, _ := p.Args["_set"].(map[string]any)
-					userCond, err := b.whereSQL(ti, where)
+					userCond, err := b.whereSQL(ti, where, id)
 					if err != nil {
 						return nil, err
 					}
@@ -1051,7 +1104,7 @@ func (b *builder) addMutationFields(fields graphql.Fields, ti *tableInfo) {
 					return nil, err
 				}
 				where, _ := p.Args["where"].(map[string]any)
-				userCond, err := b.whereSQL(ti, where)
+				userCond, err := b.whereSQL(ti, where, id)
 				if err != nil {
 					return nil, err
 				}

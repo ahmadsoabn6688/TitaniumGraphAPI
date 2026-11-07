@@ -41,6 +41,11 @@ type Column struct {
 	// computes their value and rejects any client-supplied one, so they are
 	// never writable and never required on insert.
 	Generated bool
+	// Charset and Collation of character columns ("" for other types), e.g.
+	// "utf8mb4" / "utf8mb4_bin". The string filter operators use them to
+	// pick a case-(in)sensitive comparison that can still use an index.
+	Charset   string
+	Collation string
 }
 
 // ForeignKey is a (possibly composite) foreign key relationship.
@@ -137,7 +142,8 @@ func Load(ctx context.Context, db *sql.DB, schema string, include, exclude []str
 func loadColumns(ctx context.Context, db *sql.DB, schema string, t *Table) error {
 	rows, err := db.QueryContext(ctx,
 		`SELECT column_name, data_type, column_type, is_nullable, column_key, extra,
-		        column_default IS NOT NULL
+		        column_default IS NOT NULL,
+		        IFNULL(character_set_name, ''), IFNULL(collation_name, '')
 		 FROM information_schema.columns
 		 WHERE table_schema = ? AND table_name = ?
 		 ORDER BY ordinal_position`, schema, t.Name)
@@ -149,11 +155,13 @@ func loadColumns(ctx context.Context, db *sql.DB, schema string, t *Table) error
 		var c Column
 		var nullable, key, extra string
 		var hasDefault bool
-		if err := rows.Scan(&c.Name, &c.DataType, &c.ColumnType, &nullable, &key, &extra, &hasDefault); err != nil {
+		if err := rows.Scan(&c.Name, &c.DataType, &c.ColumnType, &nullable, &key, &extra, &hasDefault, &c.Charset, &c.Collation); err != nil {
 			return err
 		}
 		c.DataType = strings.ToLower(c.DataType)
 		c.ColumnType = strings.ToLower(c.ColumnType)
+		c.Charset = strings.ToLower(c.Charset)
+		c.Collation = strings.ToLower(c.Collation)
 		c.Nullable = strings.EqualFold(nullable, "YES")
 		c.IsPrimary = strings.EqualFold(key, "PRI")
 		extraLower := strings.ToLower(extra)

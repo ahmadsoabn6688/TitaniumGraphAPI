@@ -38,6 +38,15 @@ CLI can mint dev tokens (`-print-token`).
 - **Relationships from foreign keys.** `posts { author { name } }` and
   `users { posts(where: …) { … } }` are generated from FK metadata, and the
   target table's RBAC (column set + row filter) applies to nested data too.
+- **Filter through relationships.** `where: {author: {name: {_eq: "Ada"}},
+  comments: {}}` compiles to correlated `EXISTS` subqueries that apply the
+  related table's row filter for the role — in connections, aggregates,
+  vector search, nested lists and update/delete alike.
+- **Configurable filter surface.** Per role and table, choose which columns,
+  operators and relationships `where` offers, and declare your own comparison
+  operators in YAML (SQL templates with bound values). Case-insensitive and
+  literal string operators (`_ilike`, `_icontains`, `_starts_with`, …) are
+  built in.
 - **Row-level security** via SQL filters with JWT claim bindings
   (`filter: "author_id = :jwt.sub"`) and **column presets** that force values
   from claims on insert/update (`presets: {author_id: ":jwt.sub"}`).
@@ -164,6 +173,11 @@ schema_gen:
   tables:
     include: []            # empty = all base tables
     exclude: [migrations]
+  custom_operators:        # extra `where` operators (see "Custom operators")
+    - name: _year_eq       # appears in Date_comparison_exp / DateTime_comparison_exp
+      argument: Int        # GraphQL scalar of the argument
+      applies_to: [Date, DateTime]   # column scalars that get it (default: [argument])
+      sql: "YEAR({column}) = {value}"
 
 roles:
   <role-name>:
@@ -176,6 +190,12 @@ roles:
           filter: "owner_id = :jwt.sub"   # rows the op may touch (select/update/delete)
           presets:                        # forced values, hidden from the API
             owner_id: ":jwt.sub"          # from a claim — or a literal string
+        # select (object form) also takes the `where` surface, all optional:
+        #   filterable_columns:           # default: every readable column
+        #     id: all                     # all operators
+        #     title: [_eq, _ilike, _starts_with]
+        #   filter_operators: [_eq, _in, _is_null, _ilike, _starts_with]  # table-wide allow-list
+        #   filter_relationships: [author]  # default: every relationship; [] = none
 ```
 
 ### RBAC semantics
@@ -187,6 +207,9 @@ roles:
 | `insert/update.presets` | Server-forced column values. Preset columns are removed from the input types, so clients cannot even attempt to set them. |
 | `update/delete.filter` | Rows the role may touch. Everything else reports `affected_rows: 0`. |
 | `"*"` wildcard | Applies to tables without an explicit entry. Unknown columns in wildcard rules are skipped per table; in named rules they are startup errors. |
+| `select.filterable_columns` | Which readable columns appear in `<table>_bool_exp` (default: all of them). A list (`[id, title]`) or a map of column → `all` / operator list. Non-filterable columns stay selectable. |
+| `select.filter_operators` | Table-wide operator allow-list, intersected with any per-column list (default: every operator, custom ones included). |
+| `select.filter_relationships` | Relationship fields usable in `where` (default: every relationship the role can follow; `[]` = none). Navigation in the selection set is unaffected. |
 
 Notes worth knowing:
 
@@ -196,7 +219,16 @@ Notes worth knowing:
   select filter — if the filter hides it, you get `null` back (the write still
   happened).
 - Roles are startup-validated against the real schema: a typo'd table or
-  column name in the YAML refuses to boot.
+  column name in the YAML refuses to boot. The same goes for unknown
+  operator names, operators that don't apply to a column's type (in named
+  rules) and unknown `filter_relationships` names.
+- `select.filter` is also applied **inside relationship filters** (the related
+  table's filter, for the caller's role and claims). Because there it runs as
+  a correlated subquery, every select filter on a table with foreign keys is
+  dry-run against its own table at startup; one that references a column the
+  table lacks (which SQL would otherwise silently resolve against the *outer*
+  query's table) is logged as a warning and relationship filters into that
+  table are withheld for the role.
 
 ### JWT contract (for your signup service)
 
@@ -248,9 +280,13 @@ delete_posts(where: posts_bool_exp!): mutation_response!
 delete_posts_by_pk(id: BigInt!): posts
 ```
 
-`where` supports `_and/_or/_not` plus per-column `_eq _neq _gt _gte _lt _lte
-_in _nin _is_null` (`_like/_nlike/_regex/_nregex` on strings; `_contains/
-_has_key` on JSON). Type mapping: `BIGINT → BigInt`, `DECIMAL → Decimal`
+`where` supports `_and/_or/_not`, per-column `_eq _neq _gt _gte _lt _lte
+_in _nin _is_null` (plus the string operators below on strings, and
+`_contains/_has_key` on JSON), any configured custom operators, and one field
+per relationship (see [Filtering through relationships](#filtering-through-relationships)).
+Comparison types are shared per scalar (`String_comparison_exp`, …); a column
+whose operators a role restricts gets its own `<table>_<column>_comparison_exp`
+with just the allowed ones. Type mapping: `BIGINT → BigInt`, `DECIMAL → Decimal`
 (string, exact), `TINYINT(1) → Boolean`, `DATETIME/TIMESTAMP → DateTime`
 (RFC 3339), `DATE → Date`, `JSON → JSON`, `VECTOR → Vector` (`"[1,2,3]"`),
 binary → `Bytes` (base64). `BigInt` serializes as a JSON number — exact on the
@@ -288,7 +324,8 @@ config/              YAML loading + validation (env expansion, strict keys)
 introspect/          information_schema → tables, columns, PKs, FKs
 rbac/                role resolution, row-filter compilation, claim lookup
 auth/                JWT verification middleware (alg-pinned) + DB role resolver
-schema/              per-role GraphQL schema, parameterized SQL, dataloader,
+schema/              per-role GraphQL schema, parameterized SQL, where/filter
+                     surface (operators, relationship EXISTS), dataloader,
                      keyset pagination, aggregates, vector search, hooks
 server/              HTTP handler, GraphiQL (embedded), CORS, depth limit
 options.go           hook resolution (YAML names → hooks/ registry) + JWT signer
@@ -405,16 +442,133 @@ query { posts_aggregate(where: {published: {_eq: true}}) {
 `sum`/`avg` cover numeric columns; `min`/`max` cover every readable column.
 The role's row filter is always applied.
 
-### TiDB filter operators
+### Filter operators
 
-On top of `_eq _neq _gt _gte _lt _lte _in _nin _is_null` (and `_like/_nlike` on
-strings), TiDB-backed operators are available: **`_regex` / `_nregex`**
-(`REGEXP`), and on JSON columns **`_contains`** (`JSON_CONTAINS`) and
-**`_has_key`** (`JSON_CONTAINS_PATH`). All values are bound as parameters.
+On top of `_eq _neq _gt _gte _lt _lte _in _nin _is_null`, string columns get:
+
+| Operator | Meaning | SQL (values always bound) |
+|---|---|---|
+| `_like` / `_nlike` | LIKE pattern (`%`, `_` wildcards), column collation | `col LIKE ?` |
+| `_ilike` / `_nilike` | case-insensitive LIKE pattern | `col LIKE ?` on `*_ci` columns, else `LOWER(col) LIKE LOWER(?)` |
+| `_regex` / `_nregex` | regular expression, column collation | `col REGEXP ?` |
+| `_iregex` / `_niregex` | case-insensitive regular expression | `REGEXP_LIKE(col, ?, 'i')` |
+| `_contains` / `_icontains` | literal substring | `col LIKE '%…%' ESCAPE '!'` |
+| `_starts_with` / `_istarts_with` | literal prefix | `col LIKE '…%' ESCAPE '!'` |
+| `_ends_with` / `_iends_with` | literal suffix | `col LIKE '%…' ESCAPE '!'` |
+
+The literal operators take plain text, not a pattern: `%`, `_` and `!` in the
+value are escaped, so `{title: {_contains: "50%"}}` matches only titles that
+really contain `50%`. The pattern is built in Go and bound as one parameter,
+so `_starts_with` stays an index range scan. The `_i*` variants ignore case;
+the others compare exactly — on a `*_ci` column they force the charset's
+`_bin` collation (`_like`, `_regex` and `_eq` keep following the column's
+collation, as before). JSON columns keep their own **`_contains`**
+(`JSON_CONTAINS`) and **`_has_key`** (`JSON_CONTAINS_PATH`).
 
 ```graphql
-posts_connection(where: {title: {_regex: "^Notes"}, metadata: {_has_key: "tier"}}) { nodes { id } }
+posts_connection(where: {title: {_istarts_with: "notes"}, body: {_icontains: "engine"}}) { nodes { id } }
+users_connection(where: {name: {_iregex: "^(ada|grace) "}, metadata: {_has_key: "tier"}}) { nodes { id } }
 ```
+
+Performance on large tables: only `_starts_with` (and `_istarts_with` /
+`_ilike 'x%'` on a `*_ci` column) can use an index; leading-wildcard
+operators, `LOWER(col)` and regexes scan. Restrict them per role with the
+filter surface below.
+
+### Custom operators
+
+`schema_gen.custom_operators` adds operators to the comparison types of the
+scalars they apply to:
+
+```yaml
+schema_gen:
+  custom_operators:
+    - name: _year_eq                 # must start with _; may not reuse a built-in name
+      argument: Int                  # scalar of the argument (String, Int, Float, Boolean,
+                                     # BigInt, Decimal, DateTime, Date, JSON, Bytes, Vector)
+      applies_to: [Date, DateTime]   # column scalars that get it (default: [argument])
+      sql: "YEAR({column}) = {value}"
+    - name: _len_gt
+      argument: Int
+      applies_to: [String]
+      sql: "CHAR_LENGTH({column}) > {value}"
+```
+
+```graphql
+posts_connection(where: {published_on: {_year_eq: 2026}, title: {_len_gt: 20}}) { nodes { id } }
+```
+
+`{column}` becomes the backtick-quoted (and, inside relationship filters,
+alias-qualified) column; every `{value}` becomes a bound `?` carrying the
+argument. Templates are validated when the config loads — both placeholders
+present, no other `{…}`, no literal `?`, no `;` or comments, balanced quotes
+and parentheses — and dry-run against the database at startup, so a typo'd
+function fails the boot, not the first request. Custom operators obey
+`filter_operators` / `filterable_columns` like built-ins.
+
+### Restricting the filter surface
+
+By default a role can filter on every column it can read, with every
+operator, and through every relationship it can follow — exactly as before.
+Narrow it per table under `select`:
+
+```yaml
+roles:
+  anonymous:
+    tables:
+      posts:
+        select:
+          allow: true
+          columns: [id, author_id, title, body, published_on]
+          filterable_columns:              # body stays readable, but not filterable
+            id: all
+            author_id: all
+            title: [_eq, _starts_with, _istarts_with]
+            published_on: all
+          filter_operators: [_eq, _in, _gt, _lt, _starts_with, _istarts_with, _year_eq]  # _year_eq: custom, above
+          filter_relationships: [author]   # [] = no relationship filters
+```
+
+The role's schema then only contains what is allowed (`posts_title_comparison_exp
+{ _eq _starts_with _istarts_with }`, no `body` in `posts_bool_exp`), and the same checks are
+enforced again when the query runs, so values passed through variables can't
+get around them. Restrictions on a related table apply when it is reached
+through a relationship too. `filterable_columns` doesn't affect `_by_pk`
+lookups or keyset cursors (they use the primary key directly).
+
+### Filtering through relationships
+
+Every relationship the role can follow is also a field of `<table>_bool_exp`,
+typed as the related table's `bool_exp`:
+
+```graphql
+# object relationship: the related row matches
+posts_connection(where: {author: {name: {_eq: "Ada Lovelace"}}}) { nodes { id } }
+# array relationship: at least one related row matches; {} = has any
+posts_connection(where: {comments: {body: {_icontains: "cobol"}}}) { nodes { id } }
+# _not = has none (users with no posts the role can see)
+users_connection(where: {_not: {posts: {}}}) { nodes { id } }
+# nesting, in aggregates, nested lists and mutations too
+users_aggregate(where: {posts: {comments: {user: {name: {_eq: "Grace Hopper"}}}}}) { count }
+users_by_pk(id: 1) { posts(where: {comments: {}}) { id } }
+delete_comments(where: {post: {author_id: {_eq: 1}}}) { affected_rows }
+```
+
+Each relationship predicate compiles to one correlated `EXISTS (SELECT 1 FROM
+… AS __gqlgate_rN WHERE <join> AND <predicate>)` — an `_and` inside an array
+relationship must hold for the *same* related row — which TiDB runs as a
+semi-join (anti-semi-join under `_not`) on the FK index, without changing
+row multiplicity, cursors or aggregates. Every nesting level gets its own
+alias, so self-referential FKs (`parent: {parent: {…}}`, `categories: {}`)
+work, and `UPDATE`/`DELETE` whose `where` reads the same table through a
+relationship run fine on TiDB (no MySQL error 1093).
+
+RBAC: a relationship is offered only if the role can select the related table
+and read the local join columns (the same rule as for navigating it); only
+the related table's filterable columns can be used inside it; and the related
+table's `select.filter` for the role (JWT claims bound) is applied inside the
+subquery, so rows the role can't see can never be matched. Relationship
+filters nest at most 8 levels deep.
 
 ### Vector search (similarity / "nearest")
 
@@ -562,6 +716,11 @@ private database directly to verify what actually happened.
 - Schema is introspected once at startup (or on hot reload) — restart after DDL
   changes that aren't picked up by a reload.
 - GraphiQL loads its JS/CSS from unpkg.com (needs internet in dev).
+- Relationship filters nest at most 8 levels; custom operators take a single
+  scalar argument (no list arguments).
+- A role's select filter that doesn't resolve against its own table (see RBAC
+  notes) disables relationship filters into that table for the role rather
+  than failing startup — watch the startup log for the warning.
 
 ## Hardening notes
 
@@ -572,7 +731,10 @@ keyset cursor keys, which TiDB compares exactly against BIGINT PKs); the
 query-depth guard is memoized so a small fan-out fragment document can't cause
 exponential CPU; hidden columns can't be probed through `where`, `_by_pk`,
 cursors, or variables; the RBAC row filter is applied on every read path
-(connections, aggregates, relationships, vector search); aggregate and
+(connections, aggregates, relationships, vector search, and inside
+relationship filters, where each role filter is verified at startup to bind
+only to its own table); LIKE wildcards in literal string operators are
+escaped; aggregate and
 relationship selections are computed correctly even when the client wraps them
 in fragments; vector search skips NULL-vector rows; DB errors are masked from
 clients unless `server.debug` is on; and identifier/name collisions are

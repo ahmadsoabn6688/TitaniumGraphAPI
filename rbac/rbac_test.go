@@ -3,6 +3,9 @@ package rbac
 import (
 	"reflect"
 	"testing"
+
+	"gqlgate/config"
+	"gqlgate/introspect"
 )
 
 func TestLookupClaim(t *testing.T) {
@@ -94,5 +97,63 @@ func TestCompileFilterNoClaims(t *testing.T) {
 	sqlStr, args, err := f.SQL(map[string]any{})
 	if err != nil || sqlStr != "published = 1" || len(args) != 0 {
 		t.Errorf("static filter should pass through, got %q %v %v", sqlStr, args, err)
+	}
+}
+
+func TestFilterValidationSQL(t *testing.T) {
+	f, _ := CompileFilter("author_id = :jwt.sub AND tenant_id IN (:jwt.tenants)")
+	if got := f.ValidationSQL(); got != "author_id = NULL AND tenant_id IN (NULL)" {
+		t.Errorf("ValidationSQL = %q", got)
+	}
+}
+
+func filterSurfaceTable() *introspect.Table {
+	id := &introspect.Column{Name: "id", Ordinal: 0}
+	title := &introspect.Column{Name: "title", Ordinal: 1}
+	secret := &introspect.Column{Name: "secret", Ordinal: 2}
+	return &introspect.Table{
+		Name:      "posts",
+		Columns:   []*introspect.Column{id, title, secret},
+		ColumnMap: map[string]*introspect.Column{"id": id, "title": title, "secret": secret},
+	}
+}
+
+func TestResolveFilterSurface(t *testing.T) {
+	tbl := filterSurfaceTable()
+	rels := []string{"author"}
+	perm := &config.OpPerm{
+		Allow:   true,
+		Columns: []string{"id", "title"},
+		FilterableColumns: &config.FilterableColumns{
+			Names: []string{"title"}, Ops: map[string][]string{"title": {"_eq"}},
+		},
+		FilterOperators:     []string{"_eq", "_in"},
+		FilterRelationships: &rels,
+	}
+	oa, err := resolveOp("r", tbl, "select", perm, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !oa.Explicit || oa.Filterable("id") || !oa.Filterable("title") || oa.Filterable("secret") {
+		t.Errorf("filterable: explicit=%v id=%v title=%v secret=%v", oa.Explicit, oa.Filterable("id"), oa.Filterable("title"), oa.Filterable("secret"))
+	}
+	if !reflect.DeepEqual(oa.FilterColumns["title"], []string{"_eq"}) || !reflect.DeepEqual(oa.FilterOperators, []string{"_eq", "_in"}) || !reflect.DeepEqual(oa.FilterRelationships, rels) {
+		t.Errorf("surface = %+v", oa)
+	}
+
+	// Default: every readable column is filterable.
+	oa, _ = resolveOp("r", tbl, "select", &config.OpPerm{Allow: true, Columns: []string{"id"}}, true)
+	if oa.FilterColumns != nil || !oa.Filterable("id") || oa.Filterable("title") {
+		t.Errorf("default surface wrong: %+v", oa)
+	}
+
+	// A filterable column must be readable; explicit rules fail, wildcard rules skip.
+	perm = &config.OpPerm{Allow: true, Columns: []string{"id"}, FilterableColumns: &config.FilterableColumns{Names: []string{"id", "secret"}}}
+	if _, err := resolveOp("r", tbl, "select", perm, true); err == nil {
+		t.Error("unreadable filterable column must fail an explicit rule")
+	}
+	oa, err = resolveOp("r", tbl, "select", perm, false)
+	if err != nil || oa.Filterable("secret") || !oa.Filterable("id") {
+		t.Errorf("wildcard rule should skip unreadable column: %v %+v", err, oa)
 	}
 }

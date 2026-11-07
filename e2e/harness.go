@@ -122,6 +122,14 @@ const DefaultRolesYAML = `roles:
           allow: true
           columns: [id, author_id, title, body, published_on, created_at]
           filter: "published = 1"
+          # Public clients get an index-friendly filter surface: no
+          # regex / LIKE scans, and body is readable but not filterable.
+          filterable_columns:
+            id: all
+            author_id: all
+            title: [_eq, _in, _starts_with, _istarts_with, _icontains]
+            published_on: all
+            created_at: all
       users:
         select:
           allow: true

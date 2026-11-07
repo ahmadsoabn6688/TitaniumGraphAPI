@@ -171,6 +171,9 @@ type SchemaGen struct {
 	Tables          TableFilter `yaml:"tables"`
 	DefaultPageSize int         `yaml:"default_page_size"`
 	MaxPageSize     int         `yaml:"max_page_size"`
+	// CustomOperators are developer-defined comparison operators added to the
+	// <Scalar>_comparison_exp types of the scalars they apply to.
+	CustomOperators []CustomOperator `yaml:"custom_operators"`
 }
 
 // TableFilter narrows which tables of the schema are exposed.
@@ -206,11 +209,33 @@ type TablePerm struct {
 //	  filter: "author_id = :jwt.sub"  # row-level filter, claims bound as params
 //	  presets:                        # insert/update: server-forced column values
 //	    author_id: ":jwt.sub"
+//
+// select additionally shapes the role's `where` surface (all optional; the
+// default is every readable column, every operator, every relationship):
+//
+//	select:
+//	  allow: true
+//	  filterable_columns:             # columns usable in where (+ per-column operators)
+//	    id: all
+//	    title: [_eq, _ilike, _starts_with]
+//	  filter_operators: [_eq, _in, _is_null, _ilike]  # table-wide operator allow-list
+//	  filter_relationships: [author]  # relationships usable in where ([] = none)
 type OpPerm struct {
 	Allow   bool              `yaml:"allow"`
 	Columns []string          `yaml:"columns"`
 	Filter  string            `yaml:"filter"`
 	Presets map[string]string `yaml:"presets"`
+
+	// FilterableColumns restricts which readable columns appear in the
+	// role's <table>_bool_exp, optionally with per-column operator lists.
+	// nil = every readable column. select only.
+	FilterableColumns *FilterableColumns `yaml:"filterable_columns"`
+	// FilterOperators is a table-wide operator allow-list, intersected with
+	// any per-column list. Empty = every operator. select only.
+	FilterOperators []string `yaml:"filter_operators"`
+	// FilterRelationships lists the relationship fields usable in where.
+	// nil = every relationship the role can follow; [] = none. select only.
+	FilterRelationships *[]string `yaml:"filter_relationships"`
 }
 
 // UnmarshalYAML accepts either a bool or a mapping for an operation permission.
@@ -422,5 +447,5 @@ func (c *Config) validate() error {
 	if c.JWT.RoleLookup.Enabled() && c.JWT.RoleLookup.CacheSeconds < 0 {
 		return fmt.Errorf("jwt.role_lookup.cache_seconds must be >= 0")
 	}
-	return nil
+	return c.validateFilterSurface()
 }

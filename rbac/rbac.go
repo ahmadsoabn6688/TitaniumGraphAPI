@@ -66,6 +66,33 @@ type OpAccess struct {
 	Filter *Filter
 	// Presets are server-forced column values for insert/update.
 	Presets []Preset
+
+	// Explicit is true when the rule came from a named table entry rather
+	// than the "*" wildcard (names that don't fit a table are errors for
+	// explicit rules and are skipped for wildcard ones).
+	Explicit bool
+	// FilterColumns restricts the columns usable in `where` (select only):
+	// nil = every readable column; otherwise column -> operator allow-list,
+	// where a nil list means every operator.
+	FilterColumns map[string][]string
+	// FilterOperators is the table-wide operator allow-list (nil = all).
+	FilterOperators []string
+	// FilterRelationships lists the relationship fields usable in `where`
+	// (nil = every relationship the role can follow).
+	FilterRelationships []string
+}
+
+// Filterable reports whether a readable column may appear in `where` at all
+// (operator allow-lists are applied by the schema builder).
+func (o *OpAccess) Filterable(col string) bool {
+	if !o.ColumnSet[col] {
+		return false
+	}
+	if o.FilterColumns == nil {
+		return true
+	}
+	_, ok := o.FilterColumns[col]
+	return ok
 }
 
 // Preset forces a column to a value on insert/update, overriding client input.
@@ -146,7 +173,7 @@ func resolveOp(roleName string, table *introspect.Table, op string, perm *config
 	if perm == nil || !perm.Allow {
 		return nil, nil
 	}
-	oa := &OpAccess{ColumnSet: map[string]bool{}}
+	oa := &OpAccess{ColumnSet: map[string]bool{}, Explicit: explicit}
 
 	if len(perm.Columns) == 0 {
 		oa.Columns = table.Columns
@@ -172,6 +199,12 @@ func resolveOp(roleName string, table *introspect.Table, op string, perm *config
 	}
 	for _, c := range oa.Columns {
 		oa.ColumnSet[c.Name] = true
+	}
+
+	if op == "select" {
+		if err := resolveFilterSurface(roleName, table, perm, oa, explicit); err != nil {
+			return nil, err
+		}
 	}
 
 	if perm.Filter != "" {
@@ -210,6 +243,48 @@ func resolveOp(roleName string, table *introspect.Table, op string, perm *config
 		}
 	}
 	return oa, nil
+}
+
+// resolveFilterSurface copies the select-only filter-surface settings onto oa,
+// checking that every filterable column exists and is readable. Wildcard rules
+// skip columns a particular table lacks.
+func resolveFilterSurface(roleName string, table *introspect.Table, perm *config.OpPerm, oa *OpAccess, explicit bool) error {
+	if fc := perm.FilterableColumns; fc != nil {
+		oa.FilterColumns = map[string][]string{}
+		for _, c := range fc.Names {
+			if !oa.ColumnSet[c] {
+				if !explicit {
+					continue
+				}
+				if !table.HasColumn(c) {
+					return fmt.Errorf("role %q, table %q, select.filterable_columns: column %q does not exist", roleName, table.Name, c)
+				}
+				return fmt.Errorf("role %q, table %q, select.filterable_columns: column %q is not readable by the role (add it to select.columns)", roleName, table.Name, c)
+			}
+			oa.FilterColumns[c] = fc.Ops[c] // nil = every operator
+		}
+	}
+	if len(perm.FilterOperators) > 0 {
+		oa.FilterOperators = append([]string{}, perm.FilterOperators...)
+	}
+	if perm.FilterRelationships != nil {
+		oa.FilterRelationships = append([]string{}, (*perm.FilterRelationships)...)
+	}
+	return nil
+}
+
+// ValidationSQL renders the filter with every claim reference replaced by
+// NULL, for a startup dry run that checks the SQL parses and that each
+// identifier resolves against the filter's own table.
+func (f *Filter) ValidationSQL() string {
+	var sb strings.Builder
+	for i, seg := range f.segments {
+		sb.WriteString(seg)
+		if i < len(f.paths) {
+			sb.WriteString("NULL")
+		}
+	}
+	return sb.String()
 }
 
 var (

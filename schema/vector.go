@@ -130,7 +130,7 @@ func (b *builder) runNearest(ctx context.Context, ti *tableInfo, id *rbac.Identi
 	var userCond *condition
 	var err error
 	if where != nil {
-		if userCond, err = b.whereSQL(ti, where); err != nil {
+		if userCond, err = b.whereSQL(ti, where, id); err != nil {
 			return nil, err
 		}
 	}

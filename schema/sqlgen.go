@@ -35,159 +35,6 @@ func sortedKeys(m map[string]any) []string {
 	return keys
 }
 
-// whereSQL translates a GraphQL bool_exp value into SQL. Column names come
-// from the schema-validated input type, so only known fields can appear; all
-// values are bound as parameters.
-func (b *builder) whereSQL(ti *tableInfo, expr map[string]any) (*condition, error) {
-	var parts []string
-	var args []any
-	for _, key := range sortedKeys(expr) {
-		val := expr[key]
-		if val == nil {
-			continue
-		}
-		switch key {
-		case "_and", "_or":
-			items, ok := val.([]any)
-			if !ok {
-				return nil, fmt.Errorf("%s must be a list", key)
-			}
-			var sub []string
-			for _, item := range items {
-				m, ok := item.(map[string]any)
-				if !ok {
-					return nil, fmt.Errorf("%s entries must be objects", key)
-				}
-				c, err := b.whereSQL(ti, m)
-				if err != nil {
-					return nil, err
-				}
-				sub = append(sub, "("+c.sql+")")
-				args = append(args, c.args...)
-			}
-			if len(sub) == 0 {
-				continue
-			}
-			joiner := " AND "
-			if key == "_or" {
-				joiner = " OR "
-			}
-			parts = append(parts, "("+strings.Join(sub, joiner)+")")
-		case "_not":
-			m, ok := val.(map[string]any)
-			if !ok {
-				return nil, fmt.Errorf("_not must be an object")
-			}
-			c, err := b.whereSQL(ti, m)
-			if err != nil {
-				return nil, err
-			}
-			parts = append(parts, "NOT ("+c.sql+")")
-			args = append(args, c.args...)
-		default:
-			col, ok := ti.fieldToCol[key]
-			// Re-check read visibility here: the input types already hide
-			// non-readable columns, but values arriving through variables
-			// must not be able to probe hidden columns either.
-			if !ok || ti.access.Select == nil || !ti.access.Select.ColumnSet[col.Name] {
-				return nil, fmt.Errorf("unknown filter column %q", key)
-			}
-			opMap, ok := val.(map[string]any)
-			if !ok {
-				return nil, fmt.Errorf("filter on %q must be an object of operators", key)
-			}
-			for _, op := range sortedKeys(opMap) {
-				c, err := b.columnCond(col, op, opMap[op])
-				if err != nil {
-					return nil, err
-				}
-				if c == nil {
-					continue
-				}
-				parts = append(parts, c.sql)
-				args = append(args, c.args...)
-			}
-		}
-	}
-	if len(parts) == 0 {
-		return &condition{sql: "1=1"}, nil
-	}
-	return &condition{sql: strings.Join(parts, " AND "), args: args}, nil
-}
-
-var binaryOps = map[string]string{
-	"_eq": "= ?", "_neq": "<> ?",
-	"_gt": "> ?", "_gte": ">= ?",
-	"_lt": "< ?", "_lte": "<= ?",
-	"_like": "LIKE ?", "_nlike": "NOT LIKE ?",
-	"_regex": "REGEXP ?", "_nregex": "NOT REGEXP ?",
-}
-
-func (b *builder) columnCond(col *introspect.Column, op string, val any) (*condition, error) {
-	qc := quoteIdent(col.Name)
-	if tmpl, ok := binaryOps[op]; ok {
-		if val == nil {
-			return nil, fmt.Errorf("%s.%s: null is not a valid comparison value, use _is_null", col.Name, op)
-		}
-		bound, err := bindValue(col, val)
-		if err != nil {
-			return nil, err
-		}
-		return &condition{sql: qc + " " + tmpl, args: []any{bound}}, nil
-	}
-	switch op {
-	case "_in", "_nin":
-		items, ok := val.([]any)
-		if !ok {
-			return nil, fmt.Errorf("%s.%s expects a list", col.Name, op)
-		}
-		if len(items) == 0 {
-			if op == "_in" {
-				return &condition{sql: "1=0"}, nil // IN () matches nothing
-			}
-			return &condition{sql: "1=1"}, nil // NOT IN () matches everything
-		}
-		placeholders := strings.TrimSuffix(strings.Repeat("?, ", len(items)), ", ")
-		args := make([]any, 0, len(items))
-		for _, item := range items {
-			bound, err := bindValue(col, item)
-			if err != nil {
-				return nil, err
-			}
-			args = append(args, bound)
-		}
-		kw := "IN"
-		if op == "_nin" {
-			kw = "NOT IN"
-		}
-		return &condition{sql: fmt.Sprintf("%s %s (%s)", qc, kw, placeholders), args: args}, nil
-	case "_is_null":
-		isNull, ok := val.(bool)
-		if !ok {
-			return nil, fmt.Errorf("%s._is_null expects a boolean", col.Name)
-		}
-		if isNull {
-			return &condition{sql: qc + " IS NULL"}, nil
-		}
-		return &condition{sql: qc + " IS NOT NULL"}, nil
-	case "_contains":
-		// TiDB JSON_CONTAINS(col, candidate): does the JSON doc contain the value?
-		bound, err := bindValue(col, val)
-		if err != nil {
-			return nil, err
-		}
-		return &condition{sql: "JSON_CONTAINS(" + qc + ", ?)", args: []any{bound}}, nil
-	case "_has_key":
-		// TiDB JSON_CONTAINS_PATH(col, 'one', '$.<key>'): top-level key present?
-		key, ok := val.(string)
-		if !ok {
-			return nil, fmt.Errorf("%s._has_key expects a string", col.Name)
-		}
-		return &condition{sql: "JSON_CONTAINS_PATH(" + qc + ", 'one', CONCAT('$.', ?))", args: []any{key}}, nil
-	}
-	return nil, fmt.Errorf("unsupported operator %q on column %q", op, col.Name)
-}
-
 // rbacCond renders an operation's row-level filter for the current identity.
 func rbacCond(oa *rbac.OpAccess, id *rbac.Identity) (*condition, error) {
 	if oa.Filter == nil {
@@ -372,7 +219,7 @@ func (b *builder) runSelect(ctx context.Context, ti *tableInfo, id *rbac.Identit
 	var userCond *condition
 	var err error
 	if la.where != nil {
-		if userCond, err = b.whereSQL(ti, la.where); err != nil {
+		if userCond, err = b.whereSQL(ti, la.where, id); err != nil {
 			return nil, err
 		}
 	}
@@ -487,7 +334,7 @@ func (b *builder) runKeysetPage(ctx context.Context, ti *tableInfo, id *rbac.Ide
 	var userCond *condition
 	var err error
 	if userWhere != nil {
-		if userCond, err = b.whereSQL(ti, userWhere); err != nil {
+		if userCond, err = b.whereSQL(ti, userWhere, id); err != nil {
 			return nil, err
 		}
 	}
@@ -523,7 +370,7 @@ func (b *builder) runSelectByKeys(ctx context.Context, ti *tableInfo, id *rbac.I
 	var userCond *condition
 	var err error
 	if userWhere != nil {
-		if userCond, err = b.whereSQL(ti, userWhere); err != nil {
+		if userCond, err = b.whereSQL(ti, userWhere, id); err != nil {
 			return nil, err
 		}
 	}
@@ -597,7 +444,7 @@ func (b *builder) runCount(ctx context.Context, ti *tableInfo, id *rbac.Identity
 	var userCond *condition
 	var err error
 	if where != nil {
-		if userCond, err = b.whereSQL(ti, where); err != nil {
+		if userCond, err = b.whereSQL(ti, where, id); err != nil {
 			return 0, err
 		}
 	}
