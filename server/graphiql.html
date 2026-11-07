@@ -15,10 +15,44 @@
   <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
   <script crossorigin src="https://unpkg.com/graphiql@3/graphiql.min.js"></script>
   <script>
-    const fetcher = GraphiQL.createFetcher({ url: window.location.pathname });
-    ReactDOM.createRoot(document.getElementById('graphiql')).render(
-      React.createElement(GraphiQL, {
-        fetcher: fetcher,
+    const url = window.location.pathname;
+    const root = ReactDOM.createRoot(document.getElementById('graphiql'));
+
+    // gqlgate serves a different schema per role, so what Docs and
+    // autocomplete show depends on the Authorization header. GraphiQL only
+    // introspects on page load (or when its fetcher changes), so a token
+    // pasted into the Headers tab used to leave Docs stuck on the anonymous
+    // schema. Hand GraphiQL a fresh fetcher whenever the Authorization header
+    // changes; that re-runs introspection with the new token.
+    let lastAuth = '';
+    let debounce;
+
+    // Returns the Authorization value ('' when absent), or null while the
+    // headers text is not valid JSON (the user is mid-edit).
+    function authFrom(headersText) {
+      try {
+        const headers = JSON.parse(headersText || '{}');
+        const key = Object.keys(headers).find(k => k.toLowerCase() === 'authorization');
+        return key ? String(headers[key]).trim() : '';
+      } catch {
+        return null;
+      }
+    }
+
+    function onEditHeaders(text) {
+      clearTimeout(debounce);
+      debounce = setTimeout(() => {
+        const auth = authFrom(text);
+        if (auth === null || auth === lastAuth) return;
+        lastAuth = auth;
+        render(auth ? { Authorization: auth } : {});
+      }, 500);
+    }
+
+    function render(headers) {
+      root.render(React.createElement(GraphiQL, {
+        fetcher: GraphiQL.createFetcher({ url, headers }),
+        onEditHeaders,
         defaultEditorToolsVisibility: 'headers',
         // Empty (valid JSON) so Docs/introspection and anonymous-role queries
         // work immediately. Add {"Authorization":"Bearer <jwt>"} once you have
@@ -31,11 +65,13 @@
           '# Get a token without leaving here (if a signup/signin hook exists):\n' +
           '#   mutation { signup(username: "alice", password: "password123") }\n' +
           '# then put   { "Authorization": "Bearer <token>" }   in the Headers tab.\n' +
-          '# Press Docs to explore exactly what your current role can access.\n' +
+          '# Docs refresh automatically to show exactly what that role can access.\n' +
           '\n' +
           'query {\n  _role\n}\n',
-      })
-    );
+      }));
+    }
+
+    render({});
   </script>
 </body>
 </html>
