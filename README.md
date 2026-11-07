@@ -350,8 +350,10 @@ Schema-generation details that just work:
   operation. The newer generated names never do: a unique-key field whose
   name is already taken (by another generated field, or by a custom field
   from `hooks/`, which keeps it) is left out with a startup warning, and
-  `<t>_mutation_response` gets a numeric suffix if a table already owns
-  that name — so a schema that booted before still boots.
+  `<t>_mutation_response` gets a numeric suffix (with a startup warning) if
+  a table, or a type a `hooks/` custom field uses (its result, argument and
+  nested types), already owns that name — so a schema that booted before
+  still boots.
 - **`AUTO_RANDOM` primary keys** are recognized (TiDB reports them in
   `information_schema.tables`, not as `auto_increment`): they are optional
   on insert, and `insert_<t>_one` / `returning` find the generated rows.
@@ -798,6 +800,15 @@ an update or delete stays a single statement):
 - **update** locks the matching keys first (`SELECT <pk> … WHERE <where> AND
   <update filter> FOR UPDATE`), updates exactly those rows and re-reads them
   (by their new key if `_set` changed it). Rows come back in key order.
+- A supplied or `_set` key is looked up in the form the column **stores**
+  it: `DECIMAL`, `DATETIME`/`TIMESTAMP`, `TIME`, `DATE` and `BINARY(n)` key
+  values are converted with `CAST` (TiDB converts them exactly like the
+  write), so `{id: "1.005"}` into a `DECIMAL(10,2)` key returns the row with
+  `id: "1.01"`. A key the database changes in a way no cast predicts — a
+  `FLOAT`/`DOUBLE` value that is not exactly representable, a key column with
+  `ON UPDATE CURRENT_TIMESTAMP` or generated from other columns — cannot be
+  found again: the row is left out of `returning`, and with a write check
+  the mutation fails (see below).
 - **delete** locks the keys matching `<where> AND <delete filter>`, reads those
   rows, then deletes them. Which rows are deleted depends only on the DELETE
   permission.
@@ -809,7 +820,11 @@ role can select the table and the table has a primary key (it need not be
 readable); otherwise the type has `affected_rows` only. Each
 `<t>_mutation_response` implements the `mutation_response` interface, so
 `... on mutation_response { affected_rows }` keeps working. Returned rows
-count against `server.max_response_rows`; going over rolls the mutation back.
+count against `server.max_response_rows`: when the top-level `returning`
+rows go over, the mutation is rolled back. Relationship fields inside
+`returning` (and inside `insert_<t>_one` / `update_<t>_by_pk` results) are
+read after the commit; when they go over, the write stays applied and the
+`response_too_large` error says so (see [Response limits](#response-limits)).
 
 ### Write checks
 
@@ -845,10 +860,19 @@ mutation { update_posts_by_pk(id: 7, _set: {org_id: 999}) { id } }
   `:jwt.<path>` claims bound as parameters.
 - It runs inside the mutation's transaction, after the before-hooks and the
   write and before the after-hooks: the rows are counted with
-  `SELECT COUNT(*) … WHERE <written keys> AND (<check>) IS NOT TRUE`, and any
-  such row — including one where the check comes out `NULL` — rolls the
-  **whole** mutation back (all objects of a bulk insert, all rows of a bulk
-  update). After-hooks never see rows that are about to be rolled back.
+  `SELECT COUNT(*), SUM((<check>) IS NOT TRUE) … WHERE <written keys>`, and
+  any failing row — including one where the check comes out `NULL` — rolls
+  the **whole** mutation back (all objects of a bulk insert, all rows of a
+  bulk update). After-hooks never see rows that are about to be rolled back.
+- It **fails closed**: every written row must be found again by its key
+  (in its stored form, see `returning` above), or the mutation is rolled
+  back with `permission_error` ("could not be found again by their key").
+  For key types other than integers and character columns, gqlgate also
+  makes sure before the write that no existing row already answers to a
+  written key, so the check can never be evaluated on a different row. In
+  practice: a `FLOAT`/`DOUBLE` key must be sent as an exactly representable
+  value, and a checked table should not have a key column that changes on
+  its own (`ON UPDATE CURRENT_TIMESTAMP`, a generated column).
 - Presets are applied before the check sees the row, as are column defaults
   and generated columns (the check reads the row as stored).
 - It applies to `insert_<t>`, `insert_<t>_one`, `update_<t>`,
@@ -861,7 +885,14 @@ mutation { update_posts_by_pk(id: 7, _set: {org_id: 999}) { id } }
   `AUTO_INCREMENT`/`AUTO_RANDOM`) must be supplied explicitly.
 - `check` is accepted on insert and update only. **`insert.filter`** — accepted
   but ignored by earlier versions — is now enforced as the insert check (a
-  startup warning suggests renaming it); setting both is an error.
+  startup warning suggests renaming it); setting both is an error. So that a
+  config that booted before still boots, an `insert.filter` that cannot be
+  enforced on a table — the table has no primary key, or the dry run fails
+  there (e.g. a `"*"` rule naming a column that table lacks) — is skipped for
+  that table with a startup warning, i.e. ignored there as before. An
+  explicit `check` in the same situation still fails the boot. A legacy
+  filter that is enforced follows the rules above, so an insert into such a
+  table must supply keys a column default would otherwise generate.
 
 ### Lookups by unique key
 
@@ -904,7 +935,7 @@ Errors follow the GraphQL spec, and carry an `extensions.code`:
 | `conflict` | lock wait timeout, deadlock, write conflict or schema change during the transaction (1205, 1213, 8002, 8022, 8028, 9007) — retry |
 | `timeout` | the request ran past `database.query_timeout_seconds` |
 | `database_error` | anything else the database reported |
-| `permission_error` | a row failed the role's insert/update `check` |
+| `permission_error` | a row failed the role's insert/update `check`, or a written row could not be found again to verify it |
 | `response_too_large` | `server.max_response_rows` / `max_response_bytes` exceeded |
 
 ```json
@@ -935,11 +966,17 @@ server:
   unique-key lookups, relationship rows (each time they appear), vector
   search results and mutation `returning` rows (aggregates are one row). The
   request fails with `extensions.code: response_too_large` and `data: null`
-  as soon as it goes over. A mutation whose `returning` goes over is rolled
-  back; once a mutation has committed (a later field of the same request
-  goes over), its partial result is kept so the write is visible.
+  as soon as it goes over. A mutation whose top-level `returning` rows go
+  over is rolled back. Once a mutation has committed — a later field of the
+  same request, or relationship rows nested in its `returning`, go over —
+  its partial result is kept, and the `response_too_large` error says
+  "the mutation itself was applied" and carries
+  `extensions.mutation_applied: true`. `data` can still be `null` then
+  (null propagation from the failed nested field), so check that flag
+  before retrying a write.
 - **Bytes** replaces a larger response with a single `response_too_large`
-  error (noting when a mutation was nonetheless applied).
+  error (with the same message and `mutation_applied` flag when a mutation
+  was nonetheless applied).
 - Both default to 0 (unlimited), so existing configs behave as before. They
   are read per request, so a hot reload changes them.
 

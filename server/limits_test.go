@@ -51,6 +51,19 @@ func TestLimitResult(t *testing.T) {
 	if r.Data == nil {
 		t.Error("a committed mutation's partial result must be kept")
 	}
+	// The limit errors say the write happened (data may be null after null
+	// propagation, so they are the only sign of it); other errors are kept.
+	for i, e := range r.Errors[:2] {
+		if !strings.Contains(e.Message, "mutation itself was applied") || e.Extensions["mutation_applied"] != true {
+			t.Errorf("limit error %d after a commit = %q %v", i, e.Message, e.Extensions)
+		}
+	}
+	if r.Errors[2].Message != "other" || r.Errors[2].Extensions != nil {
+		t.Errorf("unrelated error changed: %+v", r.Errors[2])
+	}
+	if _, shared := limitErr.Extensions["mutation_applied"]; shared {
+		t.Error("limitResult must not modify a shared extensions map")
+	}
 }
 
 func TestTooLargeBody(t *testing.T) {
@@ -69,5 +82,8 @@ func TestTooLargeBody(t *testing.T) {
 	}
 	if msg := resp.Errors[0].Message; !strings.Contains(msg, "max_response_bytes") || !strings.Contains(msg, "applied") {
 		t.Errorf("message %q must name the limit and say the mutation was applied", msg)
+	}
+	if resp.Errors[0].Extensions["mutation_applied"] != true {
+		t.Errorf("extensions %v must carry mutation_applied", resp.Errors[0].Extensions)
 	}
 }

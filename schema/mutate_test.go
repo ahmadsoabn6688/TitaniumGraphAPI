@@ -15,6 +15,7 @@ import (
 
 	"gqlgate/config"
 	"gqlgate/introspect"
+	"gqlgate/rbac"
 )
 
 func TestChunkKeys(t *testing.T) {
@@ -369,5 +370,141 @@ func TestWriteCheckNeedsPrimaryKey(t *testing.T) {
 	cfg.SchemaGen.DefaultPageSize, cfg.SchemaGen.MaxPageSize = 25, 200
 	if _, err := BuildAll(Options{Catalog: c, Config: cfg}); err == nil || !strings.Contains(err.Error(), "primary key") {
 		t.Errorf("insert check on a table without a primary key: got %v", err)
+	}
+}
+
+func TestCastType(t *testing.T) {
+	tests := []struct{ dataType, columnType, want string }{
+		{"decimal", "decimal(10,2)", "DECIMAL(10,2)"},
+		{"decimal", "decimal(10,2) unsigned zerofill", "DECIMAL(10,2)"},
+		{"datetime", "datetime", "DATETIME"},
+		{"datetime", "datetime(3)", "DATETIME(3)"},
+		{"timestamp", "timestamp(6)", "DATETIME(6)"},
+		{"time", "time(1)", "TIME(1)"},
+		{"date", "date", "DATE"},
+		{"binary", "binary(4)", "BINARY(4)"},
+		{"bigint", "bigint(20) unsigned", ""},
+		{"varchar", "varchar(36)", ""},
+		{"float", "float", ""},
+	}
+	for _, tc := range tests {
+		if got := castType(&introspect.Column{DataType: tc.dataType, ColumnType: tc.columnType}); got != tc.want {
+			t.Errorf("castType(%s) = %q, want %q", tc.columnType, got, tc.want)
+		}
+	}
+	if castType(nil) != "" {
+		t.Error("castType(nil) must be empty")
+	}
+}
+
+func TestExactKey(t *testing.T) {
+	id := &introspect.Column{Name: "id", DataType: "bigint", IsPrimary: true}
+	code := &introspect.Column{Name: "code", DataType: "varchar", IsPrimary: true}
+	amount := &introspect.Column{Name: "amount", DataType: "decimal", IsPrimary: true}
+	if !exactKey(insertTable(id, code), []string{"id", "code"}) {
+		t.Error("integer and character keys compare exactly")
+	}
+	if exactKey(insertTable(id, amount), []string{"id", "amount"}) {
+		t.Error("a decimal key part needs the pre-write guard")
+	}
+	if exactKey(insertTable(id), []string{"missing"}) {
+		t.Error("an unknown column is not exact")
+	}
+}
+
+func TestDistinctKeys(t *testing.T) {
+	got := distinctKeys([][]any{{int64(1)}, {"1"}, {[]byte("2")}, {int64(2)}, {int64(3)}})
+	if !reflect.DeepEqual(got, [][]any{{int64(1)}, {[]byte("2")}, {int64(3)}}) {
+		t.Errorf("distinctKeys = %v", got)
+	}
+}
+
+func TestMovedCols(t *testing.T) {
+	if got := movedCols([]string{"a", "b"}, map[string]any{"b": 1, "c": 2}); !reflect.DeepEqual(got, []string{"b"}) {
+		t.Errorf("movedCols = %v", got)
+	}
+	if got := movedCols([]string{"a"}, map[string]any{"c": 2}); got != nil {
+		t.Errorf("movedCols = %v, want none", got)
+	}
+}
+
+// A legacy insert.filter (accepted and ignored by earlier versions) must not
+// stop a config from booting where it cannot be enforced: on a table without
+// a primary key it is skipped, while an explicit check there still fails.
+func TestLegacyInsertFilterWithoutPrimaryKey(t *testing.T) {
+	c := uniqueKeyCatalog()
+	c.Tables["comments"].PrimaryKey = nil
+	cfg := &config.Config{Roles: map[string]*config.Role{"r": {Tables: map[string]*config.TablePerm{
+		"*": {Select: &config.OpPerm{Allow: true}, Insert: &config.OpPerm{Allow: true, Filter: "1 = 1"}},
+	}}}}
+	cfg.SchemaGen.DefaultPageSize, cfg.SchemaGen.MaxPageSize = 25, 200
+	schemas, err := BuildAll(Options{Catalog: c, Config: cfg})
+	if err != nil {
+		t.Fatalf("a wildcard insert.filter with a PK-less table must still build: %v", err)
+	}
+	if !hasMutationField(schemas["r"], "insert_comments") || !hasMutationField(schemas["r"], "insert_posts") {
+		t.Error("insert fields must stay available")
+	}
+
+	// The builder keeps enforcing it where it can, and drops it (on a copy)
+	// where it cannot.
+	access, err := rbac.Resolve("r", cfg.Roles["r"], c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	shared, err := newBuildShared(Options{Catalog: c, Config: cfg})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _, err := buildRoleBuilder(Options{Catalog: c, Config: cfg}, shared, "r", access)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b.tinfos["comments"].access.Insert.Check != nil {
+		t.Error("the legacy filter must not be enforced on the PK-less table")
+	}
+	if b.tinfos["posts"].access.Insert.Check == nil {
+		t.Error("the legacy filter must still be enforced on a table with a primary key")
+	}
+	if access.Table("comments").Insert.Check == nil {
+		t.Error("the resolved role access must not be modified")
+	}
+}
+
+// A custom field whose own type is already named <t>_mutation_response keeps
+// the name; the generated type takes the next free numbered one.
+func TestMutationResponseAvoidsCustomTypes(t *testing.T) {
+	custom := graphql.NewObject(graphql.ObjectConfig{
+		Name:   "posts_mutation_response",
+		Fields: graphql.Fields{"ok": &graphql.Field{Type: graphql.Boolean}},
+	})
+	input := graphql.NewInputObject(graphql.InputObjectConfig{
+		Name:   "users_mutation_response",
+		Fields: graphql.InputObjectConfigFieldMap{"x": &graphql.InputObjectFieldConfig{Type: graphql.String}},
+	})
+	field := &graphql.Field{
+		Type: graphql.NewNonNull(custom),
+		Args: graphql.FieldConfigArgument{"in": &graphql.ArgumentConfig{Type: input}},
+		Resolve: func(graphql.ResolveParams) (any, error) {
+			return map[string]any{"ok": true}, nil
+		},
+	}
+	hooks := NewHooks(nil, nil, []CustomField{{Name: "publish", Operation: "mutation", Field: field}})
+	all := &config.OpPerm{Allow: true}
+	s, err := buildUniqueRole(t, &config.Role{Tables: map[string]*config.TablePerm{"*": {Select: all, Insert: all, Update: all, Delete: all}}}, hooks)
+	if err != nil {
+		t.Fatalf("a custom type named like a mutation response must not break the build: %v", err)
+	}
+	if got := s.MutationType().Fields()["insert_posts"].Type.String(); got != "posts_mutation_response_1!" {
+		t.Errorf("insert_posts returns %s", got)
+	}
+	if got := s.MutationType().Fields()["insert_users"].Type.String(); got != "users_mutation_response_1!" {
+		t.Errorf("insert_users returns %s", got)
+	}
+	if got := s.MutationType().Fields()["publish"].Type.String(); got != "posts_mutation_response!" {
+		t.Errorf("the custom field lost its type: %s", got)
+	}
+	if got := s.MutationType().Fields()["insert_comments"].Type.String(); got != "comments_mutation_response!" {
+		t.Errorf("unaffected tables keep their names, got %s", got)
 	}
 }

@@ -127,3 +127,15 @@ func checkFailed(op, table string) error {
 		Message: fmt.Sprintf("permission check failed: a row written by this %s on %q does not satisfy the role's %s check; nothing was written", op, table, op),
 	}
 }
+
+// checkUnverifiable is the error of a write whose rows could not all be found
+// again by their key (the database stored a key in another form than the one
+// sent, or changed it), so the role's check cannot be verified. It fails
+// closed: the mutation has been rolled back.
+func checkUnverifiable(op, table string) error {
+	return &CodedError{
+		Code: CodePermissionError,
+		Message: fmt.Sprintf("permission check failed: the rows written by this %s on %q could not be found again by their key "+
+			"to verify the role's %s check; nothing was written (send key values in the form the column stores them)", op, table, op),
+	}
+}

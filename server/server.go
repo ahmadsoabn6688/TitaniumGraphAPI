@@ -186,10 +186,25 @@ func restoreExtensions(errs []gqlerrors.FormattedError) {
 
 // limitResult turns a request that ran over server.max_response_rows into a
 // failure: the partial data is dropped (one response_too_large error stays)
-// unless a mutation already committed, whose partial result is kept so the
-// client can see the write happened.
+// unless a mutation already committed. Then the partial result is kept, and
+// every response_too_large error says the mutation was applied: rows a
+// mutation's result reads after its commit (relationships under `returning`)
+// can go over, and null propagation can leave data null, so the error is the
+// only sign of the write — a client must not retry it.
 func limitResult(result *graphql.Result, committed bool) {
 	if committed {
+		for i, e := range result.Errors {
+			if e.Extensions["code"] != gqlschema.CodeResponseTooLarge {
+				continue
+			}
+			ext := make(map[string]any, len(e.Extensions)+1)
+			for k, v := range e.Extensions {
+				ext[k] = v
+			}
+			ext["mutation_applied"] = true
+			result.Errors[i].Extensions = ext
+			result.Errors[i].Message += mutationAppliedNote
+		}
 		return
 	}
 	result.Data = nil
@@ -207,18 +222,24 @@ func limitResult(result *graphql.Result, committed bool) {
 	result.Errors = kept
 }
 
+// mutationAppliedNote ends a response_too_large message when a mutation of
+// the request has committed nonetheless.
+const mutationAppliedNote = " (the mutation itself was applied; do not retry it)"
+
 // tooLargeBody is the response sent instead of one over
 // server.max_response_bytes.
 func tooLargeBody(size, limit int, committed bool) []byte {
 	msg := fmt.Sprintf("response too large: %d bytes exceeds server.max_response_bytes (%d); ask for fewer rows or fields", size, limit)
+	ext := map[string]any{"code": gqlschema.CodeResponseTooLarge}
 	if committed {
-		msg += " (the mutation itself was applied)"
+		msg += mutationAppliedNote
+		ext["mutation_applied"] = true
 	}
 	body, _ := json.Marshal(map[string]any{
 		"data": nil,
 		"errors": []map[string]any{{
 			"message":    msg,
-			"extensions": map[string]any{"code": gqlschema.CodeResponseTooLarge},
+			"extensions": ext,
 		}},
 	})
 	return body

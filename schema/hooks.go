@@ -137,3 +137,88 @@ func (h *Hooks) customFieldsFor(role, operation string) []CustomField {
 	}
 	return out
 }
+
+// customTypeNames returns the names of every named type the custom fields
+// use (their result and argument types, and the types those reach), so
+// generated type names can stay clear of them.
+func (h *Hooks) customTypeNames() map[string]bool {
+	names := map[string]bool{}
+	if h == nil {
+		return names
+	}
+	for _, cf := range h.fields {
+		if cf.Field == nil {
+			continue
+		}
+		collectTypeNames(cf.Field.Type, names)
+		for _, a := range cf.Field.Args {
+			if a != nil {
+				collectTypeNames(a.Type, names)
+			}
+		}
+	}
+	return names
+}
+
+// collectTypeNames adds t's named type and every named type reachable from
+// it (fields, arguments, interfaces, union members) to seen.
+func collectTypeNames(t graphql.Type, seen map[string]bool) {
+	switch x := t.(type) {
+	case nil:
+		return
+	case *graphql.List:
+		if x != nil {
+			collectTypeNames(x.OfType, seen)
+		}
+		return
+	case *graphql.NonNull:
+		if x != nil {
+			collectTypeNames(x.OfType, seen)
+		}
+		return
+	case *graphql.Object:
+		if x == nil || seen[x.Name()] {
+			return
+		}
+		seen[x.Name()] = true
+		for _, i := range x.Interfaces() {
+			collectTypeNames(i, seen)
+		}
+		collectFieldTypes(x.Fields(), seen)
+	case *graphql.Interface:
+		if x == nil || seen[x.Name()] {
+			return
+		}
+		seen[x.Name()] = true
+		collectFieldTypes(x.Fields(), seen)
+	case *graphql.Union:
+		if x == nil || seen[x.Name()] {
+			return
+		}
+		seen[x.Name()] = true
+		for _, o := range x.Types() {
+			collectTypeNames(o, seen)
+		}
+	case *graphql.InputObject:
+		if x == nil || seen[x.Name()] {
+			return
+		}
+		seen[x.Name()] = true
+		for _, f := range x.Fields() {
+			collectTypeNames(f.Type, seen)
+		}
+	default:
+		if n := t.Name(); n != "" {
+			seen[n] = true
+		}
+	}
+}
+
+func collectFieldTypes(fields graphql.FieldDefinitionMap, seen map[string]bool) {
+	for _, f := range fields {
+		collectTypeNames(f.Type, seen)
+		for _, a := range f.Args {
+			collectTypeNames(a.Type, seen)
+		}
+	}
+}

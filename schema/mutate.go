@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -30,7 +31,9 @@ import (
 //
 // The write check (insert.check / update.check) then counts the written rows
 // that do not satisfy it — `(<check>) IS NOT TRUE`, so a check that comes out
-// NULL fails too — and any such row rolls the whole mutation back. It runs
+// NULL fails too — and any such row rolls the whole mutation back. The same
+// statement counts the rows found at all: a written row that cannot be found
+// again by its key fails the check too (see storedForms). It runs
 // after the before-hooks and the write but before the after-hooks, so an
 // after-hook never sees rows that are about to be rolled back.
 //
@@ -156,6 +159,25 @@ func (b *builder) runInsert(ctx context.Context, ti *tableInfo, id *rbac.Identit
 		if err := b.opt.Hooks.runBefore(ctx, ev); err != nil {
 			return err
 		}
+		// Before writing: does an existing row already answer to a key this
+		// insert supplies? Then a lookup by that key after the insert could
+		// find that row instead of the new one (see storedForms).
+		var stale bool
+		if needKeys && !exactKey(ti.table, pk) {
+			var supplied [][]any
+			for _, m := range merged {
+				if k, ok := insertedKey(ti.table, m.cols, m.vals, 0); ok {
+					supplied = append(supplied, k)
+				}
+			}
+			norm, err := b.storedForms(ctx, tx, ti.table, pk, supplied)
+			if err != nil {
+				return err
+			}
+			if stale, err = b.anyRowOutside(ctx, tx, ti, pk, norm, nil); err != nil {
+				return err
+			}
+		}
 		var keys [][]any
 		for _, m := range merged {
 			names := make([]string, len(m.cols))
@@ -185,6 +207,18 @@ func (b *builder) runInsert(ctx context.Context, ti *tableInfo, id *rbac.Identit
 				continue // cannot be found again: left out of returning
 			}
 			keys = append(keys, key)
+		}
+		if needKeys {
+			var err error
+			if keys, err = b.storedForms(ctx, tx, ti.table, pk, keys); err != nil {
+				return err
+			}
+		}
+		if stale {
+			if oa.Check != nil {
+				return checkUnverifiable("insert", ti.table.Name)
+			}
+			keys = nil // the rows cannot be told apart: none are returned
 		}
 		if oa.Check != nil {
 			if err := b.verifyCheck(ctx, tx, ti, id, oa.Check, pk, keys, "insert"); err != nil {
@@ -257,46 +291,196 @@ func isZeroNumber(v any) bool {
 }
 
 // verifyCheck fails with a permission error when any of the written rows
-// (identified by keyCols/keys) does not satisfy the role's write check.
+// (identified by keyCols/keys) does not satisfy the role's write check. It
+// fails closed: every key must find its row, so a written row that cannot be
+// found again by its key fails the check instead of escaping it.
 func (b *builder) verifyCheck(ctx context.Context, tx *sql.Tx, ti *tableInfo, id *rbac.Identity, check *rbac.Filter, keyCols []string, keys [][]any, op string) error {
 	csql, cargs, err := check.SQL(id.Claims)
 	if err != nil {
 		return err
 	}
-	for _, chunk := range chunkKeys(keys, len(keyCols)) {
+	for _, chunk := range chunkKeys(distinctKeys(keys), len(keyCols)) {
 		in := inCondition(keyCols, chunk)
-		query := "SELECT COUNT(*) FROM " + b.qualifiedTable(ti.table) +
-			" WHERE " + in.sql + " AND (" + csql + ") IS NOT TRUE"
-		args := append(append([]any{}, in.args...), cargs...)
+		query := "SELECT COUNT(*), COALESCE(SUM((" + csql + ") IS NOT TRUE), 0) FROM " + b.qualifiedTable(ti.table) +
+			" WHERE " + in.sql
+		args := append(append([]any{}, cargs...), in.args...)
 		b.logSQL(query, args)
-		var bad int64
-		if err := tx.QueryRowContext(ctx, query, args...).Scan(&bad); err != nil {
+		var found, bad int64
+		if err := tx.QueryRowContext(ctx, query, args...).Scan(&found, &bad); err != nil {
 			return b.dbErr(err)
 		}
 		if bad > 0 {
 			return checkFailed(op, ti.table.Name)
 		}
+		if found != int64(len(chunk)) {
+			return checkUnverifiable(op, ti.table.Name)
+		}
 	}
 	return nil
 }
 
-// lockKeys selects (and, in a pessimistic transaction, locks) the key of
-// every row matching cond, in key order. OF limits the locks to the target
-// table: rows a filter's subquery reads elsewhere are not locked.
-func (b *builder) lockKeys(ctx context.Context, tx *sql.Tx, ti *tableInfo, keyCols []string, cond *condition) ([][]any, error) {
-	cols := quotedList(keyCols)
-	query := "SELECT " + cols + " FROM " + b.qualifiedTable(ti.table) +
-		" WHERE " + cond.sql + " ORDER BY " + cols + " FOR UPDATE OF " + quoteIdent(ti.table.Name)
-	b.logSQL(query, cond.args)
-	rows, err := tx.QueryContext(ctx, query, cond.args...)
+// distinctKeys drops repeated key tuples (by keyText), keeping first-seen
+// order.
+func distinctKeys(keys [][]any) [][]any {
+	seen := make(map[string]bool, len(keys))
+	out := make([][]any, 0, len(keys))
+	for _, k := range keys {
+		t := keyText(k)
+		if !seen[t] {
+			seen[t] = true
+			out = append(out, k)
+		}
+	}
+	return out
+}
+
+// Finding written rows again.
+//
+// A write identifies its rows by key values that did not come from the
+// database: an insert's supplied keys, an update's new key from _set. The
+// database may store such a value in another form — a DECIMAL rounded to its
+// scale, a DATETIME rounded to its fractional seconds, BINARY(n) zero-padded —
+// and a lookup by the value as sent then misses the row (or finds another).
+// storedForms converts the values of those column types with CAST, which
+// TiDB evaluates like the assignment; anything else is left as sent. Two
+// guards keep the write check fail-closed whatever the type:
+//
+//   - verifyCheck requires every key to find its row, so a row that cannot
+//     be found again fails the check rather than escaping it;
+//   - for key types whose comparison is not exact (anything but integer and
+//     character columns), anyRowOutside makes sure, before the write, that no
+//     existing row already answers to one of the keys — otherwise the lookup
+//     after the write could find that row instead of the written one.
+
+// castType is the SQL type that converts a value for a column of this type
+// the way storing it would, or "" when the value is looked up as sent.
+func castType(c *introspect.Column) string {
+	if c == nil {
+		return ""
+	}
+	args := ""
+	if m := columnTypeArgs.FindStringSubmatch(strings.ToLower(strings.ReplaceAll(c.ColumnType, " ", ""))); m != nil {
+		args = m[1]
+	}
+	switch strings.ToLower(c.DataType) {
+	case "decimal", "numeric":
+		return "DECIMAL" + args
+	case "datetime", "timestamp":
+		return "DATETIME" + args
+	case "time":
+		return "TIME" + args
+	case "date":
+		return "DATE"
+	case "binary":
+		return "BINARY" + args
+	}
+	return ""
+}
+
+// columnTypeArgs captures the "(M)" / "(M,D)" of a column type.
+var columnTypeArgs = regexp.MustCompile(`^[a-z]+(\(\d+(?:,\d+)?\))?`)
+
+// exactKey reports whether every key column compares exactly: integers (a
+// value equals the stored integer only when it is that integer) and
+// character columns (the comparison uses the column's collation, as does its
+// unique index, so a value that matches an existing row is a duplicate).
+func exactKey(t *introspect.Table, keyCols []string) bool {
+	for _, name := range keyCols {
+		c := t.ColumnMap[name]
+		if c == nil {
+			return false
+		}
+		switch strings.ToLower(c.DataType) {
+		case "tinyint", "smallint", "mediumint", "int", "integer", "bigint", "char", "varchar":
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// storedForms returns keys with every value of a castType column converted
+// by the database to the form the column stores. Other values are kept.
+func (b *builder) storedForms(ctx context.Context, tx *sql.Tx, t *introspect.Table, keyCols []string, keys [][]any) ([][]any, error) {
+	casts := make([]string, len(keyCols))
+	needed := false
+	for i, name := range keyCols {
+		casts[i] = castType(t.ColumnMap[name])
+		needed = needed || casts[i] != ""
+	}
+	if !needed || len(keys) == 0 {
+		return keys, nil
+	}
+	type pos struct{ row, col int }
+	var todo []pos
+	out := make([][]any, len(keys))
+	for r, k := range keys {
+		out[r] = append([]any{}, k...)
+		for c := range keyCols {
+			if casts[c] != "" && k[c] != nil {
+				todo = append(todo, pos{r, c})
+			}
+		}
+	}
+	for len(todo) > 0 {
+		n := min(keyChunkParams, len(todo))
+		exprs := make([]string, n)
+		args := make([]any, n)
+		vals := make([]any, n)
+		ptrs := make([]any, n)
+		for i, p := range todo[:n] {
+			exprs[i] = "CAST(? AS " + casts[p.col] + ")"
+			args[i] = keys[p.row][p.col]
+			ptrs[i] = &vals[i]
+		}
+		query := "SELECT " + strings.Join(exprs, ", ")
+		b.logSQL(query, args)
+		if err := tx.QueryRowContext(ctx, query, args...).Scan(ptrs...); err != nil {
+			return nil, b.dbErr(err)
+		}
+		for i, p := range todo[:n] {
+			out[p.row][p.col] = vals[i]
+		}
+		todo = todo[n:]
+	}
+	return out, nil
+}
+
+// anyRowOutside reports whether an existing row answers to one of keys,
+// other than the rows whose (raw) keys are in except.
+func (b *builder) anyRowOutside(ctx context.Context, tx *sql.Tx, ti *tableInfo, keyCols []string, keys [][]any, except [][]any) (bool, error) {
+	skip := make(map[string]bool, len(except))
+	for _, k := range except {
+		skip[keyText(k)] = true
+	}
+	for _, chunk := range chunkKeys(distinctKeys(keys), len(keyCols)) {
+		in := inCondition(keyCols, chunk)
+		query := "SELECT " + quotedList(keyCols) + " FROM " + b.qualifiedTable(ti.table) + " WHERE " + in.sql
+		b.logSQL(query, in.args)
+		found, err := b.scanKeys(ctx, tx, len(keyCols), query, in.args)
+		if err != nil {
+			return false, err
+		}
+		for _, k := range found {
+			if !skip[keyText(k)] {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
+}
+
+// scanKeys runs a query selecting width key columns and returns the raw keys.
+func (b *builder) scanKeys(ctx context.Context, tx *sql.Tx, width int, query string, args []any) ([][]any, error) {
+	rows, err := tx.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, b.dbErr(err)
 	}
 	defer rows.Close()
 	var keys [][]any
 	for rows.Next() {
-		key := make([]any, len(keyCols))
-		ptrs := make([]any, len(key))
+		key := make([]any, width)
+		ptrs := make([]any, width)
 		for i := range key {
 			ptrs[i] = &key[i]
 		}
@@ -309,6 +493,17 @@ func (b *builder) lockKeys(ctx context.Context, tx *sql.Tx, ti *tableInfo, keyCo
 		return nil, b.dbErr(err)
 	}
 	return keys, nil
+}
+
+// lockKeys selects (and, in a pessimistic transaction, locks) the key of
+// every row matching cond, in key order. OF limits the locks to the target
+// table: rows a filter's subquery reads elsewhere are not locked.
+func (b *builder) lockKeys(ctx context.Context, tx *sql.Tx, ti *tableInfo, keyCols []string, cond *condition) ([][]any, error) {
+	cols := quotedList(keyCols)
+	query := "SELECT " + cols + " FROM " + b.qualifiedTable(ti.table) +
+		" WHERE " + cond.sql + " ORDER BY " + cols + " FOR UPDATE OF " + quoteIdent(ti.table.Name)
+	b.logSQL(query, cond.args)
+	return b.scanKeys(ctx, tx, len(keyCols), query, cond.args)
 }
 
 // readRows reads the rows with the given keys as the role may see them (its
@@ -406,6 +601,17 @@ func keyText(key []any) string {
 	return strings.Join(parts, "\x00")
 }
 
+// movedCols lists the key columns an update's _set assigns.
+func movedCols(keyCols []string, setValues map[string]any) []string {
+	var out []string
+	for _, c := range keyCols {
+		if _, ok := setValues[c]; ok {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
 // movedKeys applies an update's _set to the locked keys: a key column the
 // update assigns now holds the assigned value in every updated row.
 func movedKeys(keyCols []string, keys [][]any, setValues map[string]any) [][]any {
@@ -485,6 +691,32 @@ func (b *builder) runUpdate(ctx context.Context, ti *tableInfo, id *rbac.Identit
 			if keys, err = b.lockKeys(ctx, tx, ti, keyCols, cond); err != nil {
 				return err
 			}
+			// The keys the rows will have afterwards: a key column _set
+			// assigns takes its value in the form the column stores it.
+			newKeys := keys
+			stale := false
+			if moved := movedCols(keyCols, setValues); len(moved) > 0 {
+				vals := make([]any, len(moved))
+				for i, c := range moved {
+					vals[i] = setValues[c]
+				}
+				norm, err := b.storedForms(ctx, tx, ti.table, moved, [][]any{vals})
+				if err != nil {
+					return err
+				}
+				assigned := make(map[string]any, len(moved))
+				for i, c := range moved {
+					assigned[c] = norm[0][i]
+				}
+				newKeys = movedKeys(keyCols, keys, assigned)
+				// Another row already answering to a new key could be
+				// found in place of an updated one (see storedForms).
+				if !exactKey(ti.table, keyCols) {
+					if stale, err = b.anyRowOutside(ctx, tx, ti, keyCols, newKeys, keys); err != nil {
+						return err
+					}
+				}
+			}
 			for _, chunk := range chunkKeys(keys, len(keyCols)) {
 				in := inCondition(keyCols, chunk)
 				query := "UPDATE " + b.qualifiedTable(ti.table) + " SET " + setSQL + " WHERE " + in.sql
@@ -497,7 +729,13 @@ func (b *builder) runUpdate(ctx context.Context, ti *tableInfo, id *rbac.Identit
 				c, _ := res.RowsAffected()
 				n += c
 			}
-			keys = movedKeys(keyCols, keys, setValues)
+			keys = newKeys
+			if stale {
+				if oa.Check != nil {
+					return checkUnverifiable("update", ti.table.Name)
+				}
+				keys = nil // the rows cannot be told apart: none are returned
+			}
 			if oa.Check != nil {
 				if err := b.verifyCheck(ctx, tx, ti, id, oa.Check, keyCols, keys, "update"); err != nil {
 					return err

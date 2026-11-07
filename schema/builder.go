@@ -56,9 +56,13 @@ func newBuildShared(opt Options) (*buildShared, error) {
 	if err != nil {
 		return nil, err
 	}
+	renamed := names.avoidTypes(opt.Catalog, opt.Hooks.customTypeNames())
 	if opt.Logger != nil {
 		for _, s := range names.skipped {
 			opt.Logger.Warn("unique-key field not generated: name collision", "field", s)
+		}
+		for _, s := range renamed {
+			opt.Logger.Warn("mutation response type renamed: a custom field's type already has the name", "type", s)
 		}
 	}
 	shared := &buildShared{
@@ -149,6 +153,31 @@ type nameReservation struct {
 	// skipped describes the unique-key fields left out because of a name
 	// collision (logged at startup).
 	skipped []string
+}
+
+// avoidTypes renames every <t>_mutation_response type whose name is in taken
+// (the types custom fields bring along) to the next free numbered name. The
+// response types are newer than any custom field, so a custom type that
+// already has the name keeps it and the schema still builds. It returns a
+// description of each rename.
+func (r *nameReservation) avoidTypes(cat *introspect.Catalog, taken map[string]bool) []string {
+	var renamed []string
+	for _, tn := range cat.TableOrder {
+		old, ok := r.mutResp[tn]
+		if !ok || !taken[old] {
+			continue
+		}
+		delete(r.types, old)
+		base := graphqlName(tn) + "_mutation_response"
+		name := base
+		for i := 1; r.types[name] != "" || taken[name]; i++ {
+			name = fmt.Sprintf("%s_%d", base, i)
+		}
+		r.types[name] = "table " + tn
+		r.mutResp[tn] = name
+		renamed = append(renamed, fmt.Sprintf("%s -> %s (table %s)", old, name, tn))
+	}
+	return renamed
 }
 
 // uniqueNames are the root fields of one unique key: <t>_by_<cols>,
@@ -947,6 +976,12 @@ func (b *builder) addUniqueQueryFields(fields graphql.Fields, ti *tableInfo) {
 // build time: the table needs a primary key (the written rows are found
 // again by it), and with a database the check is dry-run against the table,
 // so a typo fails startup (or a hot reload) instead of every write.
+//
+// An insert check that comes from a legacy insert.filter is the exception:
+// earlier versions accepted and ignored it, so a config that booted then must
+// still boot. Where it cannot be enforced (no primary key, or the dry run
+// fails, e.g. a "*" rule naming a column this table lacks) it is skipped for
+// this table with a warning, as it was before.
 func (b *builder) validateWriteChecks(ti *tableInfo) error {
 	for _, w := range []struct {
 		op string
@@ -955,37 +990,59 @@ func (b *builder) validateWriteChecks(ti *tableInfo) error {
 		if w.oa == nil || w.oa.Check == nil {
 			continue
 		}
-		if len(ti.table.PrimaryKey) == 0 {
-			return fmt.Errorf("table %q: the %s check needs a primary key to find the written rows", ti.table.Name, w.op)
+		err := b.verifyWriteCheck(ti, w.op, w.oa.Check)
+		if !w.oa.CheckFromFilter {
+			if err != nil {
+				return err
+			}
+			continue
 		}
-		if w.oa.CheckFromFilter && b.opt.Logger != nil {
+		if err != nil {
+			if b.opt.Logger != nil {
+				b.opt.Logger.Warn("insert.filter cannot be enforced on this table and is ignored, as before; replace it with a check that fits the table",
+					"role", b.role, "table", ti.table.Name, "reason", err.Error())
+			}
+			ta := *ti.access
+			ins := *ta.Insert
+			ins.Check, ins.CheckFromFilter = nil, false
+			ta.Insert = &ins
+			ti.access = &ta
+			continue
+		}
+		if b.opt.Logger != nil {
 			b.opt.Logger.Warn("insert.filter is enforced as the insert check; rename it to check",
 				"role", b.role, "table", ti.table.Name)
 		}
-		if b.shared.db == nil {
-			continue
-		}
-		vsql := w.oa.Check.ValidationSQL()
-		key := "check\x00" + ti.table.Name + "\x00" + vsql
-		err, done := b.shared.filterChecks[key]
-		if !done {
-			q := "SELECT 1 FROM " + b.qualifiedTable(ti.table) + " WHERE (" + vsql + ") IS NOT TRUE LIMIT 0"
-			ctx, cancel := context.WithTimeout(context.Background(), b.shared.timeout)
-			rows, qerr := b.shared.db.QueryContext(ctx, q)
-			if qerr == nil {
-				qerr = rows.Close()
-			}
-			cancel()
-			if qerr != nil {
-				err = fmt.Errorf("table %q: verifying the %s check: %w", ti.table.Name, w.op, qerr)
-			}
-			b.shared.filterChecks[key] = err
-		}
-		if err != nil {
-			return err
-		}
 	}
 	return nil
+}
+
+// verifyWriteCheck checks that one write check can be enforced on its table:
+// the table has a primary key and (with a database) the check runs.
+func (b *builder) verifyWriteCheck(ti *tableInfo, op string, check *rbac.Filter) error {
+	if len(ti.table.PrimaryKey) == 0 {
+		return fmt.Errorf("table %q: the %s check needs a primary key to find the written rows", ti.table.Name, op)
+	}
+	if b.shared.db == nil {
+		return nil
+	}
+	vsql := check.ValidationSQL()
+	key := "check\x00" + ti.table.Name + "\x00" + vsql
+	err, done := b.shared.filterChecks[key]
+	if !done {
+		q := "SELECT 1 FROM " + b.qualifiedTable(ti.table) + " WHERE (" + vsql + ") IS NOT TRUE LIMIT 0"
+		ctx, cancel := context.WithTimeout(context.Background(), b.shared.timeout)
+		rows, qerr := b.shared.db.QueryContext(ctx, q)
+		if qerr == nil {
+			qerr = rows.Close()
+		}
+		cancel()
+		if qerr != nil {
+			err = fmt.Errorf("table %q: verifying the %s check: %w", ti.table.Name, op, qerr)
+		}
+		b.shared.filterChecks[key] = err
+	}
+	return err
 }
 
 func (b *builder) addQueryFields(fields graphql.Fields, ti *tableInfo) {
