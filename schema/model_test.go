@@ -234,6 +234,8 @@ func TestModelValidation(t *testing.T) {
 		{"incompatible types", "posts:\n  relationships:\n    x: {type: array, target: events, mapping: {title: user_id}}\n", "join-compatible"},
 		{"json join", "events:\n  relationships:\n    x: {type: array, target: users, mapping: {payload: name}}\n", "join-compatible"},
 		{"object onto non-unique", "users:\n  relationships:\n    ev: {type: object, target: events, mapping: {id: user_id}}\n", "object relationship"},
+		// The error says which unique indexes count (nullable / prefix ones do not).
+		{"object onto non-unique explains", "users:\n  relationships:\n    ev: {type: object, target: events, mapping: {id: user_id}}\n", "NOT NULL and indexed in full"},
 		{"fk named twice", "posts:\n  relationships:\n    a1: {foreign_key: fk_posts_author}\n    a2: {foreign_key: posts.fk_posts_author}\n", "already named"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -264,9 +266,46 @@ func TestJoinCompatible(t *testing.T) {
 		{col("text", "text"), col("varchar", "varchar(10)"), false},
 		{col("tinyint", "tinyint(1)"), col("int", "int"), false},
 		{col("datetime", "datetime"), col("timestamp", "timestamp"), true},
+		// ENUM / SET / BIT never join (nor key) a declared relationship.
+		{col("enum", "enum('a','b')"), col("enum", "enum('a','b')"), false},
+		{col("set", "set('a','b')"), col("varchar", "varchar(10)"), false},
+		{col("bit", "bit(8)"), col("bit", "bit(8)"), false},
+		// Character columns must share charset and collation.
+		{strCol("varchar(10)", "utf8mb4", "utf8mb4_bin"), strCol("varchar(10)", "utf8mb4", "utf8mb4_bin"), true},
+		{strCol("varchar(10)", "utf8mb4", "utf8mb4_bin"), strCol("char(3)", "utf8mb4", "utf8mb4_bin"), true},
+		{strCol("varchar(10)", "utf8mb4", "utf8mb4_bin"), strCol("varchar(10)", "utf8mb4", "utf8mb4_general_ci"), false},
+		{strCol("varchar(10)", "utf8mb4", "utf8mb4_general_ci"), strCol("varchar(10)", "utf8mb4", "utf8mb4_unicode_ci"), false},
+		{strCol("varchar(10)", "utf8", "utf8_bin"), strCol("varchar(10)", "utf8mb4", "utf8mb4_bin"), false},
+		{strCol("varchar(10)", "utf8mb4", "utf8mb4_bin"), col("varchar", "varchar(10)"), false},
 	} {
 		if got := joinCompatible(tc.a, tc.b); got != tc.ok {
-			t.Errorf("joinCompatible(%s, %s) = %v", tc.a.ColumnType, tc.b.ColumnType, got)
+			t.Errorf("joinCompatible(%s %s, %s %s) = %v", tc.a.ColumnType, tc.a.Collation, tc.b.ColumnType, tc.b.Collation, got)
+		}
+	}
+	why := joinMismatch(strCol("varchar(10)", "utf8mb4", "utf8mb4_bin"), strCol("varchar(10)", "utf8mb4", "utf8mb4_general_ci"))
+	if !strings.Contains(why, "utf8mb4_bin") || !strings.Contains(why, "utf8mb4_general_ci") {
+		t.Errorf("collation mismatch message %q should name both collations", why)
+	}
+}
+
+func strCol(ct, charset, coll string) *introspect.Column {
+	dt := ct
+	if i := strings.IndexByte(ct, '('); i >= 0 {
+		dt = ct[:i]
+	}
+	return &introspect.Column{DataType: dt, ColumnType: ct, Charset: charset, Collation: coll}
+}
+
+// TestKeyableColumn: declared keys exclude the types a keyset cursor cannot
+// seek on in their sort order (ENUM/SET sort by member index, not value).
+func TestKeyableColumn(t *testing.T) {
+	for dt, ok := range map[string]bool{
+		"int": true, "bigint": true, "varchar": true, "char": true, "datetime": true, "decimal": true, "binary": true,
+		"enum": false, "set": false, "bit": false, "json": false, "vector": false, "text": false, "blob": false,
+		"geometry": false, "point": false,
+	} {
+		if got := keyableColumn(&introspect.Column{DataType: dt}); got != ok {
+			t.Errorf("keyableColumn(%s) = %v, want %v", dt, got, ok)
 		}
 	}
 }

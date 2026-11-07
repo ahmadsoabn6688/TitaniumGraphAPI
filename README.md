@@ -423,6 +423,12 @@ roles:
 A view has no primary key or foreign keys, so give it a `primary_key` (below)
 for cursors, and `relationships` to join it.
 
+A named view that has become invalid — a table it reads was dropped or
+renamed — is listed by TiDB without columns; gqlgate then refuses to boot
+(or rejects the reload, keeping the previous schema serving) with
+`view "<name>" has no columns (is it invalid? ...)`. Recreate the view, or
+stop naming it in the config.
+
 ### Logical keys and keyless tables
 
 ```yaml
@@ -448,8 +454,11 @@ need a real primary key. Caveats:
   each page may compute and sort the whole view. Keep `max_page_size` modest
   for such views, or page a base table instead.
 - The key columns must be readable by the role (as for a primary key), or the
-  role gets the list field below instead. JSON, VECTOR, TEXT and BLOB columns
-  cannot be key columns.
+  role gets the list field below instead. JSON, VECTOR, TEXT, BLOB, BIT and
+  spatial columns cannot be key columns, and neither can ENUM or SET: they
+  sort by member index rather than by value, so a cursor seeking on the value
+  would skip rows. (Cast one in the view, e.g. `CAST(e AS CHAR(10)) AS e`, to key
+  on it.)
 
 A table or view a role has **no usable key** for — none at all, or one it
 cannot read — gets a bounded list instead of a connection:
@@ -492,10 +501,17 @@ the target and read the local join columns.
 
 Validated at startup: the target exists among the exposed tables/views; every
 mapped column exists; each pair is join-compatible (same GraphQL scalar, or
-`Int`/`BigInt`; `DECIMAL` with the same declared type; never JSON, VECTOR,
-TEXT or BLOB); and an `object` relationship must map onto the target's
-primary key, a unique key, or its declared `primary_key` (a declared key is
-not enforced — at most one matching row is returned). The name may not be a
+`Int`/`BigInt`; `DECIMAL` with the same declared type; character columns
+with the same charset **and collation**, as a real foreign key requires —
+`utf8mb4_bin` vs `utf8mb4_general_ci` is rejected, since the field and its
+`where` filter would compare `'ABC'` and `'abc'` differently; never JSON,
+VECTOR, TEXT, BLOB, BIT, ENUM, SET or spatial columns); and an `object`
+relationship must map onto the target's primary key, a usable unique key, or
+its declared `primary_key` (a declared key is not enforced — at most one
+matching row is returned). A usable unique key is a `UNIQUE` index whose
+columns are all `NOT NULL` and indexed in full: an index on a nullable
+column, or with a prefix (`col(10)`) or expression part, does not count
+(declare the relationship as `array`, or make the column `NOT NULL`). The name may not be a
 column's field name or another relationship's name (a clash with a generated
 foreign-key relationship name is a startup error; rename either one).
 
@@ -551,6 +567,8 @@ tables:
 - Collisions are checked on the final names, like the defaults: a custom name
   that clashes with any other generated type or field (or with a built-in
   such as `page_info`) refuses to boot with a message naming both owners.
+  A column may not be renamed `_and`, `_or` or `_not` (the logical operators
+  of `where`), just as a relationship may not be named so.
 
 ## Layout
 

@@ -186,6 +186,9 @@ func LoadWith(ctx context.Context, db *sql.DB, schema string, opt Options) (*Cat
 		if err := loadColumns(ctx, db, schema, cat.Tables[name]); err != nil {
 			return nil, err
 		}
+		if err := checkHasColumns(cat.Tables[name]); err != nil {
+			return nil, err
+		}
 	}
 	if err := loadForeignKeys(ctx, db, schema, cat); err != nil {
 		return nil, err
@@ -337,6 +340,20 @@ func colSetKey(cols []string) string {
 	s := append([]string{}, cols...)
 	sort.Strings(s)
 	return strings.Join(s, "\x00")
+}
+
+// checkHasColumns rejects a table or view that information_schema lists
+// without any column. TiDB does that for a view that has become invalid (its
+// base table was dropped or renamed); building a GraphQL type for it would
+// fail later with an error naming neither the view nor the cause.
+func checkHasColumns(t *Table) error {
+	if len(t.Columns) > 0 {
+		return nil
+	}
+	if t.IsView {
+		return fmt.Errorf("view %q has no columns (is it invalid? a table it reads may have been dropped or renamed; fix or recreate the view, or stop naming it in the config)", t.Name)
+	}
+	return fmt.Errorf("table %q has no columns", t.Name)
 }
 
 func loadColumns(ctx context.Context, db *sql.DB, schema string, t *Table) error {

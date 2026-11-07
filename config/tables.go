@@ -234,6 +234,11 @@ func (c *Config) validateTables() error {
 			if fc != nil && fc.Name != "" && !ValidGraphQLName(fc.Name) {
 				return fmt.Errorf("%s.columns.%s: %q is not a valid GraphQL name", where, col, fc.Name)
 			}
+			// The logical operators of <t>_bool_exp share the column fields'
+			// namespace.
+			if fc != nil && (fc.Name == "_and" || fc.Name == "_or" || fc.Name == "_not") {
+				return fmt.Errorf("%s.columns.%s: %q is not a usable column field name (it is a logical operator of the where filter)", where, col, fc.Name)
+			}
 		}
 		for rn, rc := range tc.Relationships {
 			rw := where + ".relationships." + rn

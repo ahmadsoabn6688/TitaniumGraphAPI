@@ -3,6 +3,7 @@ package introspect
 import (
 	"database/sql"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -68,5 +69,18 @@ func TestMarkAutoRandom(t *testing.T) {
 	markAutoRandom(nil, "PK_AUTO_RANDOM_BITS=5")
 	if cat.Tables["users"].ColumnMap["id"].AutoRandom {
 		t.Error("only PK_AUTO_RANDOM_BITS marks a key")
+	}
+}
+
+func TestCheckHasColumns(t *testing.T) {
+	if err := checkHasColumns(&Table{Name: "t", Columns: []*Column{{Name: "id"}}}); err != nil {
+		t.Errorf("table with columns: %v", err)
+	}
+	err := checkHasColumns(&Table{Name: "vx", IsView: true})
+	if err == nil || !strings.Contains(err.Error(), `view "vx" has no columns`) || !strings.Contains(err.Error(), "dropped") {
+		t.Errorf("invalid view: err = %v", err)
+	}
+	if err := checkHasColumns(&Table{Name: "t"}); err == nil {
+		t.Error("table without columns: want an error")
 	}
 }

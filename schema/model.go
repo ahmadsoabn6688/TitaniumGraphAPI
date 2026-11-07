@@ -248,35 +248,63 @@ func (tm *tableModel) applyConfig(tc *config.TableConfig) error {
 
 // keyableColumn reports whether a column can be part of a key: compared by
 // plain equality and order (cursors seek on it). JSON, VECTOR and the large
-// object types can't.
+// object types can't. Neither can ENUM and SET: they sort by their member
+// index but a cursor seeks on the value as a string, so a page boundary
+// would skip rows; BIT and the spatial types have no usable order either.
 func keyableColumn(c *introspect.Column) bool {
 	switch c.DataType {
 	case "json", "vector", "tinyblob", "blob", "mediumblob", "longblob",
-		"tinytext", "text", "mediumtext", "longtext":
+		"tinytext", "text", "mediumtext", "longtext",
+		"enum", "set", "bit",
+		"geometry", "point", "linestring", "polygon", "multipoint",
+		"multilinestring", "multipolygon", "geometrycollection":
 		return false
 	}
 	return true
 }
 
-// joinCompatible reports whether a declared relationship may join column a
-// to column b: both must be keyable and map to the same GraphQL scalar (or
-// both to an integer one), so equal values also batch to the same key; a
-// DECIMAL pair must have the same declared type (equal values of different
-// scales would not match after conversion).
-func joinCompatible(a, b *introspect.Column) bool {
+// joinMismatch explains why a declared relationship may not join column a
+// to column b ("" = it may). Both must be keyable and map to the same
+// GraphQL scalar (or both to an integer one), so equal values also batch to
+// the same key; a DECIMAL pair must have the same declared type (equal
+// values of different scales would not match after conversion); character
+// columns must share charset and collation, as a real foreign key must:
+// navigation compares the parent's value under the target column's
+// collation, while a relationship filter compares the two columns directly
+// under the coercion rules, so with different collations ('ABC' vs 'abc'
+// under utf8mb4_bin vs a *_ci one) the field and its filter would disagree.
+func joinMismatch(a, b *introspect.Column) string {
 	if !keyableColumn(a) || !keyableColumn(b) {
-		return false
+		return "not join-compatible types"
 	}
 	sa, sb := scalarFor(a).Name(), scalarFor(b).Name()
-	if sa == "Decimal" || sb == "Decimal" {
-		return sa == sb && a.ColumnType == b.ColumnType
+	switch {
+	case sa == "Decimal" || sb == "Decimal":
+		if sa != sb || a.ColumnType != b.ColumnType {
+			return "not join-compatible types"
+		}
+	case sa == sb:
+	default:
+		isInt := func(s string) bool { return s == "Int" || s == "BigInt" }
+		if !isInt(sa) || !isInt(sb) {
+			return "not join-compatible types"
+		}
 	}
-	if sa == sb {
-		return true
+	if a.Collation != b.Collation || a.Charset != b.Charset {
+		coll := func(c *introspect.Column) string {
+			if c.Collation == "" {
+				return "no collation"
+			}
+			return "collation " + c.Collation
+		}
+		return fmt.Sprintf("not join-compatible: %s vs %s (character columns must share charset and collation)", coll(a), coll(b))
 	}
-	isInt := func(s string) bool { return s == "Int" || s == "BigInt" }
-	return isInt(sa) && isInt(sb)
+	return ""
 }
+
+// joinCompatible reports whether a declared relationship may join column a
+// to column b (see joinMismatch).
+func joinCompatible(a, b *introspect.Column) bool { return joinMismatch(a, b) == "" }
 
 // sameColumnSet reports whether a and b hold the same column names.
 func sameColumnSet(a, b []string) bool {
@@ -375,9 +403,9 @@ func (m *catalogModel) applyRelationships(tn string, tc *config.TableConfig) err
 			description: rc.Description, deprecated: rc.Deprecated}
 		for _, i := range idx {
 			lc, rcol := t.ColumnMap[local[i]], target.table.ColumnMap[remote[i]]
-			if !joinCompatible(lc, rcol) {
-				return fmt.Errorf("%s.mapping: %s.%s (%s) and %s.%s (%s) are not join-compatible types",
-					where, tn, lc.Name, lc.ColumnType, rc.Target, rcol.Name, rcol.ColumnType)
+			if why := joinMismatch(lc, rcol); why != "" {
+				return fmt.Errorf("%s.mapping: %s.%s (%s) and %s.%s (%s) are %s",
+					where, tn, lc.Name, lc.ColumnType, rc.Target, rcol.Name, rcol.ColumnType, why)
 			}
 			dr.localCols = append(dr.localCols, lc.Name)
 			dr.targetCols = append(dr.targetCols, rcol.Name)
@@ -391,7 +419,7 @@ func (m *catalogModel) applyRelationships(tn string, tc *config.TableConfig) err
 				unique, dr.unenforced = true, true
 			}
 			if !unique {
-				return fmt.Errorf("%s: an object relationship must map onto the target's primary key, a unique key or its declared primary_key; (%s) is none of them on %q (use type: array)",
+				return fmt.Errorf("%s: an object relationship must map onto the target's primary key, a usable unique key (a UNIQUE index whose columns are all NOT NULL and indexed in full, without prefix or expression parts) or its declared primary_key; (%s) is none of them on %q (use type: array)",
 					where, strings.Join(dr.targetCols, ", "), rc.Target)
 			}
 		}
