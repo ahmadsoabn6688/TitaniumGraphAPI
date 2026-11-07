@@ -31,6 +31,7 @@ server:
   subscriptions:
     poll_interval_ms: 1000      # re-run every second, push only on change
     max_subscriptions_per_connection: 20
+    max_connections_per_identity: 10  # sockets per user (anonymous: per client address)
     reauth_interval_seconds: 10 # re-check the token and users.role this often
   cors:
     enabled: true

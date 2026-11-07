@@ -17,8 +17,12 @@ import (
 //	    poll_interval_ms: 1000        # default interval
 //	    min_poll_interval_ms: 250     # bounds for every interval in the config
 //	    max_poll_interval_ms: 60000
-//	    max_connections: 1000         # open sockets per gateway (-1 = unlimited)
+//	    max_connections: 1000         # initialised sockets per gateway (-1 = unlimited)
+//	    max_pending_connections: 100  # sockets still waiting for connection_init (-1 = unlimited)
+//	    max_connections_per_identity: 25    # initialised sockets per caller (-1 = unlimited)
 //	    max_subscriptions_per_connection: 100
+//	    max_subscriptions_per_identity: 200 # running operations per caller (-1 = unlimited)
+//	    max_concurrent_polls: 5       # executions at once (default max(1, max_open_conns/2))
 //	    connection_init_timeout_seconds: 10
 //	    keepalive_seconds: 30         # WebSocket ping interval (-1 = off)
 //	    ping_timeout_seconds: 10      # a ping unanswered this long closes the socket
@@ -35,12 +39,34 @@ type Subscriptions struct {
 	// and 60000.
 	MinPollIntervalMS int `yaml:"min_poll_interval_ms"`
 	MaxPollIntervalMS int `yaml:"max_poll_interval_ms"`
-	// MaxConnections caps the open WebSocket connections of the gateway.
-	// Default 1000; -1 = unlimited.
+	// MaxConnections caps the initialised (acknowledged) WebSocket
+	// connections of the gateway; a connection_init over the cap is closed
+	// with 1013. Default 1000; -1 = unlimited.
 	MaxConnections int `yaml:"max_connections"`
+	// MaxPendingConnections caps the sockets that are upgraded but have not
+	// completed connection_init yet (unauthenticated); further upgrades get
+	// HTTP 503. Default 100; -1 = unlimited.
+	MaxPendingConnections int `yaml:"max_pending_connections"`
+	// MaxConnectionsPerIdentity caps the initialised connections of one
+	// caller: the token's sub claim, or for a caller without one (the
+	// anonymous role) the role plus the client address. Default 25; -1 =
+	// unlimited.
+	MaxConnectionsPerIdentity int `yaml:"max_connections_per_identity"`
 	// MaxPerConnection caps the operations running at once on one socket.
 	// Default 100.
 	MaxPerConnection int `yaml:"max_subscriptions_per_connection"`
+	// MaxPerIdentity caps the operations running at once over all the
+	// sockets of one caller (see MaxConnectionsPerIdentity). Default 200;
+	// -1 = unlimited.
+	MaxPerIdentity int `yaml:"max_subscriptions_per_identity"`
+	// MaxConcurrentPolls caps the WebSocket executions (subscription polls,
+	// queries and mutations sent over a socket) running at once across the
+	// gateway, so live queries cannot take every pooled connection from
+	// HTTP requests; a poll waits its turn. A query counts as
+	// server.max_parallel_root_fields executions. 0 (the default) picks
+	// max(1, database.max_open_conns/2); above 1 it must be less than
+	// database.max_open_conns; -1 = unlimited.
+	MaxConcurrentPolls int `yaml:"max_concurrent_polls"`
 	// ConnectionInitTimeoutSeconds is how long a client has to send
 	// connection_init after the upgrade. Default 10.
 	ConnectionInitTimeoutSeconds int `yaml:"connection_init_timeout_seconds"`
@@ -115,7 +141,10 @@ func (p *SubscriptionPolling) Interval(kind string, def time.Duration) time.Dura
 	return def
 }
 
-func (s *Subscriptions) applyDefaults() {
+func (s *Subscriptions) applyDefaults(maxOpenConns int) {
+	if s.MaxConcurrentPolls == 0 {
+		s.MaxConcurrentPolls = max(1, maxOpenConns/2)
+	}
 	if s.PollIntervalMS == 0 {
 		s.PollIntervalMS = int(DefaultPollInterval / time.Millisecond)
 	}
@@ -128,8 +157,17 @@ func (s *Subscriptions) applyDefaults() {
 	if s.MaxConnections == 0 {
 		s.MaxConnections = 1000
 	}
+	if s.MaxPendingConnections == 0 {
+		s.MaxPendingConnections = 100
+	}
+	if s.MaxConnectionsPerIdentity == 0 {
+		s.MaxConnectionsPerIdentity = 25
+	}
 	if s.MaxPerConnection == 0 {
 		s.MaxPerConnection = 100
+	}
+	if s.MaxPerIdentity == 0 {
+		s.MaxPerIdentity = 200
 	}
 	if s.ConnectionInitTimeoutSeconds == 0 {
 		s.ConnectionInitTimeoutSeconds = 10
@@ -160,8 +198,21 @@ func (c *Config) validateSubscriptions() error {
 	if err := s.checkInterval(w+".poll_interval_ms", s.PollIntervalMS); err != nil {
 		return err
 	}
-	if s.MaxConnections < -1 {
-		return fmt.Errorf("%s.max_connections must be > 0 (or -1 = unlimited)", w)
+	for key, v := range map[string]int{
+		"max_connections":                s.MaxConnections,
+		"max_pending_connections":        s.MaxPendingConnections,
+		"max_connections_per_identity":   s.MaxConnectionsPerIdentity,
+		"max_subscriptions_per_identity": s.MaxPerIdentity,
+		"max_concurrent_polls":           s.MaxConcurrentPolls,
+	} {
+		if v < -1 {
+			return fmt.Errorf("%s.%s must be > 0 (or -1 = unlimited)", w, key)
+		}
+	}
+	if n := s.MaxConcurrentPolls; n > 1 && n >= c.Database.MaxOpenConns {
+		// At least one pooled connection must stay free for HTTP requests
+		// while every poll runs.
+		return fmt.Errorf("%s.max_concurrent_polls (%d) must be less than database.max_open_conns (%d): polls could take every pooled connection", w, n, c.Database.MaxOpenConns)
 	}
 	for key, v := range map[string]int{
 		"max_subscriptions_per_connection": s.MaxPerConnection,

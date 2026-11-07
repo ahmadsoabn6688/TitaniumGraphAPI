@@ -29,14 +29,23 @@ import (
 const wsTestSecret = "0123456789abcdef0123456789abcdef"
 
 type wsFixture struct {
-	t       *testing.T
-	ts      *httptest.Server
-	srv     *Server
-	cur     atomic.Pointer[State]
-	counter atomic.Int64
+	t        *testing.T
+	ts       *httptest.Server
+	srv      *Server
+	cur      atomic.Pointer[State]
+	counter  atomic.Int64
+	resolver auth.RoleResolver // optional jwt.role_lookup stand-in
+
+	inflight, maxInflight atomic.Int64 // concurrent executions of `slow`
 }
 
 func wsConfig(t *testing.T, subs string) *config.Config {
+	return wsConfigWith(t, "", subs)
+}
+
+// wsConfigWith adds server-level lines (e.g. cors) besides the
+// server.subscriptions ones.
+func wsConfigWith(t *testing.T, server, subs string) *config.Config {
 	t.Helper()
 	cfg, err := config.Parse([]byte(`
 database:
@@ -46,7 +55,7 @@ jwt:
   secret: "` + wsTestSecret + `"
   anonymous_role: anonymous
 server:
-  subscriptions:
+` + server + `  subscriptions:
 ` + subs + `
 roles:
   viewer:
@@ -76,6 +85,18 @@ func (f *wsFixture) testSchemas(subFields ...string) map[string]graphql.Schema {
 			return int(f.counter.Load()), nil
 		}},
 		"other": &graphql.Field{Type: graphql.Int, Resolve: func(p graphql.ResolveParams) (any, error) { return 1, nil }},
+		"slow": &graphql.Field{Type: graphql.Int, Resolve: func(p graphql.ResolveParams) (any, error) {
+			n := f.inflight.Add(1)
+			defer f.inflight.Add(-1)
+			for {
+				m := f.maxInflight.Load()
+				if n <= m || f.maxInflight.CompareAndSwap(m, n) {
+					break
+				}
+			}
+			time.Sleep(100 * time.Millisecond)
+			return 1, nil
+		}},
 	}
 	sub := graphql.Fields{}
 	for _, n := range subFields {
@@ -97,9 +118,13 @@ func (f *wsFixture) testSchemas(subFields ...string) map[string]graphql.Schema {
 
 func newWSFixture(t *testing.T, subs string) *wsFixture {
 	t.Helper()
-	f := &wsFixture{t: t}
-	cfg := wsConfig(t, subs)
-	f.cur.Store(f.state(cfg, "tick", "other"))
+	return newWSFixtureWith(t, wsConfig(t, subs), nil)
+}
+
+func newWSFixtureWith(t *testing.T, cfg *config.Config, resolver auth.RoleResolver) *wsFixture {
+	t.Helper()
+	f := &wsFixture{t: t, resolver: resolver}
+	f.cur.Store(f.state(cfg, "tick", "other", "slow"))
 	f.srv = NewServer(cfg, func() *State { return f.cur.Load() }, nil)
 	f.ts = httptest.NewServer(f.srv)
 	t.Cleanup(func() {
@@ -112,7 +137,7 @@ func newWSFixture(t *testing.T, subs string) *wsFixture {
 }
 
 func (f *wsFixture) state(cfg *config.Config, subFields ...string) *State {
-	v, err := auth.New(cfg.JWT, []string{"viewer", "anonymous"}, nil)
+	v, err := auth.New(cfg.JWT, []string{"viewer", "anonymous"}, f.resolver)
 	if err != nil {
 		f.t.Fatal(err)
 	}
@@ -123,7 +148,11 @@ func (f *wsFixture) state(cfg *config.Config, subFields ...string) *State {
 }
 
 func (f *wsFixture) token(role string, exp time.Time) string {
-	tok, err := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{"role": role, "sub": "1", "exp": exp.Unix()}).SignedString([]byte(wsTestSecret))
+	return f.tokenFor(role, "1", exp)
+}
+
+func (f *wsFixture) tokenFor(role, sub string, exp time.Time) string {
+	tok, err := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{"role": role, "sub": sub, "exp": exp.Unix()}).SignedString([]byte(wsTestSecret))
 	if err != nil {
 		f.t.Fatal(err)
 	}
@@ -140,13 +169,21 @@ type testWS struct {
 
 func (f *wsFixture) dial(subprotocol string) *testWS {
 	f.t.Helper()
+	c, resp, err := f.dialRaw(subprotocol, nil)
+	if err != nil {
+		f.t.Fatalf("dial: %v (%v)", err, resp)
+	}
+	return f.wrap(c)
+}
+
+func (f *wsFixture) dialRaw(subprotocol string, header http.Header) (*websocket.Conn, *http.Response, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	c, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(f.ts.URL, "http")+"/graphql",
-		&websocket.DialOptions{Subprotocols: []string{subprotocol}})
-	if err != nil {
-		f.t.Fatalf("dial: %v", err)
-	}
+	return websocket.Dial(ctx, "ws"+strings.TrimPrefix(f.ts.URL, "http")+"/graphql",
+		&websocket.DialOptions{Subprotocols: []string{subprotocol}, HTTPHeader: header})
+}
+
+func (f *wsFixture) wrap(c *websocket.Conn) *testWS {
 	w := &testWS{t: f.t, c: c, msgs: make(chan wsMessage, 64), closed: make(chan struct{}), code: -1}
 	go func() {
 		defer close(w.closed)
@@ -170,15 +207,20 @@ func (f *wsFixture) dial(subprotocol string) *testWS {
 func (f *wsFixture) init(token string) *testWS {
 	f.t.Helper()
 	w := f.dial(wsSubprotocol)
+	w.sendInit(token)
+	if m := w.read(); m.Type != "connection_ack" {
+		f.t.Fatalf("expected connection_ack, got %+v", m)
+	}
+	return w
+}
+
+func (w *testWS) sendInit(token string) {
+	w.t.Helper()
 	payload := map[string]any{}
 	if token != "" {
 		payload["Authorization"] = "Bearer " + token
 	}
 	w.send(map[string]any{"type": "connection_init", "payload": payload})
-	if m := w.read(); m.Type != "connection_ack" {
-		f.t.Fatalf("expected connection_ack, got %+v", m)
-	}
-	return w
 }
 
 func (w *testWS) send(msg any) {
@@ -280,22 +322,21 @@ func TestWSLiveQueryPushesOnlyChanges(t *testing.T) {
 
 func TestWSAuthentication(t *testing.T) {
 	f := newWSFixture(t, "")
-	// No token: the anonymous role, which has no Subscription root.
-	w := f.init("")
+	// The viewer runs queries over the socket too.
+	w := f.init(f.token("viewer", time.Now().Add(time.Hour)))
 	w.subscribe("q", `{ role }`)
-	if m := w.read(); payloadString(m) != `{"data":{"role":"anonymous"}}` {
-		t.Fatalf("anonymous: %s", m.Payload)
+	if m := w.read(); payloadString(m) != `{"data":{"role":"viewer"}}` {
+		t.Fatalf("viewer: %s", m.Payload)
 	}
 	w.read() // complete
-	w.subscribe("s", `subscription { tick }`)
-	if m := w.read(); m.Type != "error" || !strings.Contains(payloadString(m), "no subscriptions") {
-		t.Fatalf("anonymous subscription: %+v %s", m, m.Payload)
-	}
 
+	// No token: the anonymous role, which has no Subscription root, so
+	// nothing to hold a socket for — refused like a bad token (4403), and
+	// it never counts towards max_connections.
 	// A bad or expired token, or an unknown role: 4403 at connection_init.
-	for _, tok := range []string{"garbage", f.token("viewer", time.Now().Add(-time.Hour)), f.token("root", time.Now().Add(time.Hour))} {
+	for _, tok := range []string{"", "garbage", f.token("viewer", time.Now().Add(-time.Hour)), f.token("root", time.Now().Add(time.Hour))} {
 		w := f.dial(wsSubprotocol)
-		w.send(map[string]any{"type": "connection_init", "payload": map[string]any{"Authorization": "Bearer " + tok}})
+		w.sendInit(tok)
 		if code := w.waitClose(5 * time.Second); code != closeForbidden {
 			t.Errorf("token %.20s…: close %d", tok, code)
 		}
@@ -479,14 +520,36 @@ func TestRootFieldNames(t *testing.T) {
 }
 
 func TestOriginPatternsAndUpgrade(t *testing.T) {
-	if p := originPatterns(config.CORS{Enabled: false, AllowedOrigins: []string{"*"}}); p != nil {
-		t.Errorf("CORS off: same origin only, got %v", p)
+	req := func(origin string) *http.Request {
+		r := httptest.NewRequest(http.MethodGet, "http://gw.example:8080/graphql", nil)
+		if origin != "" {
+			r.Header.Set("Origin", origin)
+		}
+		return r
 	}
-	if p := originPatterns(config.CORS{Enabled: true, AllowedOrigins: []string{"http://localhost:3000", "https://app.example.com"}}); strings.Join(p, ",") != "localhost:3000,app.example.com" {
-		t.Errorf("patterns = %v", p)
-	}
-	if p := originPatterns(config.CORS{Enabled: true, AllowedOrigins: []string{"https://a.example", "*"}}); strings.Join(p, ",") != "*" {
-		t.Errorf("wildcard = %v", p)
+	for _, tc := range []struct {
+		cors   config.CORS
+		origin string
+		want   bool
+	}{
+		// CORS off: same origin (or no Origin) only.
+		{config.CORS{Enabled: false, AllowedOrigins: []string{"*"}}, "https://evil.example", false},
+		{config.CORS{}, "", true},
+		{config.CORS{}, "http://gw.example:8080", true},
+		{config.CORS{}, "http://gw.example:9090", false},
+		// Whole origins, compared exactly: the scheme and port count.
+		{config.CORS{Enabled: true, AllowedOrigins: []string{"https://app.example.com"}}, "https://app.example.com", true},
+		{config.CORS{Enabled: true, AllowedOrigins: []string{"https://app.example.com"}}, "http://app.example.com", false},
+		{config.CORS{Enabled: true, AllowedOrigins: []string{"https://app.example.com"}}, "https://app.example.com:8443", false},
+		{config.CORS{Enabled: true, AllowedOrigins: []string{"https://app.example.com"}}, "https://evil.com", false},
+		// No glob matching.
+		{config.CORS{Enabled: true, AllowedOrigins: []string{"https://*.example.com"}}, "https://a.example.com", false},
+		{config.CORS{Enabled: true, AllowedOrigins: []string{"https://a.example", "*"}}, "http://anything.test", true},
+		{config.CORS{Enabled: true, AllowedOrigins: []string{"https://a.example"}}, "null", false},
+	} {
+		if got := newWSOrigins(tc.cors).allow(req(tc.origin)); got != tc.want {
+			t.Errorf("%+v, Origin %q: allow = %v, want %v", tc.cors, tc.origin, got, tc.want)
+		}
 	}
 	r := httptest.NewRequest(http.MethodGet, "/graphql", nil)
 	r.Header.Set("Connection", "keep-alive, Upgrade")
@@ -510,7 +573,8 @@ func TestWSPingTimeout(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer c.CloseNow()
-	if err := c.Write(ctx, websocket.MessageText, []byte(`{"type":"connection_init"}`)); err != nil {
+	initMsg := `{"type":"connection_init","payload":{"Authorization":"Bearer ` + f.token("viewer", time.Now().Add(time.Hour)) + `"}}`
+	if err := c.Write(ctx, websocket.MessageText, []byte(initMsg)); err != nil {
 		t.Fatal(err)
 	}
 	if _, data, err := c.Read(ctx); err != nil || !strings.Contains(string(data), "connection_ack") {

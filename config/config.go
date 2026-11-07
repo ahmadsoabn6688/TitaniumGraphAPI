@@ -541,7 +541,7 @@ func (c *Config) applyDefaults() {
 			}
 		}
 	}
-	c.Server.Subscriptions.applyDefaults()
+	c.Server.Subscriptions.applyDefaults(c.Database.MaxOpenConns)
 	if c.SchemaGen.DefaultPageSize == 0 {
 		c.SchemaGen.DefaultPageSize = 25
 	}

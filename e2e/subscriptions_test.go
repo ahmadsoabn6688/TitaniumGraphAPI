@@ -201,13 +201,10 @@ func TestSubscriptionRBACNegative(t *testing.T) {
 	if r := anon.Next(t, "draft", wait).Result(t).MustOK(t); r.Get("posts_by_pk") != nil {
 		t.Fatalf("anonymous sees a draft: %s", r.Raw)
 	}
-	// A role without any subscribable table has no Subscription root.
+	// A role without any subscribable table has no Subscription root, and
+	// so cannot hold a socket at all: its connection_init is refused.
 	env2 := New(t, WithConfigTemplate(subsTemplate("")))
-	ws := env2.DialWS(t, AuthPayload(""))
-	ws.Subscribe(t, "x", `subscription { posts_aggregate { count } }`, nil)
-	if m := ws.Next(t, "x", wait); m.Type != "error" || !strings.Contains(string(m.Payload), "no subscriptions") {
-		t.Fatalf("default roles (no subscribe): %+v %s", m, m.Payload)
-	}
+	expectInitRefused(t, env2, AuthPayload(""), 4403, "no subscriptions")
 	r := env2.MustGQL(t, "", `{ __schema { subscriptionType { name } } }`, nil)
 	if r.Get("__schema.subscriptionType") != nil {
 		t.Fatalf("subscriptionType without grants: %s", r.Raw)
@@ -408,10 +405,10 @@ func TestSubscriptionLimitsAndShutdown(t *testing.T) {
 		t.Fatalf("after complete: %+v %s", m, m.Payload)
 	}
 
-	ws2 := env.DialWS(t, AuthPayload(""))
-	if _, resp, err := env.DialWSRaw(t, nil, ""); err == nil || resp == nil || resp.StatusCode != http.StatusServiceUnavailable {
-		t.Fatalf("third connection: err %v, resp %+v", err, resp)
-	}
+	ws2 := env.DialWS(t, AuthPayload(env.Token(t, "author", 2)))
+	// max_connections counts initialised sockets: a third one upgrades but
+	// its connection_init is turned away with 1013 (try again later).
+	expectInitRefused(t, env, AuthPayload(env.Token(t, "admin", 4)), websocket.StatusTryAgainLater, "max_connections")
 
 	// Shutdown closes every socket with 1001.
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -512,10 +509,151 @@ func TestSubscriptionNativeQuery(t *testing.T) {
 			t.Fatalf("%s: %+v %s", id, m, m.Payload)
 		}
 	}
-	// Anonymous may query it but not subscribe to it.
+	// Anonymous may query it but not subscribe to it: with nothing
+	// subscribable it cannot even open a socket.
+	expectInitRefused(t, env, AuthPayload(""), 4403, "no subscriptions")
+}
+
+// expectInitRefused dials, sends connection_init with payload and expects
+// the socket to close with code (and a reason containing substr).
+func expectInitRefused(t *testing.T, env *Env, payload map[string]any, code websocket.StatusCode, substr string) {
+	t.Helper()
+	c, _, err := env.DialWSRaw(t, nil, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.Send(t, map[string]any{"type": "connection_init", "payload": payload})
+	if got, reason := c.WaitClose(t, wait); got != code || !strings.Contains(reason, substr) {
+		t.Fatalf("connection_init: close %d %q, want %d %q", got, reason, code, substr)
+	}
+}
+
+// Unauthenticated sockets only fill the pending pool, never the
+// initialised connections; one caller (a token's sub, or the anonymous role
+// per client address) cannot take every slot; polls still run with
+// max_concurrent_polls 1; and disabling subscriptions by a reload closes
+// the open sockets.
+func TestSubscriptionCallerLimits(t *testing.T) {
+	t.Parallel()
+	limits := "    max_connections: 3\n    max_pending_connections: 2\n    max_connections_per_identity: 1\n" +
+		"    max_subscriptions_per_identity: 2\n    max_concurrent_polls: 1\n"
+	env := New(t, WithConfigTemplate(subsTemplate(limits)), WithRolesYAML(subsRolesYAML))
+	grace := env.Token(t, "author", 2)
+	admin := env.Token(t, "admin", 4)
+
+	// Two sockets that never send connection_init fill the pending pool.
+	var idle []*WSClient
+	for range 2 {
+		c, _, err := env.DialWSRaw(t, nil, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		idle = append(idle, c)
+	}
+	if _, resp, err := env.DialWSRaw(t, nil, ""); err == nil || resp == nil || resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("third pending socket: err %v, resp %+v", err, resp)
+	}
+	for _, c := range idle {
+		c.Close()
+	}
+	// They never held one of the 3 initialised slots.
+	var author *WSClient
+	deadline := time.Now().Add(wait)
+	for author == nil {
+		c, _, err := env.DialWSRaw(t, nil, "")
+		if err == nil {
+			c.Send(t, map[string]any{"type": "connection_init", "payload": AuthPayload(grace)})
+			if m := c.Read(t, wait); m.Type == "connection_ack" {
+				author = c
+				break
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("pending slots not freed: %v", err)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	// One socket per caller: a second one of author 2 is turned away, other
+	// callers are not.
+	expectInitRefused(t, env, AuthPayload(grace), websocket.StatusTryAgainLater, "max_connections_per_identity")
 	anon := env.DialWS(t, AuthPayload(""))
-	anon.Subscribe(t, "x", `subscription { my_posts(args: {author: 1}) { post_id } }`, nil)
-	if m := anon.Next(t, "x", wait); m.Type != "error" {
-		t.Fatalf("anonymous subscription: %+v %s", m, m.Payload)
+	// Anonymous callers share one identity per client address.
+	expectInitRefused(t, env, AuthPayload(""), websocket.StatusTryAgainLater, "max_connections_per_identity")
+	adminWS := env.DialWS(t, AuthPayload(admin))
+	// The 3 initialised slots are taken.
+	expectInitRefused(t, env, AuthPayload(env.Token(t, "author", 1)), websocket.StatusTryAgainLater, "(server.subscriptions.max_connections)")
+
+	// Two operations per caller (over all its sockets); with one poll at a
+	// time they all still run, each with its own role's permissions.
+	author.Subscribe(t, "a", `subscription { posts_connection { nodes { id } } }`, nil)
+	author.Subscribe(t, "b", `subscription { posts_aggregate { count } }`, nil)
+	for range 2 { // in either order
+		m := author.Read(t, wait)
+		r := m.Result(t).MustOK(t)
+		switch m.ID {
+		case "a":
+			if fmt.Sprint(r.IDs(t, "posts_connection.nodes")) != "[3]" {
+				t.Fatalf("author's own posts only: %s", r.Raw)
+			}
+		case "b":
+			if n := r.Int(t, "posts_aggregate.count"); n != 1 {
+				t.Fatalf("author's count = %d", n)
+			}
+		default:
+			t.Fatalf("unexpected message %+v", m)
+		}
+	}
+	author.Subscribe(t, "c", `subscription { posts_by_pk(id: 3) { id } }`, nil)
+	if m := author.Next(t, "c", wait); m.Type != "error" || !strings.Contains(string(m.Payload), "max_subscriptions_per_identity") {
+		t.Fatalf("third operation of author 2: %+v %s", m, m.Payload)
+	}
+	adminWS.Subscribe(t, "a", `subscription { posts_aggregate { count } }`, nil)
+	if n := adminWS.Next(t, "a", wait).Result(t).MustOK(t).Int(t, "posts_aggregate.count"); n != 4 {
+		t.Fatalf("admin's count = %d", n)
+	}
+	anon.Subscribe(t, "a", `subscription { posts_aggregate { count } }`, nil)
+	if n := anon.Next(t, "a", wait).Result(t).MustOK(t).Int(t, "posts_aggregate.count"); n != 3 {
+		t.Fatalf("anonymous count = %d", n)
+	}
+
+	// A reload that disables subscriptions closes every open socket (idle
+	// ones too) and the endpoint.
+	env.settings.template = subsTemplate(limits + "    enabled: false\n")
+	if err := env.Reload(t, subsRolesYAML); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []*WSClient{author, adminWS, anon} {
+		if code, _ := c.WaitClose(t, wait); code != websocket.StatusGoingAway {
+			t.Fatalf("after disabling: close %d", code)
+		}
+	}
+	if _, resp, err := env.DialWSRaw(t, nil, ""); err == nil || resp == nil || resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("disabled endpoint: err %v, resp %+v", err, resp)
+	}
+}
+
+// The upgrade's Origin must match server.cors.allowed_origins exactly,
+// scheme included.
+func TestSubscriptionOriginCheck(t *testing.T) {
+	t.Parallel()
+	tmpl := strings.Replace(subsTemplate(""), "  graphiql: false\n",
+		"  graphiql: false\n  cors:\n    enabled: true\n    allowed_origins: [\"https://app.example.com\"]\n", 1)
+	env := New(t, WithConfigTemplate(tmpl), WithRolesYAML(subsRolesYAML))
+	for origin, want := range map[string]int{
+		"http://app.example.com":  http.StatusForbidden,
+		"https://evil.example":    http.StatusForbidden,
+		"https://app.example.com": http.StatusSwitchingProtocols,
+	} {
+		c, resp, _ := env.DialWSRaw(t, http.Header{"Origin": {origin}}, "")
+		if resp == nil || resp.StatusCode != want {
+			t.Fatalf("Origin %s: resp %+v, want %d", origin, resp, want)
+		}
+		if c != nil {
+			c.Send(t, map[string]any{"type": "connection_init", "payload": AuthPayload(env.Token(t, "author", 1))})
+			if m := c.Read(t, wait); m.Type != "connection_ack" {
+				t.Fatalf("allowed origin: %+v", m)
+			}
+			c.Close()
+		}
 	}
 }

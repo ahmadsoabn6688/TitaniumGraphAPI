@@ -195,8 +195,12 @@ server:
     poll_interval_ms: 1000 # default polling interval
     min_poll_interval_ms: 250    # bounds for every interval in the file
     max_poll_interval_ms: 60000
-    max_connections: 1000        # open sockets per gateway (-1 = unlimited)
+    max_connections: 1000        # initialised sockets per gateway (-1 = unlimited)
+    max_pending_connections: 100 # sockets still waiting for connection_init (-1 = unlimited)
+    max_connections_per_identity: 25    # initialised sockets per caller (-1 = unlimited)
     max_subscriptions_per_connection: 100
+    max_subscriptions_per_identity: 200 # running operations per caller, all sockets (-1 = unlimited)
+    max_concurrent_polls: 5      # executions at once (default max(1, max_open_conns/2); -1 = unlimited)
     connection_init_timeout_seconds: 10
     keepalive_seconds: 30        # WebSocket ping interval (-1 = no pings)
     ping_timeout_seconds: 10     # an unanswered ping closes the socket
@@ -1122,8 +1126,10 @@ interval.
 `graphql-transport-ws` — the protocol of the [`graphql-ws`](https://github.com/enisdenjo/graphql-ws)
 client (Apollo Client's `GraphQLWsLink`, urql's `subscriptionExchange`,
 GraphiQL). The legacy `subscriptions-transport-ws` protocol is not
-supported. Queries and mutations sent over the socket run once (`next`, then
-`complete`), with the same permissions as over HTTP. (Conversely, a subscription
+supported. Only a role with a `Subscription` root (at least one
+subscribable table or native query) may open a socket; on it, queries and
+mutations run once too (`next`, then `complete`), with the same permissions
+as over HTTP. (Conversely, a subscription
 operation POSTed over HTTP runs once and returns the current result.)
 
 ```ts
@@ -1147,7 +1153,10 @@ const stop = client.subscribe(
 or under `headers` — nothing else from the payload is used. Non-browser
 clients may instead send them on the upgrade request. They are verified
 exactly like an HTTP request's (role claim or `role_lookup`, allowed roles);
-an anonymous connection gets the anonymous role. Afterwards:
+an anonymous connection gets the anonymous role. A role with nothing to
+subscribe to is refused (4403) — it has no reason to hold a socket, so an
+anonymous role without `subscribe` grants cannot be used to tie up
+connections. Afterwards:
 
 - the socket closes with **4401** when the token expires (`exp` plus
   `jwt.leeway_seconds`), even with no poll in flight;
@@ -1158,33 +1167,63 @@ an anonymous connection gets the anonymous role. Afterwards:
   **4403**. A transient database error during that re-check also closes the
   socket (fail closed); clients reconnect.
 
-The browser `Origin` of the upgrade must be the gateway's own, or match
-`server.cors.allowed_origins` when CORS is enabled.
+The browser `Origin` of the upgrade must be the gateway's own (same host),
+or — when CORS is enabled — one of `server.cors.allowed_origins` compared as
+a whole origin exactly like the CORS headers are: scheme, host and port
+(`https://app.example.com` does not let `http://app.example.com` in), no
+wildcards except a lone `"*"`. Anything else gets HTTP 403. Clients that
+send no `Origin` (non-browser) are not affected.
 
 | Close code | Meaning |
 |---|---|
 | 4400 | Invalid message (not JSON, unknown type, binary frame, subscribe without id) |
 | 4401 | `subscribe` before `connection_ack`, or the token expired |
-| 4403 | `connection_init` rejected, or the re-check no longer accepts the caller |
+| 4403 | `connection_init` rejected (bad token, unknown role, a role with no subscriptions), or the re-check no longer accepts the caller |
 | 4406 | Subprotocol other than `graphql-transport-ws` |
-| 4408 | No `connection_init` within `connection_init_timeout_seconds` |
+| 4408 | No `connection_init` received within `connection_init_timeout_seconds` (one that arrived in time but is still authenticating is not cut off) |
 | 4409 | An operation id that is already running |
 | 4429 | A second `connection_init` |
-| 1001 | Server shutting down |
+| 1001 | Server shutting down, or a reload set `server.subscriptions.enabled: false` |
 | 1008 | A WebSocket ping unanswered for `ping_timeout_seconds` |
+| 1013 | `connection_init` over `max_connections` or the caller's `max_connections_per_identity` (try again later) |
 
 An invalid operation (unknown field, hidden column, more than one root
 field, too deep, no subscriptions for the role) gets an `error` message and
 ends; the socket stays open.
 
-**Limits.** `max_connections` (further upgrades get HTTP 503),
-`max_subscriptions_per_connection` (further operations get an `error`
-message), `connection_init_timeout_seconds`, WebSocket pings every
-`keepalive_seconds` with `ping_timeout_seconds` to answer, and the 1 MiB
-message limit of HTTP requests.
+**Limits.** A socket is *pending* from the upgrade until its
+`connection_init` succeeds, and *initialised* after that; the two are
+capped separately, so unauthenticated sockets can never crowd out
+authenticated ones:
+
+- `max_pending_connections` — sockets that have not completed
+  `connection_init` (further upgrades get HTTP 503; each is closed after
+  `connection_init_timeout_seconds` at the latest);
+- `max_connections` — initialised sockets of the gateway (a
+  `connection_init` over it is closed with 1013);
+- `max_connections_per_identity` and `max_subscriptions_per_identity` —
+  initialised sockets, and operations running over all of them, of one
+  caller (1013, resp. an `error` message). The caller is the token's `sub`
+  claim; a caller without one — the anonymous role — counts per role and
+  client address. Behind a reverse proxy every anonymous client has the
+  proxy's address and so shares one budget: raise these (or set `-1`) there;
+- `max_subscriptions_per_connection` (further operations get an `error`
+  message);
+- `max_concurrent_polls` — executions running at once across the gateway
+  (each poll of a subscription, each query or mutation sent over a socket;
+  a query counts as `max_parallel_root_fields`). A poll waits for a free
+  slot, so with many subscribers the effective interval stretches instead
+  of the polls taking every pooled connection from HTTP requests. The
+  default is half of `database.max_open_conns`; above 1 it must be less
+  than `max_open_conns`;
+- `connection_init_timeout_seconds`, WebSocket pings every
+  `keepalive_seconds` with `ping_timeout_seconds` to answer, and the 1 MiB
+  message limit of HTTP requests.
 
 **Reload and shutdown.** Subscriptions are re-validated after a hot reload
-(see [Hot config reload](#hot-config-reload-dev)). `Gate.Close` and the
+(see [Hot config reload](#hot-config-reload-dev)); a reload that sets
+`server.subscriptions.enabled: false` closes every open socket (1001, idle
+ones included, within about a second) and the endpoint. `Gate.Close` and the
 built-in server's shutdown close every socket with 1001 and wait for the
 polls to stop; an embedding host serving `gate.Handler()` itself calls
 `gate.Close()` on shutdown (`http.Server.Shutdown` does not track
@@ -1193,7 +1232,10 @@ WebSockets).
 **Cost.** Each subscription is its own poll — subscribers are not
 multiplexed, so 1,000 subscribers at 1 s are 1,000 queries per second.
 Grant `subscribe` deliberately, prefer `_by_pk` and narrow `where` filters,
-give aggregates longer intervals, and use the limits above. Every poll reads
+give aggregates longer intervals, and use the limits above
+(`max_concurrent_polls` keeps the polls from starving HTTP requests of
+pooled connections; the per-identity caps keep one caller from opening the
+gateway's whole budget). Every poll reads
 the latest data (no stale or follower reads).
 
 **GraphiQL** runs subscriptions too: it opens a socket lazily with the
@@ -1227,7 +1269,9 @@ connection re-authenticates against the new config, and each subscription is
 checked against its role's new schema before it runs again (picking up a new
 polling interval). One the new permissions reject — a column or table no
 longer readable, `subscribe` revoked — ends with an `error` message; a caller
-the new config no longer accepts is disconnected (close code 4403).
+the new config no longer accepts is disconnected (close code 4403), and
+`server.subscriptions.enabled: false` disconnects everyone (1001). The
+connection limits apply from the next connection or operation.
 
 ## Querying it (React or any client)
 
@@ -1962,8 +2006,8 @@ code and reason).
 - Subscriptions are live queries by polling (TiDB has no LISTEN/NOTIFY or
   triggers): each subscription runs its own query every interval, with no
   sharing between identical subscriptions, so N subscribers cost N queries
-  per interval — size `max_connections`, `max_subscriptions_per_connection`
-  and the intervals accordingly (aggregates over big tables deserve long
+  per interval — size `max_connections`, `max_subscriptions_per_connection`,
+  `max_concurrent_polls` and the intervals accordingly (aggregates over big tables deserve long
   ones). Changes between two polls that cancel out are never seen; there
   are no streaming (`_stream`) subscriptions, no custom subscription fields
   from `hooks/`, and only `graphql-transport-ws` (not the legacy
@@ -2038,6 +2082,10 @@ field error, never a crash; concurrent root fields are capped per request
 below the pool size; and a subscription is an ordinary query of the role
 re-run per poll — validated and depth-checked like a request, re-validated
 after a reload, with a fresh timeout, dataloader and row budget each time —
-on a socket that only accepts the configured origins, authenticates before
-any operation, and closes when its token expires or a periodic re-check of
-the token and role lookup fails.
+on a socket that only accepts the configured origins (whole origins,
+scheme included), authenticates before any operation, is only kept for a
+role that can subscribe, counts against per-caller and gateway-wide caps
+(unauthenticated sockets against a separate pending cap), shares a bounded
+number of pooled connections with the other polls, and closes when its
+token expires, a periodic re-check of the token and role lookup fails, or a
+reload disables subscriptions.

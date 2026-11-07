@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -52,6 +53,14 @@ import (
 // longer accepts the caller: the token stops verifying, the role lookup
 // fails or yields another role, or the role is gone after a reload.
 //
+// Limits: a socket counts towards max_pending_connections from the upgrade
+// until connection_init succeeds, and from then on towards max_connections
+// and its caller's max_connections_per_identity — so unauthenticated sockets
+// cannot crowd out authenticated ones. A role with no Subscription root is
+// refused at connection_init. Every execution (a poll, or a query or
+// mutation sent over a socket) takes a slot of max_concurrent_polls, so
+// live queries cannot take every pooled connection from HTTP requests.
+//
 // Hot reload: every poll re-reads the serving state. When it changed, the
 // connection re-authenticates against the new verifier, and each operation
 // is re-validated against its role's new schema before it runs again (an
@@ -95,39 +104,200 @@ func isWebSocketUpgrade(r *http.Request) bool {
 
 // wsHub owns the open WebSocket connections of one Server.
 type wsHub struct {
-	s              *srv
-	originPatterns []string
+	s       *srv
+	origins wsOrigins
 
 	mu      sync.Mutex
 	conns   map[*wsConn]struct{}
-	pending int // upgrades in progress (count towards max_connections)
+	pending int                 // sockets not (yet) past connection_init, upgrades in progress included
+	active  int                 // sockets past connection_init
+	callers map[string]*wsUsage // per identityKey
 	closing bool
 	wg      sync.WaitGroup
+
+	polls wsLimiter // max_concurrent_polls
+}
+
+// wsUsage is what one caller (identityKey) holds open.
+type wsUsage struct {
+	conns int // initialised sockets
+	ops   int // running operations over all of them
 }
 
 func newWSHub(s *srv, static *config.Config) *wsHub {
-	return &wsHub{s: s, originPatterns: originPatterns(static.Server.CORS), conns: map[*wsConn]struct{}{}}
+	return &wsHub{s: s, origins: newWSOrigins(static.Server.CORS), conns: map[*wsConn]struct{}{}, callers: map[string]*wsUsage{}}
 }
 
-// originPatterns turns server.cors.allowed_origins into the host patterns
-// the WebSocket handshake accepts besides the same origin. Without CORS only
-// same-origin browser pages (and clients sending no Origin) may connect.
-func originPatterns(cors config.CORS) []string {
+// wsOrigins is the set of browser origins allowed to open a WebSocket
+// besides the gateway's own: server.cors.allowed_origins when CORS is
+// enabled, compared as whole origins (scheme, host and port) exactly like
+// the HTTP CORS middleware does, "*" allowing any.
+type wsOrigins struct {
+	all     bool
+	allowed map[string]bool
+}
+
+func newWSOrigins(cors config.CORS) wsOrigins {
+	o := wsOrigins{allowed: map[string]bool{}}
 	if !cors.Enabled {
-		return nil
+		return o
 	}
-	var out []string
-	for _, o := range cors.AllowedOrigins {
-		if o == "*" {
-			return []string{"*"}
+	for _, v := range cors.AllowedOrigins {
+		if v == "*" {
+			o.all = true
 		}
-		if u, err := url.Parse(o); err == nil && u.Host != "" {
-			out = append(out, u.Host)
-		} else {
-			out = append(out, o)
+		o.allowed[v] = true
+	}
+	return o
+}
+
+// allow reports whether an upgrade request's Origin may connect: no Origin
+// (a non-browser client), an allowed origin, or the same host as the
+// request (the gateway's own pages).
+func (o wsOrigins) allow(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" || o.all || o.allowed[origin] {
+		return true
+	}
+	u, err := url.Parse(origin)
+	if err != nil || u.Host == "" {
+		return false
+	}
+	return strings.EqualFold(u.Host, r.Host)
+}
+
+// identityKey is the caller a connection counts against for the
+// per-identity limits: the token's sub claim, or — for a caller without one,
+// such as the anonymous role — the role plus the client address (behind a
+// reverse proxy that is the proxy's address).
+func identityKey(id *rbac.Identity, remoteAddr string) string {
+	if sub, ok := id.Claims["sub"]; ok && sub != nil {
+		if s := fmt.Sprint(sub); s != "" {
+			return "sub:" + s
 		}
 	}
-	return out
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		host = remoteAddr
+	}
+	return "addr:" + id.Role + "@" + host
+}
+
+// admit moves an authenticated connection from the pending count to the
+// initialised ones, unless that would exceed max_connections or its
+// caller's max_connections_per_identity.
+func (h *wsHub) admit(c *wsConn, key string, sc config.Subscriptions) (websocket.StatusCode, string, bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	u := h.callers[key]
+	switch {
+	case h.closing:
+		return websocket.StatusGoingAway, "server shutting down", false
+	case sc.MaxConnections > 0 && h.active >= sc.MaxConnections:
+		return websocket.StatusTryAgainLater, "too many WebSocket connections (server.subscriptions.max_connections)", false
+	case u != nil && sc.MaxConnectionsPerIdentity > 0 && u.conns >= sc.MaxConnectionsPerIdentity:
+		return websocket.StatusTryAgainLater, "too many WebSocket connections for this caller (server.subscriptions.max_connections_per_identity)", false
+	}
+	if u == nil {
+		u = &wsUsage{}
+		h.callers[key] = u
+	}
+	u.conns++
+	h.pending--
+	h.active++
+	c.key, c.admitted = key, true
+	return 0, "", true
+}
+
+// release forgets a connection that ended (under h.mu).
+func (h *wsHub) release(c *wsConn) {
+	delete(h.conns, c)
+	if !c.admitted {
+		h.pending--
+		return
+	}
+	h.active--
+	if u := h.callers[c.key]; u != nil {
+		u.conns--
+		if u.conns <= 0 && u.ops <= 0 {
+			delete(h.callers, c.key)
+		}
+	}
+}
+
+// reserveOp counts one more running operation for a caller unless that
+// exceeds max (<= 0 = unlimited).
+func (h *wsHub) reserveOp(key string, max int) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	u := h.callers[key]
+	if u == nil {
+		u = &wsUsage{}
+		h.callers[key] = u
+	}
+	if max > 0 && u.ops >= max {
+		return false
+	}
+	u.ops++
+	return true
+}
+
+func (h *wsHub) releaseOp(key string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if u := h.callers[key]; u != nil {
+		u.ops--
+		if u.conns <= 0 && u.ops <= 0 {
+			delete(h.callers, key)
+		}
+	}
+}
+
+// wsLimiter is a counting semaphore whose size is read on every acquire, so
+// a reload that changes max_concurrent_polls applies to the next poll.
+type wsLimiter struct {
+	mu   sync.Mutex
+	used int
+	wake chan struct{} // closed (and dropped) on every release
+}
+
+// acquire takes n slots of limit() (<= 0 = unlimited), waiting until they
+// are free or ctx ends (ok false). n is capped at the limit, and a request
+// is granted whenever nothing else holds a slot, so a shrunken limit never
+// deadlocks. It returns the number of slots taken, for release.
+func (l *wsLimiter) acquire(ctx context.Context, n int, limit func() int) (int, bool) {
+	for {
+		l.mu.Lock()
+		max := limit()
+		if max > 0 && n > max {
+			n = max
+		}
+		if max <= 0 || l.used == 0 || l.used+n <= max {
+			l.used += n
+			l.mu.Unlock()
+			return n, true
+		}
+		if l.wake == nil {
+			l.wake = make(chan struct{})
+		}
+		wake := l.wake
+		l.mu.Unlock()
+		select {
+		case <-wake:
+		case <-ctx.Done():
+			return 0, false
+		}
+	}
+}
+
+func (l *wsLimiter) release(n int) {
+	l.mu.Lock()
+	l.used -= n
+	if l.wake != nil {
+		close(l.wake)
+		l.wake = nil
+	}
+	l.mu.Unlock()
 }
 
 // serve upgrades one request and runs the connection until it closes.
@@ -137,15 +307,19 @@ func (h *wsHub) serve(w http.ResponseWriter, r *http.Request) {
 		auth.WriteError(w, http.StatusBadRequest, "GraphQL over WebSocket is disabled (server.subscriptions.enabled)")
 		return
 	}
+	if !h.origins.allow(r) {
+		auth.WriteError(w, http.StatusForbidden, "WebSocket Origin not allowed (server.cors.allowed_origins)")
+		return
+	}
 	h.mu.Lock()
 	switch {
 	case h.closing:
 		h.mu.Unlock()
 		auth.WriteError(w, http.StatusServiceUnavailable, "server is shutting down")
 		return
-	case sc.MaxConnections > 0 && len(h.conns)+h.pending >= sc.MaxConnections:
+	case sc.MaxPendingConnections > 0 && h.pending >= sc.MaxPendingConnections:
 		h.mu.Unlock()
-		auth.WriteError(w, http.StatusServiceUnavailable, "too many WebSocket connections (server.subscriptions.max_connections)")
+		auth.WriteError(w, http.StatusServiceUnavailable, "too many WebSocket connections awaiting connection_init (server.subscriptions.max_pending_connections)")
 		return
 	}
 	h.pending++
@@ -154,8 +328,10 @@ func (h *wsHub) serve(w http.ResponseWriter, r *http.Request) {
 	defer h.wg.Done()
 
 	ws, err := websocket.Accept(w, r, &websocket.AcceptOptions{
-		Subprotocols:   []string{wsSubprotocol},
-		OriginPatterns: h.originPatterns,
+		Subprotocols: []string{wsSubprotocol},
+		// The Origin was checked above against whole origins (the
+		// library's OriginPatterns compare hosts only).
+		InsecureSkipVerify: true,
 	})
 	if err != nil {
 		h.mu.Lock()
@@ -164,21 +340,19 @@ func (h *wsHub) serve(w http.ResponseWriter, r *http.Request) {
 		return // Accept already answered the request
 	}
 	ctx, cancel := context.WithCancel(r.Context())
-	c := &wsConn{hub: h, ws: ws, ctx: ctx, cancel: cancel, ops: map[string]*wsOp{}, upgrade: r.Header.Clone(), closeDone: make(chan struct{})}
+	c := &wsConn{hub: h, ws: ws, ctx: ctx, cancel: cancel, ops: map[string]*wsOp{}, upgrade: r.Header.Clone(),
+		remoteAddr: r.RemoteAddr, closeDone: make(chan struct{})}
 
 	h.mu.Lock()
-	h.pending--
 	closing := h.closing
-	if !closing {
-		h.conns[c] = struct{}{}
-	}
+	h.conns[c] = struct{}{}
 	h.mu.Unlock()
 	if closing {
 		c.closeWith(websocket.StatusGoingAway, "server shutting down")
 	}
 	defer func() {
 		h.mu.Lock()
-		delete(h.conns, c)
+		h.release(c)
 		h.mu.Unlock()
 	}()
 	if ws.Subprotocol() != wsSubprotocol {
@@ -223,7 +397,13 @@ type wsConn struct {
 	cancel  context.CancelFunc
 	upgrade http.Header // the upgrade request's headers (auth fallback)
 
-	initSeen bool        // read loop only
+	remoteAddr string
+	// Set by wsHub.admit, under wsHub.mu: the connection counts towards
+	// max_connections and its caller's limits under key.
+	admitted bool
+	key      string
+
+	initSeen atomic.Bool // connection_init received (it may still be authenticating)
 	acked    atomic.Bool // connection_ack sent: operations allowed
 	closing  atomic.Bool // closeWith was called: run nothing more
 
@@ -283,8 +463,10 @@ func (c *wsConn) run() {
 	sc := c.hub.s.current().Cfg.Server.Subscriptions
 	c.ws.SetReadLimit(maxBodyBytes)
 
+	// 4408 means no connection_init arrived in time; one that did is still
+	// authenticating (bounded by wsAuthTimeout) and settles the socket itself.
 	initTimer := time.AfterFunc(time.Duration(sc.ConnectionInitTimeoutSeconds)*time.Second, func() {
-		if !c.acked.Load() {
+		if !c.initSeen.Load() {
 			c.closeWith(closeInitTimeout, "Connection initialisation timeout")
 		}
 	})
@@ -292,6 +474,7 @@ func (c *wsConn) run() {
 	if sc.KeepAliveSeconds > 0 {
 		go c.keepAlive(time.Duration(sc.KeepAliveSeconds)*time.Second, time.Duration(sc.PingTimeoutSeconds)*time.Second)
 	}
+	go c.watchEnabled()
 
 	for {
 		typ, data, err := c.ws.Read(c.ctx)
@@ -330,6 +513,30 @@ func (c *wsConn) keepAlive(every, timeout time.Duration) {
 	}
 }
 
+// wsEnabledCheck is how often an open socket checks that a reload has not
+// turned server.subscriptions.enabled off.
+const wsEnabledCheck = time.Second
+
+const wsDisabledReason = "GraphQL over WebSocket is disabled (server.subscriptions.enabled)"
+
+// watchEnabled closes the connection (1001) once a reload disables GraphQL
+// over WebSocket, idle sockets included.
+func (c *wsConn) watchEnabled() {
+	t := time.NewTicker(wsEnabledCheck)
+	defer t.Stop()
+	for {
+		select {
+		case <-c.ctx.Done():
+			return
+		case <-t.C:
+			if !c.hub.s.current().Cfg.Server.Subscriptions.On() {
+				c.closeWith(websocket.StatusGoingAway, wsDisabledReason)
+				return
+			}
+		}
+	}
+}
+
 // closeWith starts closing the connection with a status code (once); the
 // read loop then ends and every operation stops.
 func (c *wsConn) closeWith(code websocket.StatusCode, reason string) {
@@ -355,11 +562,10 @@ func (c *wsConn) handle(data []byte) bool {
 	}
 	switch msg.Type {
 	case "connection_init":
-		if c.initSeen {
+		if c.initSeen.Swap(true) {
 			c.closeWith(closeTooManyInits, "Too many initialisation requests")
 			return false
 		}
-		c.initSeen = true
 		return c.connectionInit(msg.Payload)
 	case "ping":
 		c.send(wsMessage{Type: "pong"})
@@ -392,6 +598,10 @@ func (c *wsConn) handle(data []byte) bool {
 // payload and acknowledges it.
 func (c *wsConn) connectionInit(payload json.RawMessage) bool {
 	st := c.hub.s.current()
+	if !st.Cfg.Server.Subscriptions.On() {
+		c.closeWith(websocket.StatusGoingAway, wsDisabledReason)
+		return false
+	}
 	headers, err := initHeaders(payload, c.upgrade, st.Verifier.RoleHeader())
 	if err != nil {
 		c.closeWith(closeBadRequest, "Invalid message received: "+err.Error())
@@ -401,13 +611,22 @@ func (c *wsConn) connectionInit(payload json.RawMessage) bool {
 	id, _, err := st.Verifier.IdentifyHeaders(ctx, headers)
 	cancel()
 	if err == nil {
-		if _, ok := st.Schemas[id.Role]; !ok {
+		if schema, ok := st.Schemas[id.Role]; !ok {
 			err = fmt.Errorf("no schema for role %s", id.Role)
+		} else if schema.SubscriptionType() == nil {
+			// Nothing to subscribe to: such a caller has no reason to hold
+			// a socket (its queries go over HTTP).
+			err = fmt.Errorf("role %s has no subscriptions", id.Role)
 		}
 	}
 	if err != nil {
 		c.logDebug("websocket connection_init rejected", "err", err)
 		c.closeWith(closeForbidden, "Forbidden: "+err.Error())
+		return false
+	}
+	if code, reason, ok := c.hub.admit(c, identityKey(id, c.remoteAddr), st.Cfg.Server.Subscriptions); !ok {
+		c.logDebug("websocket connection_init over a limit", "reason", reason)
+		c.closeWith(code, reason)
 		return false
 	}
 
@@ -480,7 +699,8 @@ func (c *wsConn) subscribe(msg wsMessage) bool {
 		c.closeWith(closeBadRequest, "Invalid message received: "+err.Error())
 		return false
 	}
-	max := c.hub.s.current().Cfg.Server.Subscriptions.MaxPerConnection
+	sc := c.hub.s.current().Cfg.Server.Subscriptions
+	max := sc.MaxPerConnection
 	c.mu.Lock()
 	if _, dup := c.ops[msg.ID]; dup {
 		c.mu.Unlock()
@@ -491,6 +711,12 @@ func (c *wsConn) subscribe(msg wsMessage) bool {
 		c.mu.Unlock()
 		c.sendErrors(msg.ID, []gqlerrors.FormattedError{gqlerrors.NewFormattedError(
 			fmt.Sprintf("too many operations on this connection (server.subscriptions.max_subscriptions_per_connection is %d)", max))})
+		return true
+	}
+	if !c.hub.reserveOp(c.key, sc.MaxPerIdentity) {
+		c.mu.Unlock()
+		c.sendErrors(msg.ID, []gqlerrors.FormattedError{gqlerrors.NewFormattedError(
+			fmt.Sprintf("too many operations for this caller (server.subscriptions.max_subscriptions_per_identity is %d)", sc.MaxPerIdentity))})
 		return true
 	}
 	ctx, cancel := context.WithCancel(c.ctx)
@@ -661,6 +887,7 @@ func rootFieldNames(set *ast.SelectionSet, frags map[string]*ast.FragmentDefinit
 // for a subscription.
 func (c *wsConn) runOp(op *wsOp) {
 	defer c.wg.Done()
+	defer c.hub.releaseOp(c.key)
 	defer op.cancel()
 
 	st, id, ok := c.authorize()
@@ -732,6 +959,19 @@ func (c *wsConn) runOp(op *wsOp) {
 // execute runs a prepared operation once and encodes its result. ok is false
 // when the operation (or the connection) ended meanwhile.
 func (c *wsConn) execute(op *wsOp, p *prepared, id *rbac.Identity) (json.RawMessage, bool) {
+	// A query may run its root fields in parallel, each on its own pooled
+	// connection: it takes that many slots of max_concurrent_polls.
+	weight := 1
+	if p.opType == ast.OperationTypeQuery && p.st.Cfg.Server.MaxParallelRootFields > 1 {
+		weight = p.st.Cfg.Server.MaxParallelRootFields
+	}
+	n, ok := c.hub.polls.acquire(op.ctx, weight, func() int {
+		return c.hub.s.current().Cfg.Server.Subscriptions.MaxConcurrentPolls
+	})
+	if !ok {
+		return nil, false
+	}
+	defer c.hub.polls.release(n)
 	ctx, cancel := requestContext(op.ctx, p.st, id)
 	defer cancel()
 	start := time.Now()
@@ -764,6 +1004,10 @@ func (c *wsConn) authorize() (*State, *rbac.Identity, bool) {
 		return nil, nil, false
 	}
 	st := c.hub.s.current()
+	if !st.Cfg.Server.Subscriptions.On() {
+		c.closeWith(websocket.StatusGoingAway, wsDisabledReason)
+		return nil, nil, false
+	}
 	every := time.Duration(st.Cfg.Server.Subscriptions.ReauthIntervalSeconds) * time.Second
 	if st == c.st && time.Since(c.authAt) < every {
 		return c.st, c.id, true
